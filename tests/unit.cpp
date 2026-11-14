@@ -1062,11 +1062,26 @@ static void test_vector_math() {
                                                                   : double(std::nextafter(w, INFINITY)) - w;
         return std::fabs(double(got) - want) / ulp;
     };
+    // Every 16th float from lo up to hi. Floats in increasing order are consecutive integers: k for
+    // the float k steps above zero, -k for k steps below (0 is -0.0, as nextafter from below gives),
+    // so jumping 16 at a time visits them without stepping through the 15 in between.
+    auto order = [](float x) {
+        uint32_t b;
+        std::memcpy(&b, &x, 4);
+        return (b >> 31) ? -static_cast<int64_t>(b & 0x7FFFFFFFu) : static_cast<int64_t>(b);
+    };
+    auto from_order = [](int64_t k) {
+        const uint32_t b = k <= 0 ? 0x80000000u | static_cast<uint32_t>(-k) : static_cast<uint32_t>(k);
+        float x;
+        std::memcpy(&x, &b, 4);
+        return x;
+    };
     auto sweep = [&](float lo, float hi, auto f, auto ref, double max_ulp) {
         double worst = 0;
-        int64_t step = 0;
-        for (float x = lo; x <= hi; x = std::nextafter(x, INFINITY))
-            if (step++ % 16 == 0) worst = std::max(worst, ulp_error(f(x), ref(double(x))));
+        for (int64_t k = order(lo), end = order(hi); k <= end; k += 16) {
+            const float x = from_order(k);
+            worst = std::max(worst, ulp_error(f(x), ref(double(x))));
+        }
         CHECK(worst <= max_ulp);
     };
     sweep(-87.3f, 88.7f, [](float x) { return vm::exp(x); }, [](double x) { return std::exp(x); }, 1.5);

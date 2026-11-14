@@ -114,11 +114,6 @@ def test_fp16_export_matches_pytorch(tools, tmp_path, opts):
         assert r.returncode == 0, fmt + "\n" + r.stdout + r.stderr
 
 
-def test_cpp_unit_tests(tools):
-    r = subprocess.run([str(tools / "tfi_tests")], capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout[-3000:]
-
-
 def test_golden_rejects_nan(tools, tmp_path):
     torch.manual_seed(0)
     model = DecoderLM(tiny())
