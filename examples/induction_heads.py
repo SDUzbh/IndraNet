@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--positional", default="rope", help="rope | learned | alibi | ...")
     ap.add_argument("--export", help="write the trained model here for the indra CLI")
+    ap.add_argument("--fp16", action="store_true", help="with --export: store the weight matrices in fp16")
     args = ap.parse_args()
     torch.manual_seed(0)
 
@@ -130,7 +131,7 @@ def main():
             print(f"loss on copies {base:.3f} -> {ablated:.3f} with L{layer}H{head} zero-ablated")
 
     if args.export:
-        export_model(model, args.export)
+        export_model(model, args.export, dtype="float16" if args.fp16 else "float32")
         print(f"\nexported to {args.export}; try: build/indra heads {args.export}")
 
 

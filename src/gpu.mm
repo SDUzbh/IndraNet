@@ -22,8 +22,10 @@ namespace tfi {
 namespace detail {
 
 namespace {
-constexpr int64_t kDefaultMinRows = 256;  // tuned on an M5 Pro
+constexpr int64_t kDefaultMinRows = 256;      // tuned on an M5 Pro
+constexpr double kDefaultMinWork = 6e10;       // tuned on an M5 Pro (models of 1-85M parameters)
 std::atomic<int64_t> g_min_rows{0};
+std::atomic<double> g_min_work{0};
 }  // namespace
 
 int64_t gpu_min_rows() {
@@ -31,6 +33,11 @@ int64_t gpu_min_rows() {
     return r > 0 ? r : kDefaultMinRows;
 }
 void set_gpu_min_rows(int64_t rows) { g_min_rows = rows; }
+double gpu_min_work() {
+    const double w = g_min_work.load();
+    return w > 0 ? w : kDefaultMinWork;
+}
+void set_gpu_min_work(double multiply_adds) { g_min_work = multiply_adds; }
 
 // Kernels of Gpu::Seq, compiled when first needed. The math is src/vmath.h's (same polynomials),
 // so GPU and CPU agree to float rounding.
@@ -285,10 +292,10 @@ struct Gpu::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     std::mutex mutex;  // guards the weight caches and pool
-    // By host address. float32 weights: their GPU copies, and fp16 copies (nil for a weight outside
-    // fp16's range). Half-precision weights: buffers over their own memory.
+    // By host address. Vectors (norm scales, biases): GPU copies. float32 matrices in fp16 runs: fp16
+    // copies (nil for one outside fp16's range). Matrices (float32 or fp16): buffers over their own memory.
     std::unordered_map<const float*, id<MTLBuffer>> weights, weights_fp16;
-    std::unordered_map<const uint16_t*, id<MTLBuffer>> shared;
+    std::unordered_map<const void*, id<MTLBuffer>> shared;
     std::vector<id<MTLBuffer>> pool;  // free scratch buffers
 
     // Where a multiply reads a weight from, and whether those values are fp16.
@@ -296,42 +303,45 @@ struct Gpu::Impl {
         id<MTLBuffer> buf = nil;
         bool half = false;
     };
-    // A half-precision weight is read in place, whatever `fp16`. A float32 weight gives its fp16
-    // copy when `fp16` is asked for and every value fits, else its float32 copy.
+    // A matrix is read in place, float32 or fp16. In an fp16 run, a float32 matrix gives an fp16
+    // copy instead when every value fits.
     WBuf weight_for(const Weight& W, bool fp16) {
-        if (W.is_fp16()) return {shared_buffer(W), true};
-        if (fp16)
-            if (id<MTLBuffer> b = weight_buffer(W.f32(), true)) return {b, true};
-        return {weight_buffer(W.f32(), false), false};
+        if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
+        if (fp16 && !W.is_fp16())
+            if (id<MTLBuffer> b = copy_buffer(W.f32_data(), W.numel(), true)) return {b, true};
+        return {shared_buffer(W), W.is_fp16()};
     }
 
     id<MTLBuffer> shared_buffer(const Weight& W) {
         std::lock_guard<std::mutex> lock(mutex);
-        auto it = shared.find(W.f16());
+        auto it = shared.find(W.data());
         if (it != shared.end()) return it->second;
         // The buffer keeps the weight's memory alive (Weight allocates it page-aligned, in whole pages).
-        std::shared_ptr<const uint16_t> keep = W.f16_owner();
-        id<MTLBuffer> b = [device newBufferWithBytesNoCopy:const_cast<uint16_t*>(W.f16())
-                                                    length:W.f16_capacity()
+        std::shared_ptr<const void> keep = W.owner();
+        id<MTLBuffer> b = [device newBufferWithBytesNoCopy:const_cast<void*>(W.data())
+                                                    length:W.capacity()
                                                    options:MTLResourceStorageModeShared
                                                deallocator:^(void*, NSUInteger) { (void)keep; }];
-        if (!b) b = [device newBufferWithBytes:W.f16() length:W.f16_capacity() options:MTLResourceStorageModeShared];
+        if (!b) b = [device newBufferWithBytes:W.data() length:W.capacity() options:MTLResourceStorageModeShared];
         if (!b) throw std::runtime_error("GPU: could not allocate a weight buffer");
-        shared.emplace(W.f16(), b);
+        shared.emplace(W.data(), b);
         return b;
     }
 
-    id<MTLBuffer> weight_buffer(const Tensor& W, bool fp16) {
+    id<MTLBuffer> weight_buffer(const Tensor& W, bool fp16) { return copy_buffer(W.ptr(), W.numel(), fp16); }
+
+    // A GPU copy of n floats at p (fp16 when asked: nil if a value doesn't fit), cached by address.
+    id<MTLBuffer> copy_buffer(const float* p, int64_t n, bool fp16) {
         std::lock_guard<std::mutex> lock(mutex);
         auto& cache = fp16 ? weights_fp16 : weights;
-        auto it = cache.find(W.ptr());
+        auto it = cache.find(p);
         if (it != cache.end()) return it->second;
-        const NSUInteger bytes = static_cast<NSUInteger>(W.numel()) * (fp16 ? sizeof(__fp16) : sizeof(float));
+        const NSUInteger bytes = static_cast<NSUInteger>(std::max<int64_t>(n, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float));
         id<MTLBuffer> b = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         if (!b) throw std::runtime_error("GPU: could not allocate a weight buffer");
-        if (!fp16) std::memcpy(b.contents, W.ptr(), bytes);
-        else if (!to_half(W.ptr(), static_cast<__fp16*>(b.contents), W.numel())) b = nil;
-        cache.emplace(W.ptr(), b);
+        if (!fp16) std::memcpy(b.contents, p, static_cast<size_t>(n) * sizeof(float));
+        else if (!to_half(p, static_cast<__fp16*>(b.contents), n)) b = nil;
+        cache.emplace(p, b);
         return b;
     }
 
@@ -503,7 +513,7 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const We
         const Weight* b = bs.empty() ? nullptr : bs[i];
         if (!b) continue;
         const int64_t n = Ws[i]->shape[0];
-        const Tensor bias = b->to_tensor();
+        const Tensor& bias = b->f32();
         if (bias.numel() != n) throw std::invalid_argument("linear: bias does not match the weight");
         float* y = ys[i].ptr();
         for (int64_t r = 0; r < m; ++r)

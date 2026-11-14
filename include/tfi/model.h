@@ -20,8 +20,8 @@ namespace detail {
 struct RowBatch;  // internal (src/ops.h)
 class Gpu;        // internal (src/gpu.h, macOS)
 
-// A model's GPU context, created on first use. Copies start empty: the context caches the
-// weights by address, and a copy's weights live elsewhere.
+// A model's GPU context, created on first use. Copies start empty: each model has its own context
+// (a copy shares the weights' memory, which each context uses in place).
 struct GpuSlot {
     std::shared_ptr<Gpu> gpu;
     bool checked = false;
@@ -93,6 +93,7 @@ class Model {
     // Internal (macOS): this model's GPU context for batched patching, created on first use and
     // kept with its copies of the weights; nullptr without a Metal device or on other systems.
     detail::Gpu* gpu() const;
+    bool has_gpu() const;  // Internal: whether gpu() has created the context (its start-up is paid)
     // Like forward, but also stores activations (after `hooks` ran) for hooks the filter accepts.
     Tensor run_with_cache(const Tokens& tokens, ActivationCache& cache, NameFilter filter = nullptr,
                           const Hooks* hooks = nullptr) const;

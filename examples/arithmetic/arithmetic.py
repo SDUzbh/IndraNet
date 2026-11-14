@@ -109,7 +109,8 @@ def cmd_calc(args):
 
 def cmd_export(args):
     model, task, _ = load(args.checkpoint)
-    export_model(model, args.out, vocab=list(VOCAB), metadata={"task": "arithmetic", "task_config": str(task.to_dict())})
+    export_model(model, args.out, vocab=list(VOCAB), metadata={"task": "arithmetic", "task_config": str(task.to_dict())},
+                 dtype="float16" if args.fp16 else "float32")
     pos = task.positions()
     print(f"exported to {args.out}")
     print(f"layout of {decode([0])}-padded sequences ({task.seq_len} tokens): a at {pos['a']}, op at {pos['op']}, "
@@ -166,6 +167,7 @@ def main():
     x = sub.add_parser("export", help="write a safetensors file for the indra CLI")
     x.add_argument("checkpoint")
     x.add_argument("out")
+    x.add_argument("--fp16", action="store_true", help="store the weight matrices in fp16 (half the file)")
     x.set_defaults(fn=cmd_export)
 
     p = sub.add_parser("problems", help="print random problems, one per line (reference data for indra ablate)")

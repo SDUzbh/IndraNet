@@ -98,6 +98,12 @@ class Gpu::Seq {
 int64_t gpu_min_rows();
 // For tests: 0 restores the default; a very large value turns the GPU off.
 void set_gpu_min_rows(int64_t rows);
+// A command uses the GPU only if the multiply-adds its GPU-sized batches would run add up to at
+// least this many (rows x layers x each layer's weights; a gradient run counts 3 passes). Below it,
+// the CPU finishes before the GPU would repay its start-up (about 35 ms in a fresh process).
+double gpu_min_work();
+// For tests: 0 restores the default.
+void set_gpu_min_work(double multiply_adds);
 
 }  // namespace detail
 }  // namespace tfi

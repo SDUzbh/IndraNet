@@ -451,8 +451,8 @@ int64_t head_batch_rows() { return g_head_batch_rows ? g_head_batch_rows.load() 
 int64_t ablation_batch_rows() { return g_head_batch_rows ? g_head_batch_rows.load() : kAblationBatchRows; }
 #ifdef TFI_USE_ACCELERATE
 // Attribution patching's gradient runs (steps sequences of P rows), tuned on an M5 Pro: aim for 8
-// batches running in parallel, at most 256 rows each. When the GPU is used at all (steps x P >=
-// gpu_min_rows()), a batch goes to it from a quarter of gpu_min_rows() rows (default 64): one
+// batches running in parallel, at most 256 rows each. When the GPU is used at all (enough work:
+// gpu_min_work()), a batch goes to it from a quarter of gpu_min_rows() rows (default 64): one
 // such sequence already runs faster there than on the CPU.
 int64_t gradient_batch_rows(int64_t steps, int64_t P) {
     if (g_head_batch_rows) return g_head_batch_rows.load();
@@ -493,12 +493,34 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
     return batches;
 }
 
-// The model's GPU context (macOS), only when some batch is large enough to use it: creating one takes time.
+#ifdef TFI_USE_ACCELERATE
+// Multiply-adds per row per block, about: the blocks' 2-D weights over the layers.
+double block_weights_per_layer(const Model& m) {
+    double n = 0;
+    for (const auto& kv : m.weights())
+        if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) n += static_cast<double>(kv.second.numel());
+    return n / static_cast<double>(std::max<int64_t>(1, m.cfg().n_layers));
+}
+
+// Multiply-adds of the batches big enough for the GPU (gpu_min_rows): each runs its rows from its
+// layer to the last.
+double gpu_work(const Model& m, const std::vector<Batch>& batches) {
+    double rows_x_layers = 0;
+    for (const Batch& b : batches)
+        if (b.rows >= detail::gpu_min_rows())
+            rows_x_layers += static_cast<double>(b.rows) * static_cast<double>(m.cfg().n_layers - b.layer);
+    return rows_x_layers > 0 ? rows_x_layers * block_weights_per_layer(m) : 0.0;
+}
+#endif
+
+// The model's GPU context (macOS), only when the batches large enough for it (gpu_min_rows) add up to
+// enough work to repay starting it (gpu_min_work), or it has started already (its start-up is paid):
+// otherwise everything runs on the CPU.
 detail::Gpu* gpu_for(const Model& m, const std::vector<Batch>& batches) {
 #ifdef TFI_USE_ACCELERATE
     if (!use_gpu()) return nullptr;
-    for (const Batch& b : batches)
-        if (b.rows >= detail::gpu_min_rows()) return m.gpu();
+    const double work = gpu_work(m, batches);
+    if (work > 0 && (m.has_gpu() || work >= detail::gpu_min_work())) return m.gpu();
 #else
     (void)m;
     (void)batches;
@@ -761,8 +783,11 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     std::vector<int64_t> cpu_steps;
     detail::Gpu* gpu = nullptr;
 #ifdef TFI_USE_ACCELERATE
-    // Only with enough work in all to pay for starting the GPU (about 60 ms in a fresh process).
-    if (use_gpu() && steps * P >= detail::gpu_min_rows())
+    // Only with enough work in all to repay starting the GPU (gpu_min_work; a forward and backward
+    // pass count as 3 passes).
+    if (use_gpu() && (m.has_gpu() ? steps * P >= detail::gpu_min_rows()
+                                   : 3.0 * static_cast<double>(steps * P * m.cfg().n_layers) * block_weights_per_layer(m) >=
+                                         detail::gpu_min_work()))
         for (Batch& b : make_batches({all_steps}, [P](int64_t) { return P; }, gradient_batch_rows(steps, P))) {
             if (b.rows >= std::max<int64_t>(1, detail::gpu_min_rows() / 4) && (gpu || (gpu = m.gpu())))
                 gpu_batches.push_back(std::move(b));
@@ -1075,6 +1100,22 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
     const int64_t L = m.cfg().n_layers, H = m.max_heads(), T = static_cast<int64_t>(tokens.size());
     const int64_t d = m.cfg().d_model, V = m.cfg().vocab_size;
     if (T < 2) throw std::invalid_argument("loss needs at least two tokens");
+#ifdef TFI_USE_ACCELERATE
+    if (mode == Ablation::Mean && use_gpu()) {
+        // The reference passes and the ablation passes each choose the GPU on their own work. If the
+        // two together are worth it, start it now: its start-up is paid once, and then both use it.
+        std::vector<std::vector<int64_t>> heads(L);
+        for (int64_t i = 0; i < L; ++i)
+            for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) heads[i].push_back(h);
+        std::vector<int64_t> refs(reference.size());
+        for (size_t n = 0; n < refs.size(); ++n) refs[n] = static_cast<int64_t>(n);
+        const double work =
+            gpu_work(m, make_batches(heads, [T](int64_t) { return T; }, ablation_batch_rows())) +
+            gpu_work(m, make_batches({refs}, [&](int64_t n) { return static_cast<int64_t>(reference[n].size()); },
+                                     ablation_batch_rows()));
+        if (work >= detail::gpu_min_work()) m.gpu();
+    }
+#endif
     const HeadMeans means = mode == Ablation::Mean ? head_means(m, reference, T) : HeadMeans{};
     std::set<std::string> needed;
     for (int64_t i = 0; i < L; ++i) {

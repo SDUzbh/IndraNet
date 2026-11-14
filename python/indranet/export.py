@@ -5,7 +5,8 @@ tensor bytes. The model's config is stored as JSON in the header metadata, so a 
 file fully describes the model.
 
     from indranet.export import export_model
-    export_model(model, "model.safetensors")
+    export_model(model, "model.safetensors")                     # float32
+    export_model(model, "model.safetensors", dtype="float16")    # 2-D weights in fp16: half the file
 
 Then, from the repository root: ``build/indra info model.safetensors``.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import json
 import struct
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
 
@@ -22,7 +24,8 @@ from torch import Tensor
 from .model import DecoderLM
 
 FORMAT_VERSION = "1"
-_DTYPES = {torch.float32: "F32", torch.int64: "I64"}
+_DTYPES = {torch.float32: "F32", torch.float16: "F16", torch.int64: "I64"}
+FP16_MAX = 65504.0  # largest finite fp16 value
 
 # Components the C++ side implements. Custom registered components cannot be exported.
 SUPPORTED = {
@@ -68,12 +71,20 @@ def _check_supported(model: DecoderLM) -> None:
 
 
 def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Sequence[str]] = None,
-                 metadata: Optional[Dict[str, str]] = None) -> None:
-    """Write weights (FP32) and config. Tied unembedding weights are stored once.
+                 metadata: Optional[Dict[str, str]] = None, dtype: str = "float32") -> None:
+    """Write weights and config. Tied unembedding weights are stored once.
 
     ``vocab`` (one string per token id) lets the C++ tools take ``--text`` input and print
     tokens as text. ``metadata`` adds free-form string entries to the file header.
+
+    ``dtype="float16"`` stores every 2-D weight (embeddings, attention and MLP projections,
+    unembedding) in half precision, which halves the file. Each value is rounded to the nearest
+    fp16 value, as ``indra --fp16`` rounds a float32 file; norm scales and biases stay float32. A
+    weight with a value outside fp16's range (|v| > 65504, or not finite) stays float32, with a
+    warning. ``indra --fp16`` then loads these weights as they are, without converting them.
     """
+    if dtype not in ("float32", "float16"):
+        raise ValueError(f"dtype must be 'float32' or 'float16', got {dtype!r}")
     _check_supported(model)
     if vocab is not None and len(vocab) != model.cfg.vocab_size:
         raise ValueError(f"vocab has {len(vocab)} entries but the model's vocab_size is {model.cfg.vocab_size}")
@@ -84,7 +95,18 @@ def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Seque
     meta.update({"format": "indranet", "format_version": FORMAT_VERSION, "config": json.dumps(model.cfg.to_dict())})
     if vocab is not None:
         meta["vocab"] = json.dumps(list(vocab))
-    save_safetensors({k: v.float() for k, v in state.items()}, path, meta)
+    tensors, kept = {}, []
+    for name, value in state.items():
+        value = value.detach().float()
+        if dtype == "float16" and value.dim() == 2:
+            if value.numel() == 0 or (torch.isfinite(value).all() and value.abs().max() <= FP16_MAX):
+                value = value.half()
+            else:
+                kept.append(name)
+        tensors[name] = value
+    if kept:
+        warnings.warn(f"kept in float32 (values outside fp16's range): {', '.join(kept)}")
+    save_safetensors(tensors, path, meta)
 
 
 def hook_gradients(model: DecoderLM, tokens: Tensor, pos: int, target: int, other: int = -1) -> Dict[str, Tensor]:

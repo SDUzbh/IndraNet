@@ -46,7 +46,11 @@ from indranet.export import export_model
 model = DecoderLM.from_preset("attn_only_2l")   # or any config; see python/README.md
 ...                                             # train it
 export_model(model, "model.safetensors")        # FP32 weights + config in one file
+export_model(model, "model.safetensors", dtype="float16")  # weight matrices in fp16: half the file
 ```
+
+An fp16 file holds the same values `indra --fp16` would round a float32 file to; with `--fp16` it
+loads them as they are.
 
 Or train an example circuit and export it in one go:
 
@@ -255,8 +259,10 @@ const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
 Tensor q_rows = Wq.rows(0, 16);                              // read as float32 either way (also cols, to_tensor)
 ```
 
-`Model::weight` returns a `Weight`: `f32()` gives a float32 weight's tensor directly, and `rows()`,
-`cols()`, `to_tensor()` and the `linear()` / `matmul()` overloads read either kind as float32.
+`Model::weight` returns a `Weight`. Matrices (float32 or fp16) are read with `rows()`, `cols()`,
+`to_tensor()` and the `linear()` / `matmul()` overloads, which give float32 either way; they sit in
+page-aligned memory that the GPU uses in place, so no weight is held twice. Norm scales and biases
+are float32 tensors, read with `f32()`.
 
 Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accelerate -framework Metal
 -framework MetalPerformanceShaders -framework Foundation`).

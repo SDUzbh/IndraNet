@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "tfi/tensor.h"
@@ -15,31 +16,43 @@ namespace tfi {
 // (norm scales, biases) always stay float32, and all arithmetic is float32 either way.
 enum class WeightFormat { fp32, fp16 };
 
-// One weight: float32 (a Tensor), or half precision. Half-precision values are read through rows(),
-// cols(), to_tensor() and the linear() / matmul() overloads below, which convert them to float32.
+// One weight. A 2-D weight (a matrix: embeddings, projections, unembedding) keeps its values, float32
+// or half precision, in a page-aligned allocation that the GPU can use in place, without a copy of
+// its own; copies of a Weight share it. Read matrices through rows(), cols(), to_tensor() and the
+// linear() / matmul() overloads below, which give float32 either way. Other weights (norm scales,
+// biases) are float32 Tensors, read with f32().
 class Weight {
   public:
     Shape shape;
 
     Weight() = default;
     explicit Weight(Tensor t);  // float32
-    // Half precision, rounded to nearest even. Throws if a value does not fit (fits_fp16).
+    // A 2-D weight in half precision, rounded to nearest even. Throws if a value does not fit (fits_fp16).
     static Weight fp16(const Tensor& t);
+    // A 2-D weight from fp16 values given as bit patterns (e.g. an F16 tensor in a file), as they are.
+    // Throws if a value is infinite or NaN.
+    static Weight fp16_bits(Shape shape, const uint16_t* bits);
+    // A 2-D weight whose values `fill` writes straight into its storage: numel() float32 values, or
+    // with fp16, numel() fp16 bit patterns, taken as they are (e.g. read or converted from a file).
+    static Weight filled(Shape shape, bool fp16, const std::function<void(void* dst)>& fill);
     static bool fits_fp16(const Tensor& t);  // every value finite and within +-65504
 
     int64_t numel() const;
     int64_t dim() const { return static_cast<int64_t>(shape.size()); }
-    bool is_fp16() const { return static_cast<bool>(half_); }
+    bool is_fp16() const { return half_; }
     int64_t bytes() const { return numel() * (is_fp16() ? 2 : 4); }  // memory the values take
 
-    // The float32 values. Throws std::logic_error for a half-precision weight.
+    // A weight that is not 2-D (norm scale, bias), as a float32 Tensor. Throws std::logic_error for a
+    // 2-D weight: read those with rows(), cols(), to_tensor() or linear() / matmul().
     const Tensor& f32() const;
-    // The half-precision values (row-major, as IEEE fp16 bit patterns), or nullptr for float32.
-    // The allocation starts on a page boundary and is f16_capacity() bytes, a whole number of pages,
-    // so that the GPU can use it in place. f16_owner() keeps it alive.
-    const uint16_t* f16() const { return half_.get(); }
-    size_t f16_capacity() const { return half_capacity_; }
-    std::shared_ptr<const uint16_t> f16_owner() const { return half_; }
+    // A 2-D weight's values, row-major: float32, or fp16 bit patterns when is_fp16(); nullptr for
+    // other weights. The allocation starts on a page boundary and is capacity() bytes, a whole number
+    // of pages, so that the GPU can use it in place; owner() keeps it alive.
+    const void* data() const { return mat_.get(); }
+    const float* f32_data() const { return half_ ? nullptr : static_cast<const float*>(data()); }
+    const uint16_t* f16() const { return half_ ? static_cast<const uint16_t*>(data()) : nullptr; }
+    size_t capacity() const { return capacity_; }
+    std::shared_ptr<const void> owner() const { return mat_; }
 
     Tensor to_tensor() const;                       // every value, as float32
     Tensor rows(int64_t begin, int64_t end) const;  // W[begin:end] of a 2-D weight, as float32
@@ -49,9 +62,10 @@ class Weight {
     void read_rows(int64_t begin, int64_t end, float* dst) const;
 
   private:
-    Tensor f32_;
-    std::shared_ptr<const uint16_t> half_;
-    size_t half_capacity_ = 0;
+    Tensor vec_;                       // a weight that is not 2-D
+    std::shared_ptr<const void> mat_;  // a 2-D weight's values (page-aligned)
+    size_t capacity_ = 0;
+    bool half_ = false;
 };
 
 // y = x @ W^T + b (W (out, in), as linear() above) with a model weight. A half-precision W is

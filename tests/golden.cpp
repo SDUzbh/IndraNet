@@ -1,10 +1,11 @@
 // Compare the C++ forward pass with a PyTorch reference written by indranet.export.export_reference.
 //
-//   tfi_golden model.safetensors reference.safetensors [tolerance]
+//   tfi_golden model.safetensors reference.safetensors [tolerance] [fp16]
 //
 // Checks the logits and every cached activation, and, when the reference was written with a
 // metric, every hook point's gradient of it (PyTorch autograd vs. tfi's backward pass). The
-// tolerance is relative to each tensor's largest magnitude. Exit code 0 means everything matched.
+// tolerance is relative to each tensor's largest magnitude. With fp16 the model is loaded with
+// WeightFormat::fp16. Exit code 0 means everything matched.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -20,12 +21,13 @@ using namespace tfi;
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s model.safetensors reference.safetensors [tolerance]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s model.safetensors reference.safetensors [tolerance] [fp16]\n", argv[0]);
         return 2;
     }
     const float tol = argc > 3 ? std::strtof(argv[3], nullptr) : 1e-4f;
     try {
-        const Model model = Model::load(argv[1]);
+        const bool fp16 = argc > 4 && std::string(argv[4]) == "fp16";
+        const Model model = Model::load(argv[1], fp16 ? WeightFormat::fp16 : WeightFormat::fp32);
         const SafeTensors ref = load_safetensors(argv[2]);
         const IntTensor& tok = ref.int_tensors.at("tokens");
         ActivationCache cache;

@@ -27,8 +27,9 @@ void set_num_threads(int n);
 int num_threads();
 
 // On macOS with a Metal device, the batched passes of exact patching, ablation and reference means,
-// and attribution patching's gradient runs, run everything but attention on the GPU. set_use_gpu(false) keeps everything on the CPU; results
-// agree up to float rounding. Until it is
+// and attribution patching's gradient runs, run everything but attention on the GPU when they add up
+// to enough work to repay starting it (small models and short inputs stay on the CPU, which is then
+// faster). set_use_gpu(false) keeps everything on the CPU; results agree up to float rounding. Until it is
 // called, the TFI_NO_GPU environment variable (any value but 0) does the same. use_gpu() says
 // whether the GPU is allowed, not whether there is one.
 void set_use_gpu(bool use);

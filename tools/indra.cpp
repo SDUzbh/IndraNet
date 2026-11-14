@@ -56,8 +56,9 @@ Token input
 
 Performance
   --threads N                  threads for patch / ablate (default: TFI_THREADS, else all cores)
-  --no-gpu                     patch / ablate: keep everything on the CPU (default: the
-                               GPU when there is one, macOS only; TFI_NO_GPU=1 does the same)
+  --no-gpu                     patch / ablate: keep everything on the CPU (default: the GPU
+                               when there is one and enough work to repay starting it, macOS
+                               only; TFI_NO_GPU=1 does the same)
 
 Precision
   --fp32                       weights in float32 (the default)
@@ -66,6 +67,8 @@ Precision
                                give the GPU's multiplies fp16 inputs, which is faster. Errors around
                                1e-3 on the patching metric (fine for gaps of 1 or more) and around
                                1e-4 on ablation's loss increases. Arithmetic stays float32.
+                               A file written with export_model(..., dtype="float16") already
+                               holds fp16 weights: --fp16 loads them as they are, --fp32 widens them.
 )";
 
 struct Args {

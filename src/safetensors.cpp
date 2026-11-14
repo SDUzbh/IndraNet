@@ -22,7 +22,7 @@ float bf16_to_f32(uint16_t h) {
 
 SafeTensors load_safetensors(const std::string& path) { return load_safetensors(path, nullptr); }
 
-SafeTensors load_safetensors(const std::string& path, const TensorSink& take) {
+SafeTensors load_safetensors(const std::string& path, const TensorSink& take, const RawSink& take_raw) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
     uint64_t header_len = 0;
@@ -52,39 +52,49 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take) {
         const uint64_t begin = static_cast<uint64_t>(info.at("data_offsets").array.at(0).as_int());
         const uint64_t end = static_cast<uint64_t>(info.at("data_offsets").array.at(1).as_int());
         if (end < begin || end > data_size) throw std::runtime_error(path + ": bad offsets for " + name);
+        for (int64_t dim : shape)
+            if (dim < 0) throw std::runtime_error(path + ": negative dimension for " + name);
         const int64_t n = shape_numel(shape);
-
-        std::vector<char> raw(end - begin);
+        const uint64_t width = dtype == "I64" ? 8 : dtype == "F32" ? 4 : (dtype == "F16" || dtype == "BF16") ? 2 : 0;
+        if (width == 0) throw std::runtime_error(path + ": unsupported dtype " + dtype + " for " + name);
+        if (static_cast<uint64_t>(n) > data_size / width || end - begin != static_cast<uint64_t>(n) * width)
+            throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
+        // Straight into the tensor's own storage: no intermediate byte buffer.
         f.seekg(data_start + static_cast<std::streamoff>(begin));
-        if (!raw.empty() && !f.read(raw.data(), static_cast<std::streamsize>(raw.size())))
-            throw std::runtime_error(path + ": cannot read " + name);
-
-        auto check_bytes = [&](size_t width) {
-            if (raw.size() != static_cast<size_t>(n) * width)
-                throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
+        auto read_into = [&](void* dst) {
+            if (n && !f.read(static_cast<char*>(dst), static_cast<std::streamsize>(end - begin)))
+                throw std::runtime_error(path + ": cannot read " + name);
         };
         if (dtype == "I64") {
-            check_bytes(8);
-            IntTensor t{shape, std::vector<int64_t>(n)};
-            std::memcpy(t.data.data(), raw.data(), raw.size());
+            IntTensor t{shape, std::vector<int64_t>(static_cast<size_t>(n))};
+            read_into(t.data.data());
             out.int_tensors[name] = std::move(t);
             continue;
         }
-        std::vector<float> values(n);
-        if (dtype == "F32") {
-            check_bytes(4);
-            std::memcpy(values.data(), raw.data(), raw.size());
-        } else if (dtype == "F16" || dtype == "BF16") {
-            check_bytes(2);
-            for (int64_t i = 0; i < n; ++i) {
-                uint16_t h;
-                std::memcpy(&h, raw.data() + 2 * i, 2);
-                values[i] = dtype == "F16" ? detail::half_to_float(h) : bf16_to_f32(h);
-            }
-        } else {
-            throw std::runtime_error(path + ": unsupported dtype " + dtype + " for " + name);
+        if (take_raw) {
+            const uint64_t size = end - begin;
+            const RawTensor raw{dtype, shape, size, [&](uint64_t offset, uint64_t count, void* dst) {
+                                    if (offset > size || count > size - offset)
+                                        throw std::out_of_range(path + ": read past the end of " + name);
+                                    f.seekg(data_start + static_cast<std::streamoff>(begin + offset));
+                                    if (count && !f.read(static_cast<char*>(dst), static_cast<std::streamsize>(count)))
+                                        throw std::runtime_error(path + ": cannot read " + name);
+                                }};
+            if (take_raw(name, raw)) continue;
+            f.seekg(data_start + static_cast<std::streamoff>(begin));
         }
-        raw = std::vector<char>();
+        std::vector<float> values;
+        if (dtype == "F32") {
+            values.resize(static_cast<size_t>(n));
+            read_into(values.data());
+        } else {
+            std::vector<uint16_t> bits(static_cast<size_t>(n));
+            read_into(bits.data());
+            values.resize(static_cast<size_t>(n));
+            if (dtype == "F16") detail::halves_to_floats(bits.data(), values.data(), n);
+            else
+                for (int64_t i = 0; i < n; ++i) values[i] = bf16_to_f32(bits[i]);
+        }
         Tensor t(shape, std::move(values));
         if (take) take(name, std::move(t));
         else out.tensors[name] = std::move(t);

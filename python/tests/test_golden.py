@@ -91,6 +91,29 @@ def test_cpp_matches_pytorch_presets(tools, tmp_path, name):
     _golden(tools, tmp_path, model, torch.randint(0, V, (20,)), metric=(19, 3, -1))  # log-probability metric
 
 
+@pytest.mark.parametrize("opts", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
+                                  dict(tie_embeddings=False, n_kv_heads=2, qk_norm=True), MIXED_HEADS], ids=_id)
+def test_fp16_export_matches_pytorch(tools, tmp_path, opts):
+    """export_model(dtype="float16") files: the C++ side computes what PyTorch computes with the weight
+    matrices rounded to fp16, loading them as float32 and as fp16 (taken from the file as they are)."""
+    torch.manual_seed(0)
+    model = DecoderLM(tiny(**opts))
+    with torch.no_grad():
+        for b in model.blocks:  # sharpen attention, as _golden does
+            b.attn.q_proj.weight.mul_(10)
+            b.attn.k_proj.weight.mul_(10)
+    export_model(model, tmp_path / "model.safetensors", dtype="float16")
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.dim() == 2:
+                p.copy_(p.half().float())
+    export_reference(model, torch.randint(0, V, (12,)), tmp_path / "ref.safetensors", metric=(10, 3, 5))
+    for fmt in ["fp32", "fp16"]:
+        r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors"),
+                            "1e-4", fmt], capture_output=True, text=True)
+        assert r.returncode == 0, fmt + "\n" + r.stdout + r.stderr
+
+
 def test_cpp_unit_tests(tools):
     r = subprocess.run([str(tools / "tfi_tests")], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout[-3000:]

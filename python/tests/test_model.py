@@ -367,3 +367,54 @@ def test_hook_gradients_leave_parameter_grads():
     assert before.keys() == after.keys() and all(torch.equal(before[n], after[n]) for n in before)
     assert grads.keys() == fresh.keys() and all(torch.equal(grads[n], fresh[n]) for n in grads)
     assert grads["blocks.1.hook_resid_post"].abs().sum() > 0
+
+
+def json_bytes(path):
+    import struct
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        return f.read(n)
+
+
+def _safetensors_header(path):
+    import json
+    return json.loads(json_bytes(path))
+
+
+def test_export_fp16(tmp_path):
+    """dtype="float16" writes 2-D weights as F16 (rounded like torch's .half()) and the rest as F32;
+    a weight outside fp16's range stays F32, with a warning."""
+    import numpy as np
+    import warnings
+    from indranet.export import export_model
+    torch.manual_seed(0)
+    model = DecoderLM(tiny(norm="layernorm", bias=True, tie_embeddings=False))
+    export_model(model, tmp_path / "f32.safetensors")
+    export_model(model, tmp_path / "f16.safetensors", dtype="float16")
+    header = _safetensors_header(tmp_path / "f16.safetensors")
+    state = model.state_dict()
+    data_start = 8 + len(json_bytes(tmp_path / "f16.safetensors"))
+    raw = (tmp_path / "f16.safetensors").read_bytes()
+    assert set(header) - {"__metadata__"} == set(state)
+    for name, t in state.items():
+        info = header[name]
+        assert info["dtype"] == ("F16" if t.dim() == 2 else "F32"), name
+        begin, end = info["data_offsets"]
+        values = np.frombuffer(raw[data_start + begin:data_start + end], dtype=np.float16 if t.dim() == 2 else np.float32)
+        want = t.half() if t.dim() == 2 else t.float()
+        assert torch.equal(torch.from_numpy(values.copy()).reshape(t.shape), want), name
+    assert (tmp_path / "f16.safetensors").stat().st_size < 0.6 * (tmp_path / "f32.safetensors").stat().st_size
+    with torch.no_grad():
+        model.embed.weight[0, 0] = 1e5
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        export_model(model, tmp_path / "big.safetensors", dtype="float16")
+    assert any("embed.weight" in str(w.message) for w in caught)
+    big = _safetensors_header(tmp_path / "big.safetensors")
+    assert big["embed.weight"]["dtype"] == "F32" and big["unembed.weight"]["dtype"] == "F16"
+
+
+def test_export_rejects_unknown_dtype(tmp_path):
+    from indranet.export import export_model
+    with pytest.raises(ValueError, match="dtype"):
+        export_model(DecoderLM(tiny()), tmp_path / "m.safetensors", dtype="bfloat16")

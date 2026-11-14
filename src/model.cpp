@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 
 #include "tfi/safetensors.h"
+#include "half.h"
 #include "ops.h"
 #include "vmath.h"
 #include "gpu.h"
@@ -193,6 +195,31 @@ Weight make_weight(Tensor t, WeightFormat format) {
     if (format == WeightFormat::fp16 && t.dim() == 2 && Weight::fits_fp16(t)) return Weight::fp16(t);
     return Weight(std::move(t));
 }
+
+// A float tensor's values (F32, F16 or BF16) as float32, a block at a time:
+// fn(first index, values, count).
+void for_each_block(const RawTensor& t, const std::function<void(int64_t, const float*, int64_t)>& fn) {
+    constexpr int64_t kBlock = int64_t(1) << 20;  // values per block: 4 MB as float32
+    const int64_t n = shape_numel(t.shape);
+    const bool f32 = t.dtype == "F32";
+    std::vector<float> values(static_cast<size_t>(std::min(kBlock, n)));
+    std::vector<uint16_t> bits(f32 ? 0 : values.size());
+    for (int64_t i = 0; i < n; i += kBlock) {
+        const int64_t m = std::min(kBlock, n - i);
+        if (f32) {
+            t.read(static_cast<uint64_t>(i) * 4, static_cast<uint64_t>(m) * 4, values.data());
+        } else {
+            t.read(static_cast<uint64_t>(i) * 2, static_cast<uint64_t>(m) * 2, bits.data());
+            if (t.dtype == "F16") detail::halves_to_floats(bits.data(), values.data(), m);
+            else
+                for (int64_t j = 0; j < m; ++j) {  // BF16: the top half of a float32
+                    const uint32_t b = uint32_t(bits[j]) << 16;
+                    std::memcpy(&values[j], &b, 4);
+                }
+        }
+        fn(i, values.data(), m);
+    }
+}
 }  // namespace
 
 Model::Model(ModelConfig cfg, std::map<std::string, Tensor> weights, WeightFormat format)
@@ -271,9 +298,42 @@ void Model::check_shapes() {
 
 Model Model::load(const std::string& path, WeightFormat format) {
     std::map<std::string, Weight> weights;
-    SafeTensors st = load_safetensors(path, [&](const std::string& name, Tensor&& t) {
-        weights.emplace(name, make_weight(std::move(t), format));
-    });
+    // Each 2-D tensor goes from the file straight into its weight's storage: read as it is when the file
+    // holds the type kept in memory, otherwise converted a block at a time as it is read.
+    const RawSink straight = [&](const std::string& name, const RawTensor& t) {
+        if (t.shape.size() != 2) return false;
+        const int64_t n = shape_numel(t.shape);
+        const bool to_fp16 = format == WeightFormat::fp16;
+        auto read_all = [&](void* dst) { t.read(0, t.bytes, dst); };
+        if (t.dtype == (to_fp16 ? "F16" : "F32")) {
+            Weight w = Weight::filled(t.shape, to_fp16, read_all);
+            if (!to_fp16 || detail::all_finite_halves(w.f16(), n)) {
+                weights.emplace(name, std::move(w));
+                return true;
+            }  // an fp16 infinity or NaN: kept as float32, below
+        } else if (to_fp16) {  // F32 or BF16 -> fp16, unless a value doesn't fit (then float32, below)
+            int64_t bad = 0;
+            Weight w = Weight::filled(t.shape, true, [&](void* dst) {
+                for_each_block(t, [&](int64_t first, const float* v, int64_t count) {
+                    bad += detail::floats_to_halves(v, static_cast<uint16_t*>(dst) + first, count);
+                });
+            });
+            if (bad == 0) {
+                weights.emplace(name, std::move(w));
+                return true;
+            }
+        }
+        weights.emplace(name, Weight::filled(t.shape, false, [&](void* dst) {  // -> float32
+                            if (t.dtype == "F32") return read_all(dst);
+                            for_each_block(t, [&](int64_t first, const float* v, int64_t count) {
+                                std::copy(v, v + count, static_cast<float*>(dst) + first);
+                            });
+                        }));
+        return true;
+    };
+    SafeTensors st = load_safetensors(
+        path, [&](const std::string& name, Tensor&& t) { weights.emplace(name, make_weight(std::move(t), format)); },
+        straight);
     auto it = st.metadata.find("config");
     if (it == st.metadata.end())
         throw std::runtime_error(path + " has no IndraNet model config; export it with indranet.export.export_model");
@@ -693,10 +753,13 @@ Tensor Model::forward_from(int64_t layer, Tensor x, const Hooks* hooks) const {
     return logits_from_final(f);
 }
 
+namespace {
+std::mutex g_gpu_mutex;  // guards each model's one-time GPU context creation; Gpu itself is thread-safe
+}  // namespace
+
 detail::Gpu* Model::gpu() const {
 #ifdef TFI_USE_ACCELERATE
-    static std::mutex mutex;  // one-time creation; Gpu itself is thread-safe
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(g_gpu_mutex);
     if (!gpu_.checked) {
         gpu_.gpu = detail::Gpu::create();
         gpu_.checked = true;
@@ -705,6 +768,11 @@ detail::Gpu* Model::gpu() const {
 #else
     return nullptr;
 #endif
+}
+
+bool Model::has_gpu() const {
+    std::lock_guard<std::mutex> lock(g_gpu_mutex);
+    return gpu_.gpu != nullptr;
 }
 
 namespace {

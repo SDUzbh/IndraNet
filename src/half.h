@@ -55,6 +55,13 @@ inline uint16_t float_to_half(float f) {
 // Whether v survives the round trip through fp16 without overflowing: finite and |v| <= 65504.
 inline bool fits_half(float v) { return v >= -65504.f && v <= 65504.f; }
 
+// Whether every fp16 value is finite (no infinity or NaN: exponent bits not all set).
+inline bool all_finite_halves(const uint16_t* h, int64_t n) {
+    uint32_t bad = 0;
+    for (int64_t i = 0; i < n; ++i) bad |= (h[i] & 0x7C00) == 0x7C00;
+    return bad == 0;
+}
+
 inline void halves_to_floats(const uint16_t* src, float* dst, int64_t n) {
     int64_t i = 0;
 #if defined(__aarch64__)

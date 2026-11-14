@@ -427,6 +427,7 @@ static void test_optimized_patching_matches_naive(const Model& m) {
     for (const bool gpu : gpu_modes) {
 #ifdef TFI_USE_ACCELERATE
         detail::set_gpu_min_rows(gpu ? 1 : std::numeric_limits<int64_t>::max());
+        detail::set_gpu_min_work(gpu ? 1 : 0);
 #else
         (void)gpu;
 #endif
@@ -469,6 +470,7 @@ static void test_optimized_patching_matches_naive(const Model& m) {
     // same results.
     if (m.gpu()) {
         detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
         const Model copy = m;
         CHECK(copy.gpu() != nullptr && copy.gpu() != m.gpu());
         check_close(patch_residual(copy, t, corrupt, "resid_pre", 8, 1, 2).effect,
@@ -478,6 +480,7 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         const Tensor cpu = patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect;
         const Tensor cpu_heads = patch_heads(m, t, corrupt, 8, 1, 2).effect;
         detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
         set_use_gpu(false);
         CHECK(max_abs_diff(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu) == 0.f);
         CHECK(max_abs_diff(patch_heads(m, t, corrupt, 8, 1, 2).effect, cpu_heads) == 0.f);
@@ -512,6 +515,7 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         set_gpu_fp16(false);
     }
     detail::set_gpu_min_rows(0);
+    detail::set_gpu_min_work(0);
 #endif
     set_use_gpu(false);
     CHECK(!use_gpu());
@@ -798,9 +802,35 @@ static void test_fp16_weight() {
     CHECK_THROWS(w.rows(5, 3001));
     const long page = sysconf(_SC_PAGESIZE);
     CHECK(reinterpret_cast<uintptr_t>(w.f16()) % static_cast<uintptr_t>(page) == 0);
-    CHECK(w.f16_capacity() % static_cast<size_t>(page) == 0 && w.f16_capacity() >= 2 * static_cast<size_t>(W.numel()));
+    CHECK(w.capacity() % static_cast<size_t>(page) == 0 && w.capacity() >= 2 * static_cast<size_t>(W.numel()));
+    CHECK(w.f32_data() == nullptr && w.data() == w.f16());
     const Weight bw(b);
-    CHECK(!bw.is_fp16() && bw.f32().data == b.data);
+    CHECK(!bw.is_fp16() && bw.f32().data == b.data && bw.data() == nullptr);
+    // float32 matrices are page-aligned too (the GPU uses them in place), and copies share them.
+    const Weight w32(W);
+    CHECK(!w32.is_fp16() && w32.f16() == nullptr && w32.f32_data() == w32.data());
+    CHECK(reinterpret_cast<uintptr_t>(w32.data()) % static_cast<uintptr_t>(page) == 0);
+    CHECK(w32.capacity() % static_cast<size_t>(page) == 0 && w32.capacity() >= 4 * static_cast<size_t>(W.numel()));
+    CHECK(w32.to_tensor().data == W.data && w32.rows(10, 13).data == rows(W, 10, 13).data);
+    CHECK(w32.cols(150, 200).data == cols(W, 150, 200).data && w32.row(5).data == row(W, 5).data);
+    CHECK_THROWS(w32.f32());  // 2-D: read with rows(), cols(), to_tensor()
+    const Weight w32copy = w32;
+    CHECK(w32copy.data() == w32.data());
+    CHECK(linear(x, w32, &bw).data == linear(x, W, &b).data);
+    CHECK(matmul(A, w32).data == matmul(A, W).data);
+    CHECK(Weight(Tensor({0, 4})).to_tensor().shape == Shape({0, 4}));
+    CHECK_THROWS(Weight::fp16(b));  // only 2-D weights are stored in fp16
+    // From fp16 bit patterns, as an F16 tensor in a file: taken as they are.
+    std::vector<uint16_t> bits(static_cast<size_t>(W.numel()));
+    detail::floats_to_halves(W.ptr(), bits.data(), W.numel());
+    const Weight wbits = Weight::fp16_bits(W.shape, bits.data());
+    CHECK(wbits.is_fp16() && wbits.to_tensor().data == R.data);
+    CHECK(reinterpret_cast<uintptr_t>(wbits.data()) % static_cast<uintptr_t>(page) == 0);
+    CHECK_THROWS(Weight::fp16_bits({W.numel()}, bits.data()));  // 1-D
+    bits[3] = 0x7C00;                                              // infinity
+    CHECK_THROWS(Weight::fp16_bits(W.shape, bits.data()));
+    bits[3] = 0x7E00;  // NaN
+    CHECK_THROWS(Weight::fp16_bits(W.shape, bits.data()));
     const Tensor want = linear(x, R, &b), got = linear(x, w, &bw);
     CHECK(got.shape == want.shape);
     CHECK(max_abs_diff(got, want) <= 1e-5f * std::max(1.f, max_abs(want)));
@@ -852,7 +882,7 @@ static void test_fp16_model(const Model& m16) {
         CHECK(g16.count(kv.first) && max_abs_diff(g16.at(kv.first), kv.second) <= 1e-4f * std::max(1.f, max_abs(kv.second)));
     const Model copy = m16;  // copies share the fp16 values
     CHECK(copy.forward(t).data == a.data);
-    CHECK(copy.weight("embed.weight").f16() == m16.weight("embed.weight").f16());
+    CHECK(copy.weight("embed.weight").f16() == m16.weight("embed.weight").f16() && copy.weight("embed.weight").f16());
     // A weight with a value outside fp16's range stays float32.
     std::map<std::string, Tensor> w;
     for (const auto& kv : m16.weights()) w[kv.first] = kv.second.to_tensor();
@@ -862,61 +892,130 @@ static void test_fp16_model(const Model& m16) {
     CHECK(big.fp32_weights() == std::vector<std::string>{"embed.weight"});
 }
 
-// Model::load with fp16 converts each tensor as it is read: the same model as converting afterwards,
-// from float32 and from fp16 tensors in the file.
-static void test_fp16_load() {
-    const ModelConfig cfg = tiny([](ModelConfig& c) { c.bias = true; c.norm = "layernorm"; });
-    const Model m = random_model(cfg, 9);
-    std::map<std::string, Tensor> w;
-    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
-    const std::string cfg_json = R"({"vocab_size": 50, "d_model": 16, "n_layers": 2, "n_heads": 4, "max_seq_len": 32, )"
-                                 R"("mlp_multiple_of": 8, "bias": true, "norm": "layernorm"})";
+// A safetensors file of `tensors` with `cfg_json` as its config; dtype(name) picks "F32", "F16" or
+// "BF16" (rounded to nearest even) for each tensor.
+static void write_safetensors(const std::string& path, const std::string& cfg_json,
+                              const std::map<std::string, Tensor>& tensors,
+                              const std::function<std::string(const std::string&)>& dtype) {
     std::string escaped;
     for (char ch : cfg_json) {
         if (ch == '"' || ch == '\\') escaped += '\\';
         escaped += ch;
     }
-    // embed.weight stored as F16 in the file, the rest as F32.
     std::string header = "{\"__metadata__\": {\"config\": \"" + escaped + "\"}", data;
-    for (const auto& kv : w) {
-        const bool f16 = kv.first == "embed.weight";
+    for (const auto& kv : tensors) {
+        const std::string type = dtype(kv.first);
         const size_t begin = data.size();
         for (float v : kv.second.data) {
-            if (f16) {
-                const uint16_t hb = detail::float_to_half(v);
-                data.append(reinterpret_cast<const char*>(&hb), 2);
-            } else {
+            if (type == "F32") {
                 data.append(reinterpret_cast<const char*>(&v), 4);
+                continue;
             }
+            uint16_t hb;
+            if (type == "F16") {
+                hb = detail::float_to_half(v);
+            } else {
+                uint32_t x;
+                std::memcpy(&x, &v, 4);
+                hb = static_cast<uint16_t>((x + 0x7FFF + ((x >> 16) & 1)) >> 16);
+            }
+            data.append(reinterpret_cast<const char*>(&hb), 2);
         }
         std::string shape;
         for (int64_t d : kv.second.shape) shape += (shape.empty() ? "" : ", ") + std::to_string(d);
-        header += ", \"" + kv.first + "\": {\"dtype\": \"" + (f16 ? "F16" : "F32") + "\", \"shape\": [" + shape +
-                  "], \"data_offsets\": [" + std::to_string(begin) + ", " + std::to_string(data.size()) + "]}";
+        header += ", \"" + kv.first + "\": {\"dtype\": \"" + type + "\", \"shape\": [" + shape + "], \"data_offsets\": [" +
+                  std::to_string(begin) + ", " + std::to_string(data.size()) + "]}";
     }
     header += "}";
-    const std::string path = "/tmp/tfi_unit_fp16_" + std::to_string(::getpid()) + ".safetensors";
-    {
-        std::ofstream f(path, std::ios::binary);
-        const uint64_t n = header.size();
-        unsigned char len[8];
-        for (int i = 0; i < 8; ++i) len[i] = static_cast<unsigned char>(n >> (8 * i));
-        f.write(reinterpret_cast<const char*>(len), 8);
-        f << header << data;
+    std::ofstream f(path, std::ios::binary);
+    const uint64_t n = header.size();
+    unsigned char len[8];
+    for (int i = 0; i < 8; ++i) len[i] = static_cast<unsigned char>(n >> (8 * i));
+    f.write(reinterpret_cast<const char*>(len), 8);
+    f << header << data;
+}
+
+// What a file stores for v in `dtype`, read back as float32.
+static float stored(float v, const std::string& dtype) {
+    if (dtype == "F16") return detail::half_to_float(detail::float_to_half(v));
+    if (dtype == "BF16") {
+        uint32_t x;
+        std::memcpy(&x, &v, 4);
+        x = ((x + 0x7FFF + ((x >> 16) & 1)) >> 16) << 16;
+        std::memcpy(&v, &x, 4);
     }
-    w["embed.weight"] = Weight::fp16(w["embed.weight"]).to_tensor();  // what the file holds
+    return v;
+}
+
+// Model::load reads each 2-D tensor straight into its weight, converting as it reads when the file's
+// type differs from the one kept in memory: the same model as building it from the file's values.
+static void check_load(const std::string& path, const std::string& cfg_json, const ModelConfig& cfg,
+                       std::map<std::string, Tensor> w, const std::function<std::string(const std::string&)>& dtype) {
+    write_safetensors(path, cfg_json, w, dtype);
+    for (auto& kv : w)
+        for (float& v : kv.second.data) v = stored(v, dtype(kv.first));  // what the file holds
     const Model want16(cfg, w, WeightFormat::fp16), want32(cfg, w);
     const Model got16 = Model::load(path, WeightFormat::fp16), got32 = Model::load(path);
     std::remove(path.c_str());
     CHECK(got16.weight_format() == WeightFormat::fp16 && got32.weight_format() == WeightFormat::fp32);
-    CHECK(got16.weights().size() == want16.weights().size());
+    CHECK(got16.weights().size() == want16.weights().size() && got32.weights().size() == want32.weights().size());
+    bool same = true;
     for (const auto& kv : want16.weights()) {
         const Weight* g = got16.weight_or_null(kv.first);
-        CHECK(g && g->is_fp16() == kv.second.is_fp16() && g->to_tensor().data == kv.second.to_tensor().data);
-        CHECK(got32.weight(kv.first).to_tensor().data == want32.weight(kv.first).to_tensor().data);
+        same &= g && g->is_fp16() == kv.second.is_fp16() && g->to_tensor().data == kv.second.to_tensor().data;
+        const Weight* g32 = got32.weight_or_null(kv.first);
+        same &= g32 && !g32->is_fp16() && g32->to_tensor().data == want32.weight(kv.first).to_tensor().data;
     }
-    const Tokens t = seq(10, 2);
+    CHECK(same);
+    CHECK(got16.fp32_weights() == want16.fp32_weights());
+    const Tokens t = seq(10, 2, cfg.vocab_size);
     CHECK(got16.forward(t).data == want16.forward(t).data);
+    CHECK(got32.forward(t).data == want32.forward(t).data);
+}
+
+static void test_fp16_load() {
+    const std::string path = "/tmp/tfi_unit_fp16_" + std::to_string(::getpid()) + ".safetensors";
+    const ModelConfig cfg = tiny([](ModelConfig& c) { c.bias = true; c.norm = "layernorm"; });
+    const std::string cfg_json = R"({"vocab_size": 50, "d_model": 16, "n_layers": 2, "n_heads": 4, "max_seq_len": 32, )"
+                                 R"("mlp_multiple_of": 8, "bias": true, "norm": "layernorm"})";
+    std::map<std::string, Tensor> w;
+    const Model m = random_model(cfg, 9);
+    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+    // F16 embedding; a BF16 matrix and bias; the rest F32, one matrix with a value outside fp16's range
+    // (with fp16, read again as float32).
+    w["blocks.1.attn.q_proj.weight"].data[5] = 1e5f;
+    auto mixed = [](const std::string& n) -> std::string {
+        if (n == "embed.weight") return "F16";
+        if (n == "blocks.0.mlp.up.weight" || n == "blocks.0.mlp.up.bias") return "BF16";
+        return "F32";
+    };
+    check_load(path, cfg_json, cfg, w, mixed);
+    // Everything in fp16, and everything in BF16.
+    w["blocks.1.attn.q_proj.weight"].data[5] = 0.5f;
+    check_load(path, cfg_json, cfg, w, [](const std::string&) { return std::string("F16"); });
+    check_load(path, cfg_json, cfg, w, [](const std::string&) { return std::string("BF16"); });
+    // An F16 tensor holding an infinity is not taken as fp16: it stays float32, as a float32 weight
+    // outside fp16's range does.
+    w["embed.weight"].data[7] = INFINITY;
+    check_load(path, cfg_json, cfg, w, mixed);
+    write_safetensors(path, cfg_json, w, mixed);
+    const Model inf16 = Model::load(path, WeightFormat::fp16);
+    std::remove(path.c_str());
+    CHECK(!inf16.weight("embed.weight").is_fp16() && std::isinf(inf16.weight("embed.weight").to_tensor().data[7]));
+    CHECK(inf16.fp32_weights() == std::vector<std::string>{"embed.weight"});
+    CHECK(inf16.weight("blocks.0.attn.q_proj.weight").is_fp16());
+    // An embedding of more than one conversion block (2^20 values), F32 and F16 in the file.
+    const ModelConfig big = tiny([](ModelConfig& c) { c.vocab_size = 70000; c.n_layers = 1; });
+    const std::string big_json = R"({"vocab_size": 70000, "d_model": 16, "n_layers": 1, "n_heads": 4, "max_seq_len": 32, )"
+                                 R"("mlp_multiple_of": 8})";
+    std::map<std::string, Tensor> wb;
+    const Model mb = random_model(big, 3);
+    for (const auto& kv : mb.weights()) wb[kv.first] = kv.second.to_tensor();
+    CHECK(wb.at("embed.weight").numel() > (int64_t(1) << 20));
+    wb["embed.weight"].data[(int64_t(1) << 20) + 3] = -7e4f;  // in the second block: fp16 keeps it float32
+    check_load(path, big_json, big, wb, [](const std::string&) { return std::string("F32"); });
+    wb["embed.weight"].data[(int64_t(1) << 20) + 3] = 0.25f;
+    check_load(path, big_json, big, wb, [](const std::string&) { return std::string("F16"); });
 }
 
 // Every weight must have the shape the config implies: a model with any one weight a row (or an
@@ -1238,6 +1337,7 @@ static void test_gpu_resident(const Model& m) {
         return;
     }
     detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
     const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, T = 9;
     const Tokens t = seq(T, 7);
     ActivationCache cache;
@@ -1300,6 +1400,7 @@ static void test_gpu_resident(const Model& m) {
         CHECK(max_abs_diff(h16, got) > 0.f);
     }
     detail::set_gpu_min_rows(0);
+    detail::set_gpu_min_work(0);
 }
 
 // Batched gradient passes on the GPU (Model::gradients_rows) = one run_with_gradients per sequence,
@@ -1630,6 +1731,7 @@ static void test_gpu_attribution(const Model& m) {
         cpu.push_back(attribution_patch_heads(m, clean, corrupt, pos, 1, -1, steps).effect);
         set_use_gpu(true);
         detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
         for (const int64_t rows : {0, 7, 1000}) {  // default, one sequence per batch, all in one
             detail::set_patch_batch_rows(0, rows);
             size_t i = 0;
@@ -1642,9 +1744,11 @@ static void test_gpu_attribution(const Model& m) {
         }
         detail::set_patch_batch_rows(0, 0);
         detail::set_gpu_min_rows(0);
+    detail::set_gpu_min_work(0);
     }
     CHECK(differs);
     detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
     set_num_threads(1);
     const Tensor a1 = attribution_patch_residual(m, clean, corrupt, "attn_out", pos, 1, 2, 5).effect;
     const Tensor h1 = mixed_patch_heads(m, clean, corrupt, pos, 1, -1, 3, 5).effect;
@@ -1660,6 +1764,7 @@ static void test_gpu_attribution(const Model& m) {
     test_attribution_patching(m);
     test_mixed_patching(m);
     detail::set_gpu_min_rows(0);
+    detail::set_gpu_min_work(0);
 }
 #endif
 
@@ -1670,6 +1775,7 @@ static void test_gpu_fp16_matches_rounded(const Model& m16) {
     const Model r = rounded_copy(m16);
     if (!m16.gpu() || !r.gpu()) return;
     detail::set_gpu_min_rows(1);
+    detail::set_gpu_min_work(1);
     const int64_t L = m16.cfg().n_layers, T = 9;
     const Tokens t = seq(T, 7);
     ActivationCache cache;
@@ -1722,6 +1828,34 @@ static void test_gpu_fp16_matches_rounded(const Model& m16) {
         CHECK(a[s].size() == b[s].size() && !a[s].empty());
         for (const auto& kv : b[s]) CHECK(a[s].count(kv.first) && a[s].at(kv.first).data == kv.second.data);
     }
+    detail::set_gpu_min_rows(0);
+    detail::set_gpu_min_work(0);
+}
+#endif
+
+#ifdef TFI_USE_ACCELERATE
+// The GPU is used only when the batches big enough for it add up to enough work to repay starting it:
+// a tiny model never starts it, whatever the batch sizes, unless the threshold is lowered.
+static void test_gpu_work_threshold() {
+    const ModelConfig cfg = tiny();
+    const Tokens clean = seq(12, 1), corrupt = [&] { Tokens t = clean; t[5] = (t[5] + 1) % 50; return t; }();
+    detail::set_gpu_min_rows(1);  // every batch is GPU-sized
+    CHECK(detail::gpu_min_work() == 6e10);
+    {
+        const Model m = random_model(cfg, 2);
+        const Tensor r = patch_residual(m, clean, corrupt, "resid_pre", 11, 1, 2).effect;
+        const Tensor h = attribution_patch_residual(m, clean, corrupt, "resid_pre", 11, 1, 2, 8).effect;
+        const Tensor a = head_ablation(m, clean, Ablation::Zero, {});
+        CHECK(!m.has_gpu());  // far below the threshold: everything ran on the CPU
+        detail::set_gpu_min_work(1);
+        const Model g = random_model(cfg, 2);
+        check_close(patch_residual(g, clean, corrupt, "resid_pre", 11, 1, 2).effect, r);
+        CHECK(g.has_gpu() || !detail::Gpu::create());  // now it starts (when there is a Metal device)
+        check_close(attribution_patch_residual(g, clean, corrupt, "resid_pre", 11, 1, 2, 8).effect, h);
+        check_close(head_ablation(g, clean, Ablation::Zero, {}), a);
+    }
+    detail::set_gpu_min_work(0);
+    CHECK(detail::gpu_min_work() == 6e10);
     detail::set_gpu_min_rows(0);
 }
 #endif
@@ -1782,6 +1916,7 @@ int main() {
     run("vector math", test_vector_math);
 #ifdef TFI_USE_ACCELERATE
     run("GPU linear layer (macOS)", test_gpu_linear);
+    run("GPU used only with enough work (macOS)", test_gpu_work_threshold);
     run("GPU block operations (macOS)", test_gpu_seq);
     for (const auto& kv : gpu_block_configs())
         run("GPU-resident batched passes = per-layer and plain (macOS): " + kv.first,
