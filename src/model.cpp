@@ -109,13 +109,17 @@ void activation_grad_(Tensor& t, const std::string& act) {
 }
 
 // (T, H*D) -> (H, T, D)
-Tensor split_heads(const Tensor& x, int64_t H, int64_t D) {
-    const int64_t T = x.shape[0];
+Tensor split_heads(const float* x, int64_t T, int64_t H, int64_t D) {
     Tensor out({H, T, D});
     for (int64_t t = 0; t < T; ++t)
-        for (int64_t h = 0; h < H; ++h)
-            for (int64_t d = 0; d < D; ++d) out.data[(h * T + t) * D + d] = x.data[t * H * D + h * D + d];
+        for (int64_t h = 0; h < H; ++h) std::copy(x + (t * H + h) * D, x + (t * H + h + 1) * D, out.ptr() + (h * T + t) * D);
     return out;
+}
+
+Tensor split_heads(const Tensor& x, int64_t H, int64_t D) {
+    if (x.dim() != 2 || x.shape[1] != H * D)
+        throw std::invalid_argument("split_heads: expected (T, " + std::to_string(H * D) + "), got " + shape_str(x.shape));
+    return split_heads(x.ptr(), x.shape[0], H, D);
 }
 
 Tensor merge_heads(const Tensor& x) {
@@ -571,13 +575,23 @@ Tensor Model::attention(int64_t layer, const Tensor& x, const Hooks* hooks, cons
 Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks* hooks,
                      const detail::RowBatch* batch) const {
     const ModelConfig& c = layer_cfgs_[layer];
-    const std::string p = layer_prefix(layer) + "attn.";
-    const int64_t T = q2.shape[0], H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv;
+    const int64_t T = q2.shape[0], Hd = c.n_heads * c.head_dim(), KVd = c.kv_heads() * c.head_dim();
+    if (q2.dim() != 2 || q2.shape[1] != Hd || k2.shape != Shape{T, KVd} || v2.shape != Shape{T, KVd})
+        throw std::invalid_argument("attend: q, k, v must be (T, H*D), (T, Hkv*D), (T, Hkv*D)");
+    Tensor z({T, Hd});
+    attend_into(layer, q2.ptr(), k2.ptr(), v2.ptr(), T, hooks, batch, z.ptr());
+    return z;
+}
 
-    Tensor q = split_heads(q2, H, D);
-    Tensor k = split_heads(k2, Hkv, D);
-    Tensor v = split_heads(v2, Hkv, D);
-    q2 = k2 = v2 = Tensor();
+void Model::attend_into(int64_t layer, const float* q2, const float* k2, const float* v2, int64_t T, const Hooks* hooks,
+                        const detail::RowBatch* batch, float* z_out) const {
+    const ModelConfig& c = layer_cfgs_[layer];
+    const std::string p = layer_prefix(layer) + "attn.";
+    const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv;
+
+    Tensor q = split_heads(q2, T, H, D);
+    Tensor k = split_heads(k2, T, Hkv, D);
+    Tensor v = split_heads(v2, T, Hkv, D);
     if (c.qk_norm) {
         ModelConfig qc = c;
         if (qc.norm == "none") qc.norm = "rmsnorm";
@@ -600,7 +614,10 @@ Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks
     HeadAttention ha{D, static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D))),
                      c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f, 0.f,
                      c.sliding_window ? *c.sliding_window : 0};
-    Tensor z({T, H, D});
+    // z goes straight to z_out, unless a hook needs it as a tensor first.
+    const bool hook_z = hooks && hooks->matches(p + "hook_z");
+    Tensor zt = hook_z ? Tensor({T, H, D}) : Tensor();
+    float* z = hook_z ? zt.ptr() : z_out;
     if (!batch) {
         Tensor pattern({H, T, T});
         for (int64_t h = 0; h < H; ++h) {
@@ -611,7 +628,7 @@ Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks
         hook(hooks, p + "hook_pattern", pattern);
         for (int64_t h = 0; h < H; ++h) {
             const float* vh = v.ptr() + (h / rep) * T * D;
-            ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z.ptr() + h * D, H * D);
+            ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z + h * D, H * D);
         }
     } else {  // stacked segments: no hook_pattern (each segment has its own pattern)
         std::vector<float> probs;
@@ -627,12 +644,15 @@ Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks
                 ha.pattern(q.ptr() + (h * T + off) * D, n, first, pk ? pk->ptr() + g * Tp * D : nullptr,
                            k.ptr() + (g * T + off) * D, probs.data(), nk);
                 ha.apply(probs.data(), n, first, nk, pv ? pv->ptr() + g * Tp * D : nullptr, v.ptr() + (g * T + off) * D,
-                         z.ptr() + (off * H + h) * D, H * D);
+                         z + (off * H + h) * D, H * D);
             }
         }
     }
-    hook(hooks, p + "hook_z", z);
-    return std::move(z).reshape({T, H * D});
+    if (hook_z) {
+        hook(hooks, p + "hook_z", zt);
+        if (zt.numel() != T * H * D) throw std::runtime_error(p + "hook_z changed the activation's size");
+        std::copy(zt.ptr(), zt.ptr() + T * H * D, z_out);
+    }
 }
 
 Tensor Model::mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const {
@@ -1058,10 +1078,19 @@ bool gpu_side_hooked(const Hooks* hooks, int64_t layer) {
 // On the GPU, each run of blocks with no hook on a GPU-side activation keeps the residual stream on
 // the GPU: one submission per block (Gpu::Seq), the CPU doing only attention in between. A block
 // with such a hook, or the CPU path, runs Model::block (linear layers still go to the GPU).
-Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks) const {
-    const int64_t L = cfg_.n_layers;
+Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows) const {
+    const int64_t L = cfg_.n_layers, d = cfg_.d_model, S = static_cast<int64_t>(batch.start.size());
+    // Each segment's last row of a (rows, d) residual stream at `src`.
+    auto lasts = [&](const float* src) {
+        Tensor out({S, d});
+        for (int64_t s = 0; s < S; ++s) {
+            const int64_t r = batch.offset[s] + batch.len[s] - 1;
+            std::copy(src + r * d, src + (r + 1) * d, out.ptr() + s * d);
+        }
+        return out;
+    };
 #ifdef TFI_USE_ACCELERATE
-    const int64_t R = batch.rows(), d = cfg_.d_model;
+    const int64_t R = batch.rows();
     if (g_gpu_resident.load() && batch.gpu && R >= detail::gpu_min_rows()) {
         detail::Gpu::Seq s(*batch.gpu);
         GpuBlocks gb{*this, s, R, d};
@@ -1084,29 +1113,25 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
             s.run(batch.fp16);
             for (int64_t l = i; l < j; ++l) {
                 const ModelConfig& c = layer_cfgs_[l];
-                const int64_t Hd = c.n_heads * c.head_dim(), KVd = c.kv_heads() * c.head_dim();
-                auto get = [&](int slot, int64_t width) {
-                    Tensor t({R, width});
-                    std::copy(s.data(slot), s.data(slot) + R * width, t.ptr());
-                    return t;
-                };
-                const Tensor z = attend(l, get(kQ, Hd), get(kK, KVd), get(kV, KVd), hooks, &batch);
-                std::copy(z.ptr(), z.ptr() + R * Hd, s.reserve(kZ, R * Hd));
+                // Attention reads q, k, v from their GPU buffers and writes z into its own: no copies.
+                float* z = s.reserve(kZ, R * c.n_heads * c.head_dim());
+                attend_into(l, s.data(kQ), s.data(kK), s.data(kV), R, hooks, &batch, z);
                 const int next = cur == kResid0 ? kResid1 : kResid0;
                 gb.after_attention(l, inference_slots(c, l, cur, next));
                 cur = next;
                 if (l + 1 < j) gb.before_attention(l + 1, inference_slots(layer_cfgs_[l + 1], l + 1, cur, cur == kResid0 ? kResid1 : kResid0));
                 s.run(batch.fp16);
             }
+            if (j == L && last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
             x = Tensor({R, d});
             std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());
             i = j;
         }
-        return x;
+        return last_rows ? lasts(x.ptr()) : x;
     }
 #endif
     for (int64_t i = layer; i < L; ++i) x = block(i, std::move(x), hooks, &batch);
-    return x;
+    return last_rows ? lasts(x.ptr()) : x;
 }
 
 // Forward: one submission per block as in run_rows, keeping each block's activations on the GPU
@@ -1149,18 +1174,21 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
         float* z = s.reserve(kZ, R * H * D);
         for (int64_t g = 0; g < S; ++g) {
             SegAttn& a = saved[l][g];
-            Tensor q2 = rows(kQ, g, H * D), k2 = rows(kK, g, Hkv * D), v2 = rows(kV, g, Hkv * D);
+            const int64_t off = batch.offset[g], n = batch.len[g];
+            // This segment's rows of the GPU buffers, read in place.
+            const float* q2 = s.data(kQ) + off * H * D;
+            const float* k2 = s.data(kK) + off * Hkv * D;
+            const float* v2 = s.data(kV) + off * Hkv * D;
             if (c.qk_norm) {
-                a.q0 = detail::split_heads(q2, H, D);
-                a.k0 = detail::split_heads(k2, Hkv, D);
+                a.q0 = detail::split_heads(q2, n, H, D);
+                a.k0 = detail::split_heads(k2, n, Hkv, D);
             }
             Hooks keep;
             keep.add(p + "hook_q", [&](const std::string&, Tensor& t) { a.q = t; });
             keep.add(p + "hook_k", [&](const std::string&, Tensor& t) { a.k = t; });
             keep.add(p + "hook_v", [&](const std::string&, Tensor& t) { a.v = t; });
             keep.add(p + "hook_pattern", [&](const std::string&, Tensor& t) { a.pattern = t; });
-            const Tensor zg = attend(l, std::move(q2), std::move(k2), std::move(v2), &keep, nullptr);
-            std::copy(zg.ptr(), zg.ptr() + zg.numel(), z + batch.offset[g] * H * D);
+            attend_into(l, q2, k2, v2, n, &keep, nullptr, z + off * H * D);
         }
         gb.after_attention(l, saved_slots(l));
         if (l + 1 < L) gb.before_attention(l + 1, saved_slots(l + 1));
@@ -1195,23 +1223,24 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
     auto g_post = [&](int64_t l) { return l == L - 1 ? static_cast<int>(kTop) : grad_slots(l + 1).resid_pre; };
     std::vector<GpuBlocks::Reported> rep(L);
     std::vector<int> base(L);
-    std::vector<Tensor> dz(L);  // dF/dz, (rows, H*D)
+    std::vector<ActivationCache> out(S);
     base[L - 1] = gb.backward_before(L - 1, saved_slots(L - 1), grad_slots(L - 1), g_post(L - 1), rep[L - 1]);
     s.run(false);
     for (int64_t l = L - 1; l >= 0; --l) {
         const ModelConfig& c = layer_cfgs_[l];
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
-        dz[l] = Tensor({R, H * D});
-        std::copy(s.data(kDZ), s.data(kDZ) + R * H * D, dz[l].ptr());
+        const bool want_z = wanted(layer_prefix(l) + "attn.hook_z");
         float* dq = s.reserve(kDQ, R * H * D);
         float* dk = s.reserve(kDK, R * Hkv * D);
         float* dv = s.reserve(kDV, R * Hkv * D);
         for (int64_t g = 0; g < S; ++g) {
             const SegAttn& a = saved[l][g];
             const int64_t off = batch.offset[g], n = batch.len[g];
-            const Tensor dzg({n, H * D}, std::vector<float>(dz[l].ptr() + off * H * D, dz[l].ptr() + (off + n) * H * D));
+            // dF/dz of this segment, straight from its GPU buffer.
+            Tensor dzg({n, H * D}, std::vector<float>(s.data(kDZ) + off * H * D, s.data(kDZ) + (off + n) * H * D));
             const detail::AttentionGrads ag = detail::attention_backward(
                 *this, l, dzg, a.q, a.k, a.v, a.pattern, c.qk_norm ? &a.q0 : nullptr, c.qk_norm ? &a.k0 : nullptr);
+            if (want_z) out[g][layer_prefix(l) + "attn.hook_z"] = std::move(dzg).reshape({n, H, D});
             std::copy(ag.q_proj.ptr(), ag.q_proj.ptr() + n * H * D, dq + off * H * D);
             std::copy(ag.k_proj.ptr(), ag.k_proj.ptr() + n * Hkv * D, dk + off * Hkv * D);
             std::copy(ag.v_proj.ptr(), ag.v_proj.ptr() + n * Hkv * D, dv + off * Hkv * D);
@@ -1221,25 +1250,17 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
         s.run(false);
     }
 
-    std::vector<ActivationCache> out(S);
     auto put = [&](const std::string& name, int slot) {
         if (slot < 0 || !wanted(name)) return;
         for (int64_t g = 0; g < S; ++g) out[g][name] = rows(slot, g, d);
     };
     for (int64_t l = 0; l < L; ++l) {
-        const ModelConfig& c = layer_cfgs_[l];
         const std::string p = layer_prefix(l);
         put(p + "hook_resid_pre", grad_slots(l).resid_pre);
         put(p + "hook_resid_post", g_post(l));
         put(p + "hook_resid_mid", rep[l].mid);
         put(p + "hook_attn_out", rep[l].attn_out);
         put(p + "hook_mlp_out", rep[l].mlp_out);
-        if (wanted(p + "attn.hook_z"))
-            for (int64_t g = 0; g < S; ++g) {
-                const int64_t off = batch.offset[g], n = batch.len[g], Hd = c.n_heads * c.head_dim();
-                out[g][p + "attn.hook_z"] =
-                    Tensor({n, c.n_heads, c.head_dim()}, std::vector<float>(dz[l].ptr() + off * Hd, dz[l].ptr() + (off + n) * Hd));
-            }
     }
     put("hook_embed", grad_slots(0).resid_pre);
     return out;
@@ -1259,14 +1280,7 @@ Tensor Model::forward_rows_final(int64_t layer, Tensor x, const detail::RowBatch
 
 Tensor Model::forward_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks) const {
     check_rows(*this, layer, x, batch);
-    x = run_rows(layer, std::move(x), batch, hooks);
-    const int64_t S = static_cast<int64_t>(batch.start.size()), d = cfg_.d_model;
-    Tensor last({S, d});
-    for (int64_t s = 0; s < S; ++s) {
-        const int64_t r = batch.offset[s] + batch.len[s] - 1;
-        std::copy(x.ptr() + r * d, x.ptr() + (r + 1) * d, last.ptr() + s * d);
-    }
-    return logits_from_final(final_norm(last));
+    return logits_from_final(final_norm(run_rows(layer, std::move(x), batch, hooks, /*last_rows=*/true)));
 }
 
 Tensor Model::run_with_cache(const Tokens& tokens, ActivationCache& cache, NameFilter filter, const Hooks* hooks) const {

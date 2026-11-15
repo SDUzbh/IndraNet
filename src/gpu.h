@@ -7,10 +7,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "tfi/tensor.h"
 #include "tfi/weight.h"
+#include "gpu_chunks.h"
 
 namespace tfi {
 namespace detail {
@@ -21,6 +23,7 @@ enum class GpuAct : int32_t { Relu, Gelu, GeluTanh, Silu, Tanh, Relu2 };
 class Gpu {
   public:
     class Seq;
+    class Batch;
 
     // nullptr when there is no Metal device (e.g. some virtual machines): callers then use the CPU.
     static std::unique_ptr<Gpu> create();
@@ -87,6 +90,60 @@ class Gpu::Seq {
     // range the whole run is repeated in fp32. So the recorded operations must not overwrite a slot
     // that they read before writing it (anything the CPU or an earlier run left there).
     void run(bool fp16);
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Independent GPU work whose results only come back to the CPU at the end (circuits). Operations
+// are recorded in groups; run() hands them to run_chunks (gpu_chunks.h): whole groups per command
+// buffer under gpu_chunk_flops(), all committed before one wait, a failed one run again, and
+// GpuFailure if it keeps failing (the caller then computes the result on the CPU). So a group must
+// never read a scratch value that another group wrote.
+// One per thread; the Gpu must outlive it. Buffers stay until release() or the Batch's end.
+class Gpu::Batch {
+  public:
+    explicit Batch(Gpu& gpu);
+    ~Batch();
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+
+    // A buffer of `count` float32 values (or with fp16, fp16 values) in memory shared with the
+    // CPU: inputs the CPU writes through floats() or halves(), scratch, and outputs the CPU reads
+    // after run().
+    int buffer(int64_t count, bool fp16 = false);
+    float* floats(int buf);
+    uint16_t* halves(int buf);  // fp16 bit patterns
+    const uint32_t* uints(int buf) { return reinterpret_cast<const uint32_t*>(floats(buf)); }
+    // A 2-D model weight (float32 or fp16), used in place. With fp16, a float32 weight's fp16 copy
+    // instead (kept by the Gpu), unless a value doesn't fit fp16: then the float32 weight.
+    // The weight must outlive the Batch.
+    int weight(const Weight& W, bool fp16 = false);
+    bool is_fp16(int buf);
+    void release(int buf);  // back to the GPU's pool; the number is not reused
+
+    // A matrix inside a buffer: its first element and row stride, in elements.
+    struct Mat {
+        int buf;
+        int64_t offset;
+        int64_t ld;
+    };
+    // C (m, n) = A (m, k) B (k, n), or with trans_b A B^T for B (n, k). A and B are float32 or
+    // (weights) fp16; C is float32.
+    void matmul(Mat A, Mat B, Mat C, int64_t m, int64_t n, int64_t k, bool trans_b);
+    // out[out_offset + i * (cols / bn) + j] = the sum of squares of block (i, j), bm x bn, of the
+    // rows x cols matrix C (rows and cols multiples of bm and bn).
+    void block_sumsq(Mat C, int64_t rows, int64_t cols, int64_t bm, int64_t bn, int out, int64_t out_offset);
+    // uints(out)[out_offset + r] = the index of the largest of row r's n values (the first on ties).
+    void row_argmax(Mat C, int64_t rows, int64_t n, int out, int64_t out_offset);
+    // dst = src as fp16, n contiguous values from the buffers' starts. A value outside fp16's range
+    // sets overflowed() (the caller then does the work again in float32).
+    void to_half(int src, int dst, int64_t n);
+    bool overflowed();  // since the last run() began
+    void end_group();  // the operations since the previous end_group() form one group
+    // Run every group recorded since the last run() and wait for all of them.
+    void run();
 
   private:
     struct Impl;

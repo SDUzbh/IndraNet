@@ -154,8 +154,14 @@ class Model {
     // Attention from the projections q (T, H*D), k and v (T, Hkv*D): qk_norm, RoPE, hook_q/k/v, the
     // pattern and hook_z. Returns z as (T, H*D), before o_proj.
     Tensor attend(int64_t layer, Tensor q, Tensor k, Tensor v, const Hooks* hooks, const detail::RowBatch* batch) const;
-    // Blocks layer..n_layers-1 of a batched pass; returns the residual stream after the last one.
-    Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks) const;
+    // attend() reading q, k, v as row-major arrays of T rows and writing z (T, H*D) to z_out: the
+    // batched GPU passes use it on their GPU buffers in place.
+    void attend_into(int64_t layer, const float* q, const float* k, const float* v, int64_t T, const Hooks* hooks,
+                     const detail::RowBatch* batch, float* z_out) const;
+    // Blocks layer..n_layers-1 of a batched pass; returns the residual stream after the last one:
+    // every row, or with last_rows only each segment's last row, (segments, d_model).
+    Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks,
+                    bool last_rows = false) const;
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
     Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
     Tensor positional_embedding(int64_t T) const;

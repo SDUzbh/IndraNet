@@ -20,6 +20,7 @@ void activate_(Tensor& t, const std::string& act);
 // d act(x) / dx, elementwise, for the pre-activation x.
 void activation_grad_(Tensor& x, const std::string& act);
 Tensor split_heads(const Tensor& x, int64_t H, int64_t D);  // (T, H*D) -> (H, T, D)
+Tensor split_heads(const float* x, int64_t T, int64_t H, int64_t D);  // the same from a row-major (T, H*D) array
 Tensor merge_heads(const Tensor& x);                        // (H, T, D) -> (T, H*D)
 // Rotate (H, T, D) in place at positions 0..T-1 (indranet's "rotate half" RoPE), or at positions[t]
 // for row t when given. `inverse` rotates back, which is also the transpose: the backward pass.
@@ -58,6 +59,9 @@ void set_patch_batch_rows(int64_t residual, int64_t heads);
 // For tests (macOS): false runs a batched pass's GPU work one linear layer at a time, the residual
 // stream returning to the CPU after each, instead of keeping it on the GPU (Model::run_rows).
 void set_gpu_resident(bool on);
+// For tests (macOS): the GPU's circuits computations keep each run's inputs under this many bytes,
+// splitting the work into several runs if needed; 0 restores the default (512 MB).
+void set_circuits_run_bytes(int64_t bytes);
 
 struct RowBatch {
     std::vector<int64_t> start, len, offset;

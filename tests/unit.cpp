@@ -23,6 +23,7 @@
 #include "../src/gpu.h"    // internal (macOS): GPU matrix multiplies
 #include "../src/ops.h"    // internal: patching batch sizes
 #include "../src/half.h"   // internal: fp16 conversion
+#include "../src/gpu_chunks.h"  // internal: chunked GPU work (portable half)
 
 using namespace tfi;
 
@@ -1055,6 +1056,84 @@ static void test_weight_shapes_checked() {
     }
 }
 
+// The portable half of chunked GPU work: packing groups under a budget, and running chunks through a
+// fake backend that logs every call and fails on command. Every chunk is submitted before the first
+// wait; only failed chunks run again, each up to twice; a third failure throws GpuFailure.
+static void test_gpu_chunks() {
+    using detail::Chunk;
+    auto same = [](const std::vector<Chunk>& a, const std::vector<std::pair<size_t, size_t>>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].first != b[i].first || a[i].last != b[i].second) return false;
+        return true;
+    };
+    CHECK(same(detail::pack_chunks({1, 1, 1, 1}, 2), {{0, 2}, {2, 4}}));
+    CHECK(same(detail::pack_chunks({1, 5, 1, 1}, 2), {{0, 1}, {1, 2}, {2, 4}}));  // too big: alone
+    CHECK(same(detail::pack_chunks({1, 1, 1}, 100), {{0, 3}}));
+    CHECK(same(detail::pack_chunks({0, 0, 3}, 2), {{0, 2}, {2, 3}}));
+    CHECK(detail::pack_chunks({}, 2).empty());
+
+    struct Fake : detail::ChunkBackend {
+        std::vector<std::string> log;             // "s<first>" per submit, "w<first>" per wait
+        std::vector<size_t> ticket_chunk;         // ticket -> chunk's first group
+        std::map<size_t, int> fail;               // chunk's first group -> failures left
+        size_t submit(const Chunk& c) override {
+            log.push_back("s" + std::to_string(c.first));
+            ticket_chunk.push_back(c.first);
+            return ticket_chunk.size() - 1;
+        }
+        bool wait(size_t t) override {
+            const size_t c = ticket_chunk.at(t);
+            log.push_back("w" + std::to_string(c));
+            if (fail[c] > 0) {
+                --fail[c];
+                return false;
+            }
+            return true;
+        }
+    };
+    const std::vector<Chunk> chunks = {{0, 2}, {2, 3}, {3, 5}};
+    {
+        Fake f;
+        detail::run_chunks(f, chunks);
+        CHECK((f.log == std::vector<std::string>{"s0", "s2", "s3", "w0", "w2", "w3"}));
+    }
+    {   // chunk 2 fails once, chunk 3 twice: each runs again after all the first waits, on its own
+        Fake f;
+        f.fail[2] = 1;
+        f.fail[3] = 2;
+        detail::run_chunks(f, chunks);
+        CHECK((f.log == std::vector<std::string>{"s0", "s2", "s3", "w0", "w2", "w3", "s2", "w2", "s3", "w3", "s3", "w3"}));
+    }
+    {   // three failures in a row: GpuFailure
+        Fake f;
+        f.fail[3] = 3;
+        bool threw = false;
+        try {
+            detail::run_chunks(f, chunks);
+        } catch (const detail::GpuFailure&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    {   // a test-injected failure counts like a GPU failure, once per request
+        Fake f;
+        detail::set_gpu_fail_chunks(1);
+        detail::run_chunks(f, chunks);
+        CHECK((f.log == std::vector<std::string>{"s0", "s2", "s3", "w0", "w2", "w3", "s0", "w0"}));
+        detail::set_gpu_fail_chunks(0);
+    }
+    {   // nothing to run
+        Fake f;
+        detail::run_chunks(f, {});
+        CHECK(f.log.empty());
+    }
+    CHECK(detail::gpu_chunk_flops() == 1.5e12);
+    detail::set_gpu_chunk_flops(7);
+    CHECK(detail::gpu_chunk_flops() == 7);
+    detail::set_gpu_chunk_flops(0);
+}
+
 static void test_vector_math() {
     auto ulp_error = [](float got, double want) {
         const float w = static_cast<float>(std::fabs(want));
@@ -1875,6 +1954,158 @@ static void test_gpu_work_threshold() {
 }
 #endif
 
+#ifdef TFI_USE_ACCELERATE
+// Gpu::Batch's operations against the CPU: multiplies on sub-matrices (offsets, strides, transposed
+// or not, fp16 weights in place), block sums of squares, row argmaxes (the first on ties), and
+// layouts that don't fit their buffers refused.
+static void test_gpu_batch() {
+    const auto g = detail::Gpu::create();
+    if (!g) return;
+    std::mt19937_64 rng(11);
+    std::normal_distribution<float> nd;
+    using Mat = detail::Gpu::Batch::Mat;
+    Tensor A({40, 70}), B({90, 70}), Bk({70, 33});
+    for (Tensor* t : {&A, &B, &Bk})
+        for (float& v : t->data) v = nd(rng);
+    const Weight B16 = Weight::fp16(B), B32(B);
+    detail::Gpu::Batch batch(*g);
+    const int a = batch.buffer(A.numel()), bk = batch.buffer(Bk.numel());
+    std::copy(A.data.begin(), A.data.end(), batch.floats(a));
+    std::copy(Bk.data.begin(), Bk.data.end(), batch.floats(bk));
+    const int w16 = batch.weight(B16), w32 = batch.weight(B32);
+    const int c1 = batch.buffer(30 * 60), c2 = batch.buffer(30 * 60), c3 = batch.buffer(40 * 33);
+    // C (30, 50) at column 5 of a 60-wide buffer = A[5:35, 10:70] B[20:70, 10:70]^T.
+    batch.matmul(Mat{a, 5 * 70 + 10, 70}, Mat{w16, 20 * 70 + 10, 70}, Mat{c1, 5, 60}, 30, 50, 60, true);
+    batch.matmul(Mat{a, 5 * 70 + 10, 70}, Mat{w32, 20 * 70 + 10, 70}, Mat{c2, 5, 60}, 30, 50, 60, true);
+    batch.end_group();
+    batch.matmul(Mat{a, 0, 70}, Mat{bk, 0, 33}, Mat{c3, 0, 33}, 40, 33, 70, false);
+    const int sums = batch.buffer(6 * 5), top = batch.buffer(40);
+    batch.block_sumsq(Mat{c3, 0, 33}, 36, 30, 6, 6, sums, 0);
+    batch.row_argmax(Mat{c3, 0, 33}, 40, 33, top, 0);
+    batch.run();
+    const Tensor Bh = B16.to_tensor();
+    double e16 = 0, e32 = 0;
+    for (int64_t i = 0; i < 30; ++i)
+        for (int64_t j = 0; j < 50; ++j) {
+            double w16v = 0, w32v = 0;
+            for (int64_t k = 0; k < 60; ++k) {
+                w16v += double(A.data[(5 + i) * 70 + 10 + k]) * Bh.data[(20 + j) * 70 + 10 + k];
+                w32v += double(A.data[(5 + i) * 70 + 10 + k]) * B.data[(20 + j) * 70 + 10 + k];
+            }
+            e16 = std::max(e16, std::fabs(batch.floats(c1)[i * 60 + 5 + j] - w16v));
+            e32 = std::max(e32, std::fabs(batch.floats(c2)[i * 60 + 5 + j] - w32v));
+        }
+    CHECK(e16 < 1e-4 && e32 < 1e-4);  // the fp16 weight's own values, multiplied in fp32
+    const Tensor C = matmul(A, Bk);
+    CHECK(max_abs_diff(Tensor({40, 33}, std::vector<float>(batch.floats(c3), batch.floats(c3) + 40 * 33)), C) < 1e-4f);
+    bool sums_ok = true, top_ok = true;
+    for (int64_t bi = 0; bi < 6; ++bi)
+        for (int64_t bj = 0; bj < 5; ++bj) {
+            double want = 0;
+            for (int64_t r = 0; r < 6; ++r)
+                for (int64_t q = 0; q < 6; ++q) want += double(batch.floats(c3)[(bi * 6 + r) * 33 + bj * 6 + q]) * batch.floats(c3)[(bi * 6 + r) * 33 + bj * 6 + q];
+            sums_ok &= std::fabs(batch.floats(sums)[bi * 5 + bj] - want) <= 1e-4 * std::max(1.0, want);
+        }
+    for (int64_t r = 0; r < 40; ++r) top_ok &= int64_t(batch.uints(top)[r]) == topk(batch.floats(c3) + r * 33, 33, 1)[0];
+    CHECK(sums_ok && top_ok);
+    // Ties: the first index wins.
+    const int tie = batch.buffer(2 * 600), tie_top = batch.buffer(2);
+    float* tv = batch.floats(tie);
+    for (int64_t i = 0; i < 1200; ++i) tv[i] = -1.f;
+    tv[417] = tv[523] = tv[599] = 2.f;
+    tv[600 + 3] = tv[600 + 300] = 0.f;
+    batch.row_argmax(Mat{tie, 0, 600}, 2, 600, tie_top, 0);
+    batch.run();
+    CHECK(batch.uints(tie_top)[0] == 417 && batch.uints(tie_top)[1] == 3);
+    CHECK_THROWS(batch.matmul(Mat{a, 0, 70}, Mat{bk, 0, 33}, Mat{c3, 0, 33}, 41, 33, 70, false));  // past A's end
+    CHECK_THROWS(batch.block_sumsq(Mat{c3, 0, 33}, 36, 30, 7, 6, sums, 0));                      // blocks don't tile
+    CHECK_THROWS(batch.matmul(Mat{a, 0, 70}, Mat{bk, 0, 33}, Mat{w32, 0, 33}, 40, 33, 70, false));  // a weight as output
+    batch.release(c1);
+    CHECK_THROWS(batch.floats(c1));
+}
+
+// circuits on the GPU = on the CPU: composition scores to float rounding (a different but equal
+// formula), OV copying and two-head paths exactly but for near-ties. Splitting the work into
+// smaller command buffers or runs changes nothing; a command buffer that fails is run again, with
+// the same results; one that keeps failing leaves the work to the CPU.
+static void test_gpu_circuits(const Model& m) {
+    if (!m.gpu()) return;
+    const int64_t n = 64;
+    set_use_gpu(false);
+    const Composition cc = composition_scores(m);
+    const Tensor oc = ov_copying_scores(m, n), pc = ov_pair_copying_scores(m, n);
+    set_use_gpu(true);
+    detail::set_gpu_min_work(1);
+    auto close = [](const Tensor& a, const Tensor& b, double tol) {
+        if (a.shape != b.shape) return false;
+        for (int64_t i = 0; i < a.numel(); ++i)
+            if (std::isnan(a.data[i]) ? !std::isnan(b.data[i]) : !(std::fabs(a.data[i] - b.data[i]) <= tol)) return false;
+        return true;
+    };
+    auto same = [&](const Tensor& a, const Tensor& b) { return close(a, b, 0.0); };
+    const Composition cg = composition_scores(m);
+    const Tensor og = ov_copying_scores(m, n), pg = ov_pair_copying_scores(m, n);
+    CHECK(m.has_gpu());
+    CHECK(close(cg.q, cc.q, 1e-5) && close(cg.k, cc.k, 1e-5) && close(cg.v, cc.v, 1e-5));
+    CHECK(close(og, oc, 1.5 / n) && close(pg, pc, 1.5 / n));
+    // One group per command buffer, one layer per run: the same.
+    detail::set_gpu_chunk_flops(1);
+    detail::set_circuits_run_bytes(1);
+    const Composition cs = composition_scores(m);
+    CHECK(same(cs.q, cg.q) && same(cs.k, cg.k) && same(cs.v, cg.v));
+    CHECK(same(ov_copying_scores(m, n), og) && same(ov_pair_copying_scores(m, n), pg));
+    // A failed command buffer runs again: the same results.
+    detail::set_gpu_fail_chunks(2);
+    const Composition cr = composition_scores(m);
+    CHECK(same(cr.q, cg.q) && same(cr.k, cg.k) && same(cr.v, cg.v));
+    detail::set_gpu_fail_chunks(2);
+    CHECK(same(ov_copying_scores(m, n), og));
+    detail::set_gpu_fail_chunks(2);
+    CHECK(same(ov_pair_copying_scores(m, n), pg));
+    // Failing every time: the CPU's results.
+    detail::set_gpu_fail_chunks(1 << 30);
+    const Composition cf = composition_scores(m);
+    CHECK(same(cf.q, cc.q) && same(cf.k, cc.k) && same(cf.v, cc.v));
+    CHECK(same(ov_copying_scores(m, n), oc) && same(ov_pair_copying_scores(m, n), pc));
+    detail::set_gpu_fail_chunks(0);
+    detail::set_gpu_chunk_flops(0);
+    detail::set_circuits_run_bytes(0);
+
+    // fp16 inputs: close to the CPU, and really fp16 (composition differs from float32 in its last bits).
+    set_gpu_fp16(true);
+    const Composition ch = composition_scores(m);
+    double comp_scale = 0, diff32 = 0;
+    for (const float v : cc.q.data)
+        if (!std::isnan(v)) comp_scale = std::max(comp_scale, double(std::fabs(v)));
+    for (int64_t i = 0; i < ch.q.numel(); ++i)
+        if (!std::isnan(cg.q.data[i])) diff32 = std::max(diff32, double(std::fabs(ch.q.data[i] - cg.q.data[i])));
+    const double tol = 5e-3 * std::max(1.0, comp_scale);
+    CHECK(close(ch.q, cc.q, tol) && close(ch.k, cc.k, tol) && close(ch.v, cc.v, tol));
+    CHECK(diff32 > 0);
+    CHECK(close(ov_copying_scores(m, n), oc, 4.0 / n) && close(ov_pair_copying_scores(m, n), pc, 4.0 / n));
+    // Values too large for fp16: the work runs again in float32, with float32's results. First an
+    // input that doesn't fit (W_O x 1e6), then products that don't while their inputs do
+    // (embeddings and W_O x 1000).
+    for (const float scale : {1e6f, 1e3f}) {
+        std::map<std::string, Tensor> w;
+        for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+        for (auto& kv : w)
+            if (kv.first.find("o_proj.weight") != std::string::npos || (scale < 1e6f && kv.first == "embed.weight"))
+                for (float& v : kv.second.data) v *= scale;
+        const Model big(m.cfg(), w);
+        set_gpu_fp16(false);
+        const Composition b32 = composition_scores(big);
+        const Tensor o32 = ov_copying_scores(big, n), p32 = ov_pair_copying_scores(big, n);
+        set_gpu_fp16(true);
+        const Composition b16 = composition_scores(big);
+        if (scale == 1e6f) CHECK(same(b16.q, b32.q) && same(b16.k, b32.k) && same(b16.v, b32.v));
+        CHECK(same(ov_copying_scores(big, n), o32) && same(ov_pair_copying_scores(big, n), p32));
+    }
+    set_gpu_fp16(false);
+    detail::set_gpu_min_work(0);
+}
+#endif
+
 int main() {
     auto run = [](const std::string& name, const std::function<void()>& fn) {
         const int before = g_failures;
@@ -1929,9 +2160,14 @@ int main() {
     run("OV copying + positional QK", test_copying_and_positional);
     run("post-norm DLA refused", test_post_norm_dla_refused);
     run("vector math", test_vector_math);
+    run("chunked GPU work: packing, retries, failure", test_gpu_chunks);
 #ifdef TFI_USE_ACCELERATE
     run("GPU linear layer (macOS)", test_gpu_linear);
     run("GPU used only with enough work (macOS)", test_gpu_work_threshold);
+    run("GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);
+    for (const auto& kv : gpu_block_configs())
+        run("circuits on the GPU = CPU, chunked, retried, falling back (macOS): " + kv.first,
+            [&] { test_gpu_circuits(random_model(kv.second, 46)); });
     run("GPU block operations (macOS)", test_gpu_seq);
     for (const auto& kv : gpu_block_configs())
         run("GPU-resident batched passes = per-layer and plain (macOS): " + kv.first,

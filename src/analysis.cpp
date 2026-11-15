@@ -15,7 +15,12 @@
 #include <thread>
 
 #include "gpu.h"
+#include "half.h"
 #include "ops.h"
+
+#ifdef TFI_USE_ACCELERATE
+#include <Accelerate/Accelerate.h>
+#endif
 
 namespace tfi {
 
@@ -1221,6 +1226,153 @@ HeadWeights head_weights(const Model& m, int64_t layer, int64_t head) {
 Tensor ov_matrix(const HeadWeights& h) { return matmul(h.W_O, h.W_V); }
 Tensor qk_matrix(const HeadWeights& h) { return matmul(transpose2d(h.W_Q), h.W_K); }
 
+namespace {
+std::atomic<int64_t> g_circuits_run_bytes{0};
+}  // namespace
+
+void detail::set_circuits_run_bytes(int64_t bytes) { g_circuits_run_bytes = bytes; }
+
+#ifdef TFI_USE_ACCELERATE
+namespace {
+
+int64_t circuits_run_bytes() {
+    const int64_t b = g_circuits_run_bytes.load();
+    return b > 0 ? b : int64_t(512) << 20;
+}
+
+// The model's GPU for one weight-based computation of `work` multiply-adds, or null: then the CPU
+// does it (as for the batched passes: only above gpu_min_work, unless the GPU has started already).
+detail::Gpu* gpu_for_work(const Model& m, double work) {
+    if (!use_gpu() || work <= 0 || (!m.has_gpu() && work < detail::gpu_min_work())) return nullptr;
+    return m.gpu();
+}
+
+// How a GPU circuits computation went: too little work (the CPU does it), done, or a value too
+// large for fp16 inputs (it runs again in float32).
+enum class GpuRun { NotWorth, Done, Overflow };
+
+// Writes n float32 values into a batch buffer at `offset`: as they are, or into an fp16 buffer
+// rounded, counting into `bad` the values that don't fit fp16.
+void put(detail::Gpu::Batch& batch, int buf, int64_t offset, const float* src, int64_t n, std::atomic<int64_t>& bad) {
+    if (batch.is_fp16(buf)) bad += detail::floats_to_halves(src, batch.halves(buf) + offset, n);
+    else std::copy(src, src + n, batch.floats(buf) + offset);
+}
+
+// F with F F^T = G, for a symmetric positive semi-definite (r, r) G: its eigenvectors times the
+// square roots of its eigenvalues (rounding's tiny negative ones clamped to 0).
+Tensor gram_factor(const Tensor& G) {
+    const int64_t r = G.shape[0];
+    std::vector<float> a(G.data), w(static_cast<size_t>(r));  // symmetric: row-major = column-major
+    __LAPACK_int n = static_cast<__LAPACK_int>(r), lda = n, info = 0, lwork = -1, liwork = -1, iwork_size = 0;
+    float work_size = 0;
+    const char jobz = 'V', uplo = 'U';
+    ssyevd_(&jobz, &uplo, &n, a.data(), &lda, w.data(), &work_size, &lwork, &iwork_size, &liwork, &info);
+    lwork = static_cast<__LAPACK_int>(work_size);
+    liwork = iwork_size;
+    std::vector<float> work(static_cast<size_t>(std::max<__LAPACK_int>(lwork, 1)));
+    std::vector<__LAPACK_int> iwork(static_cast<size_t>(std::max<__LAPACK_int>(liwork, 1)));
+    ssyevd_(&jobz, &uplo, &n, a.data(), &lda, w.data(), work.data(), &lwork, iwork.data(), &liwork, &info);
+    if (info != 0) throw std::runtime_error("eigen-decomposition of a head's Gram matrix failed");
+    Tensor F({r, r});
+    for (int64_t j = 0; j < r; ++j) {  // column j of a (column-major) is eigenvector j
+        const float s = std::sqrt(std::max(w[j], 0.f));
+        for (int64_t i = 0; i < r; ++i) F.data[i * r + j] = a[j * r + i] * s;
+    }
+    return F;
+}
+
+// composition_scores' pairs on the GPU. A pair's score is sqrt(tr(C^T G_L C G_R)) over a norm, for
+// its block C of W_reader W_O,writer (see compose). With F F^T = G for each Gram matrix that's the
+// Frobenius norm of (F_L^T W_reader) (W_O,writer F_R): the factors fold into the weights once per
+// head, one multiply per pair of layers gives every head pair's block, and the GPU sums each block's
+// squares. With fp16 the factored weights go to the GPU as fp16 (its fast multiplies), the sums
+// staying float32.
+GpuRun composition_gpu(const Model& m, const std::vector<std::pair<int64_t, int64_t>>& ids,
+                       const std::vector<HeadCache>& heads, Composition& c, bool fp16) {
+    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, N = static_cast<int64_t>(ids.size());
+    auto H = [&](int64_t l) { return m.layer_cfg(l).n_heads; };
+    auto D = [&](int64_t l) { return m.layer_cfg(l).head_dim(); };
+    std::vector<int64_t> first(L + 1, 0);  // layer l's heads are ids[first[l] .. first[l + 1])
+    for (int64_t l = 0; l < L; ++l) first[l + 1] = first[l] + H(l);
+    double work = 0;
+    int64_t scratch = 0;
+    for (int64_t lb = 1; lb < L; ++lb)
+        for (int64_t la = 0; la < lb; ++la) {
+            work += 3.0 * double(H(lb) * D(lb)) * double(d) * double(H(la) * D(la));
+            scratch = std::max(scratch, 3 * H(lb) * D(lb) * H(la) * D(la));
+        }
+    detail::Gpu* gpu = gpu_for_work(m, work);
+    if (!gpu) return GpuRun::NotWorth;
+    detail::Gpu::Batch batch(*gpu);
+    using Mat = detail::Gpu::Batch::Mat;
+    std::atomic<int64_t> bad{0};  // values that don't fit fp16
+    // Writer side of every layer: W_O F(G_V) per head, side by side: (d, H D).
+    std::vector<int> wb(L);
+    for (int64_t l = 0; l < L; ++l) wb[l] = batch.buffer(d * H(l) * D(l), fp16);
+    parallel_for(N, [&](int64_t a) {
+        const int64_t l = ids[a].first, h = ids[a].second, Dl = D(l), cols = H(l) * Dl;
+        const Tensor B = matmul(heads[a].w.W_O, gram_factor(heads[a].GV));  // (d, D)
+        for (int64_t r = 0; r < d; ++r) put(batch, wb[l], r * cols + h * Dl, B.ptr() + r * Dl, Dl, bad);
+    });
+    if (bad) return GpuRun::Overflow;
+    const int prod = batch.buffer(scratch);
+    // Reader side, as many layers per run as fit circuits_run_bytes(): rows [Q, K, V][head][D] of
+    // F^T W for F of G_K, G_Q and G_OV^T, (3 H D, d).
+    for (int64_t lb = 1; lb < L;) {
+        int64_t end = lb, bytes = 0;
+        do {
+            bytes += 3 * H(end) * D(end) * d * 4;
+            ++end;
+        } while (end < L && bytes + 3 * H(end) * D(end) * d * 4 <= circuits_run_bytes());
+        std::vector<int> rb(L, -1), out(L, -1);
+        for (int64_t l = lb; l < end; ++l) {
+            rb[l] = batch.buffer(3 * H(l) * D(l) * d, fp16);
+            out[l] = batch.buffer(3 * H(l) * first[l]);
+        }
+        parallel_for(first[end] - first[lb], [&](int64_t j) {
+            const int64_t b = first[lb] + j, l = ids[b].first, h = ids[b].second, Dl = D(l);
+            const HeadCache& r = heads[b];
+            const Tensor* G[3] = {&r.GK, &r.GQ, &r.GOt};
+            const Tensor* W[3] = {&r.w.W_Q, &r.w.W_K, &r.w.W_V};
+            for (int kind = 0; kind < 3; ++kind) {
+                const Tensor A = matmul(transpose2d(gram_factor(*G[kind])), *W[kind]);  // (D, d)
+                put(batch, rb[l], ((kind * H(l) + h) * Dl) * d, A.ptr(), A.numel(), bad);
+            }
+        });
+        if (bad) return GpuRun::Overflow;
+        for (int64_t l = lb; l < end; ++l)
+            for (int64_t la = 0; la < l; ++la) {
+                const int64_t R = 3 * H(l) * D(l), C = H(la) * D(la);
+                batch.matmul(Mat{rb[l], 0, d}, Mat{wb[la], 0, C}, Mat{prod, 0, C}, R, C, d, false);
+                batch.block_sumsq(Mat{prod, 0, C}, R, C, D(l), D(la), out[l], 3 * H(l) * first[la]);
+                batch.end_group();
+            }
+        batch.run();
+        for (int64_t l = lb; l < end; ++l) {
+            const float* o = batch.floats(out[l]);
+            for (int64_t la = 0; la < l; ++la)
+                for (int64_t i = 0; i < H(l); ++i)
+                    for (int64_t j = 0; j < H(la); ++j) {
+                        const int64_t a = first[la] + j, b = first[l] + i;
+                        const HeadCache &w = heads[a], &r = heads[b];
+                        auto score = [&](int kind) {
+                            return std::sqrt(std::max(0.f, o[3 * H(l) * first[la] + (kind * H(l) + i) * H(la) + j]));
+                        };
+                        c.q.data[a * N + b] = score(0) / (r.qk_norm * w.ov_norm);
+                        c.k.data[a * N + b] = score(1) / (r.qk_norm * w.ov_norm);
+                        c.v.data[a * N + b] = score(2) / (r.ov_norm * w.ov_norm);
+                    }
+            batch.release(rb[l]);
+            batch.release(out[l]);
+        }
+        lb = end;
+    }
+    return GpuRun::Done;
+}
+
+}  // namespace
+#endif
+
 // The heads' Gram matrices are computed in parallel, then the pairs. Each pair's arithmetic is the
 // same as on one thread, so the scores don't depend on the thread count.
 Composition composition_scores(const Model& m) {
@@ -1241,6 +1393,14 @@ Composition composition_scores(const Model& m) {
     for (int64_t a = 0; a < N; ++a)
         for (int64_t b = 0; b < N; ++b)
             if (ids[a].first < ids[b].first) pairs.emplace_back(a, b);
+#ifdef TFI_USE_ACCELERATE
+    try {
+        GpuRun r = composition_gpu(m, ids, heads, c, gpu_fp16());
+        if (r == GpuRun::Overflow) r = composition_gpu(m, ids, heads, c, false);
+        if (r == GpuRun::Done) return c;
+    } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+    }
+#endif
     parallel_for(static_cast<int64_t>(pairs.size()), [&](int64_t n) {
         const auto [a, b] = pairs[n];
         const CompScores s = compose(heads[a], heads[b]);
@@ -1326,6 +1486,224 @@ struct OvPaths {
 
 }  // namespace
 
+#ifdef TFI_USE_ACCELERATE
+namespace {
+
+// What OvPaths reads, without its float32 copy of the unembedding: the GPU uses the unembedding in
+// place and folds the final norm's scale into each head's W_O instead.
+struct OvInputs {
+    Tokens toks;
+    Tensor X;                    // the sampled tokens' embeddings (n, d)
+    Tensor final_gamma;          // the final norm's scale, or empty
+    std::vector<Tensor> gamma;   // each layer's ln1 scale (folded into W_V by head_weights), or empty
+    OvInputs(const Model& m, int64_t max_tokens) {
+        const ModelConfig& cfg = m.cfg();
+        const int64_t V = cfg.vocab_size, d = cfg.d_model, n = std::min(V, max_tokens);
+        toks.resize(n);
+        for (int64_t i = 0; i < n; ++i) toks[i] = i * V / n;  // as OvPaths
+        const Weight& E = m.weight("embed.weight");
+        X = Tensor({n, d});
+        for (int64_t i = 0; i < n; ++i) E.read_rows(toks[i], toks[i] + 1, X.ptr() + i * d);
+        if (cfg.norm != "none" && cfg.norm_position != "post") final_gamma = m.weight("ln_final.weight").f32();
+        for (int64_t l = 0; l < cfg.n_layers; ++l) {
+            const ModelConfig& c = m.layer_cfg(l);
+            gamma.push_back(c.norm != "none" && c.norm_position != "post" ? m.weight(lp(l) + "ln1.weight").f32() : Tensor());
+        }
+    }
+    // X with layer l's ln1 scale on each column: X W_V^T for the scaled W_V.
+    Tensor x(int64_t l) const {
+        Tensor out = X;
+        const int64_t n = X.shape[0], d = X.shape[1];
+        if (!gamma[l].empty())
+            for (int64_t i = 0; i < n; ++i)
+                for (int64_t j = 0; j < d; ++j) out.data[i * d + j] *= gamma[l].data[j];
+        return out;
+    }
+    // Layer l's W_O transposed, (H D, d), with the final norm's scale on each column.
+    Tensor wo_t(const Model& m, int64_t l) const {
+        const Tensor O = m.weight(lp(l) + "attn.o_proj.weight").to_tensor();  // (d, H D)
+        const int64_t d = O.shape[0], HD = O.shape[1];
+        Tensor out({HD, d});
+        for (int64_t c = 0; c < HD; ++c)
+            for (int64_t j = 0; j < d; ++j) out.data[c * d + j] = O.data[j * HD + c] * (final_gamma.empty() ? 1.f : final_gamma.data[j]);
+        return out;
+    }
+};
+
+using Mat = detail::Gpu::Batch::Mat;
+
+// ov_copying_scores on the GPU, a layer per group: (U W_O)^T for all its heads in one multiply, X W_V^T
+// likewise, then each head's logits (n, V) and their largest entries. With fp16 every multiply takes
+// fp16 inputs: the products that feed another multiply are converted on the GPU, which reports a
+// value too large (Overflow).
+GpuRun ov_copying_gpu(const Model& m, int64_t max_tokens, Tensor& out, bool fp16) {
+    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, V = m.cfg().vocab_size, H = m.max_heads();
+    const int64_t n = std::min(V, max_tokens);
+    double work = 0;
+    int64_t max_hd = 0, max_kv = 0;
+    for (int64_t l = 0; l < L; ++l) {
+        const ModelConfig& c = m.layer_cfg(l);
+        const int64_t HD = c.n_heads * c.head_dim(), KV = c.kv_heads() * c.head_dim();
+        work += double(HD) * d * V + double(n) * HD * V + double(n) * d * KV;
+        max_hd = std::max(max_hd, HD);
+        max_kv = std::max(max_kv, KV);
+    }
+    detail::Gpu* gpu = gpu_for_work(m, work);
+    if (!gpu) return GpuRun::NotWorth;
+    const OvInputs in(m, max_tokens);
+    detail::Gpu::Batch batch(*gpu);
+    std::atomic<int64_t> bad{0};
+    const int U = batch.weight(m.unembed(), fp16);
+    if (fp16 && !batch.is_fp16(U)) return GpuRun::Overflow;
+    const int uo_t = batch.buffer(max_hd * V), xv = batch.buffer(n * max_kv), logits = batch.buffer(n * V);
+    // fp16 copies of the products that feed the next multiply (the float32 ones without fp16).
+    const int uo_h = fp16 ? batch.buffer(max_hd * V, true) : uo_t, xv_h = fp16 ? batch.buffer(n * max_kv, true) : xv;
+    for (int64_t l0 = 0; l0 < L;) {  // as many layers per run as fit circuits_run_bytes()
+        int64_t l1 = l0, bytes = 0;
+        do {
+            bytes += (m.layer_cfg(l1).n_heads * m.layer_cfg(l1).head_dim() * d + n * d) * 4;
+            ++l1;
+        } while (l1 < L && bytes + (m.layer_cfg(l1).n_heads * m.layer_cfg(l1).head_dim() * d + n * d) * 4 <= circuits_run_bytes());
+        std::vector<int> wo(L, -1), x(L, -1), idx(L, -1);
+        for (int64_t l = l0; l < l1; ++l) {
+            const ModelConfig& c = m.layer_cfg(l);
+            const int64_t Hl = c.n_heads, D = c.head_dim(), HD = Hl * D, KV = c.kv_heads() * D, rep = Hl / c.kv_heads();
+            wo[l] = batch.buffer(HD * d, fp16);
+            x[l] = batch.buffer(n * d, fp16);
+            idx[l] = batch.buffer(Hl * n);
+            const Tensor wo_t = in.wo_t(m, l), xl = in.x(l);
+            put(batch, wo[l], 0, wo_t.ptr(), wo_t.numel(), bad);
+            put(batch, x[l], 0, xl.ptr(), xl.numel(), bad);
+            const int Wv = batch.weight(m.weight(lp(l) + "attn.v_proj.weight"), fp16);
+            if (bad || (fp16 && !batch.is_fp16(Wv))) return GpuRun::Overflow;
+            batch.matmul(Mat{wo[l], 0, d}, Mat{U, 0, d}, Mat{uo_t, 0, V}, HD, V, d, true);  // (H D, V)
+            batch.matmul(Mat{x[l], 0, d}, Mat{Wv, 0, d}, Mat{xv, 0, KV}, n, KV, d, true);   // (n, Hkv D)
+            if (fp16) {
+                batch.to_half(uo_t, uo_h, HD * V);
+                batch.to_half(xv, xv_h, n * KV);
+            }
+            for (int64_t h = 0; h < Hl; ++h) {
+                batch.matmul(Mat{xv_h, (h / rep) * D, KV}, Mat{uo_h, h * D * V, V}, Mat{logits, 0, V}, n, V, D, false);
+                batch.row_argmax(Mat{logits, 0, V}, n, V, idx[l], h * n);
+            }
+            batch.end_group();
+        }
+        batch.run();
+        if (batch.overflowed()) return GpuRun::Overflow;
+        for (int64_t l = l0; l < l1; ++l) {
+            const uint32_t* top = batch.uints(idx[l]);
+            for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h) {
+                int64_t hit = 0;
+                for (int64_t r = 0; r < n; ++r) hit += static_cast<int64_t>(top[h * n + r]) == in.toks[r];
+                out.data[l * H + h] = float(hit) / float(n);
+            }
+            batch.release(wo[l]);
+            batch.release(x[l]);
+            batch.release(idx[l]);
+        }
+        l0 = l1;
+    }
+    return GpuRun::Done;
+}
+
+// ov_pair_copying_scores on the GPU: a group per (reader layer, writer layer), each recomputing what
+// it needs, so groups share no scratch. fp16 as in ov_copying_gpu.
+GpuRun ov_pair_copying_gpu(const Model& m, int64_t max_tokens, const std::vector<std::pair<int64_t, int64_t>>& ids,
+                           Tensor& out, bool fp16) {
+    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, V = m.cfg().vocab_size, N = static_cast<int64_t>(ids.size());
+    const int64_t n = std::min(V, max_tokens);
+    auto H = [&](int64_t l) { return m.layer_cfg(l).n_heads; };
+    auto D = [&](int64_t l) { return m.layer_cfg(l).head_dim(); };
+    auto KV = [&](int64_t l) { return m.layer_cfg(l).kv_heads() * D(l); };
+    std::vector<int64_t> first(L + 1, 0);
+    for (int64_t l = 0; l < L; ++l) first[l + 1] = first[l] + H(l);
+    double work = 0;
+    int64_t max_hd = 0, max_kv = 0, max_m = 0, max_d = 0;
+    for (int64_t lb = 0; lb < L; ++lb) {
+        max_hd = std::max(max_hd, H(lb) * D(lb));
+        max_kv = std::max(max_kv, KV(lb));
+        max_d = std::max(max_d, D(lb));
+        for (int64_t la = 0; la < lb; ++la) {
+            work += double(H(la) * H(lb)) * n * D(lb) * V + double(H(lb) * D(lb)) * d * V;
+            max_m = std::max(max_m, KV(lb) * H(la) * D(la));
+        }
+    }
+    detail::Gpu* gpu = gpu_for_work(m, work);
+    if (!gpu) return GpuRun::NotWorth;
+    const OvInputs in(m, max_tokens);
+    detail::Gpu::Batch batch(*gpu);
+    std::atomic<int64_t> bad{0};
+    const int U = batch.weight(m.unembed(), fp16);
+    const int uo_t = batch.buffer(max_hd * V), xv = batch.buffer(n * max_kv), M = batch.buffer(std::max<int64_t>(max_m, 1));
+    const int a2 = batch.buffer(n * max_d), logits = batch.buffer(n * V);
+    const int uo_h = fp16 ? batch.buffer(max_hd * V, true) : uo_t, xv_h = fp16 ? batch.buffer(n * max_kv, true) : xv;
+    const int M_h = fp16 ? batch.buffer(std::max<int64_t>(max_m, 1), true) : M, a2_h = fp16 ? batch.buffer(n * max_d, true) : a2;
+    std::vector<int> wo(L), x(L), vs(L), wv(L), o(L);
+    for (int64_t l = 0; l < L; ++l) {
+        wo[l] = batch.buffer(H(l) * D(l) * d, fp16);
+        const Tensor wo_t = in.wo_t(m, l), xl = in.x(l);
+        put(batch, wo[l], 0, wo_t.ptr(), wo_t.numel(), bad);
+        x[l] = batch.buffer(n * d, fp16);
+        put(batch, x[l], 0, xl.ptr(), xl.numel(), bad);
+        // W_V with ln1's scale on each column, (Hkv D, d): the reader side of W_V(b) W_O(a).
+        vs[l] = batch.buffer(KV(l) * d, fp16);
+        Tensor Wv = m.weight(lp(l) + "attn.v_proj.weight").to_tensor();
+        if (!in.gamma[l].empty())
+            for (int64_t r = 0; r < KV(l); ++r)
+                for (int64_t j = 0; j < d; ++j) Wv.data[r * d + j] *= in.gamma[l].data[j];
+        put(batch, vs[l], 0, Wv.ptr(), Wv.numel(), bad);
+        wv[l] = batch.weight(m.weight(lp(l) + "attn.v_proj.weight"), fp16);
+        o[l] = batch.weight(m.weight(lp(l) + "attn.o_proj.weight"), fp16);
+        if (fp16 && !(batch.is_fp16(wv[l]) && batch.is_fp16(o[l]))) return GpuRun::Overflow;
+    }
+    if (bad || (fp16 && !batch.is_fp16(U))) return GpuRun::Overflow;
+    // Each (writer, reader) pair's top tokens, at pair_index * n.
+    std::vector<int64_t> slot(static_cast<size_t>(N * N), -1);
+    int64_t pairs = 0;
+    for (int64_t a = 0; a < N; ++a)
+        for (int64_t b = 0; b < N; ++b)
+            if (ids[a].first < ids[b].first) slot[a * N + b] = pairs++;
+    const int idx = batch.buffer(std::max<int64_t>(pairs, 1) * n);
+    for (int64_t lb = 1; lb < L; ++lb)
+        for (int64_t la = 0; la < lb; ++la) {
+            const int64_t Db = D(lb), Da = D(la), rep_b = H(lb) / m.layer_cfg(lb).kv_heads(),
+                          rep_a = H(la) / m.layer_cfg(la).kv_heads(), ldm = H(la) * Da;
+            batch.matmul(Mat{wo[lb], 0, d}, Mat{U, 0, d}, Mat{uo_t, 0, V}, H(lb) * Db, V, d, true);  // reader's (U W_O)^T
+            batch.matmul(Mat{x[la], 0, d}, Mat{wv[la], 0, d}, Mat{xv, 0, KV(la)}, n, KV(la), d, true);  // writer's X W_V^T
+            batch.matmul(Mat{vs[lb], 0, d}, Mat{o[la], 0, ldm}, Mat{M, 0, ldm}, KV(lb), ldm, d, false);  // W_V(b) W_O(a)
+            if (fp16) {
+                batch.to_half(uo_t, uo_h, H(lb) * Db * V);
+                batch.to_half(xv, xv_h, n * KV(la));
+                batch.to_half(M, M_h, KV(lb) * ldm);
+            }
+            for (int64_t i = 0; i < H(la); ++i)
+                for (int64_t j = 0; j < H(lb); ++j) {
+                    const int64_t a = first[la] + i, b = first[lb] + j;
+                    // A' = (X W_V(a)^T) (W_V(b) W_O(a))^T, (n, D_b); then its logits through b's (U W_O)^T.
+                    batch.matmul(Mat{xv_h, (i / rep_a) * Da, KV(la)}, Mat{M_h, (j / rep_b) * Db * ldm + i * Da, ldm},
+                                 Mat{a2, 0, Db}, n, Db, Da, true);
+                    if (fp16) batch.to_half(a2, a2_h, n * Db);
+                    batch.matmul(Mat{a2_h, 0, Db}, Mat{uo_h, j * Db * V, V}, Mat{logits, 0, V}, n, V, Db, false);
+                    batch.row_argmax(Mat{logits, 0, V}, n, V, idx, slot[a * N + b] * n);
+                }
+            batch.end_group();
+        }
+    batch.run();
+    if (batch.overflowed()) return GpuRun::Overflow;
+    const uint32_t* top = batch.uints(idx);
+    for (int64_t a = 0; a < N; ++a)
+        for (int64_t b = 0; b < N; ++b) {
+            if (slot[a * N + b] < 0) continue;
+            int64_t hit = 0;
+            for (int64_t r = 0; r < n; ++r) hit += static_cast<int64_t>(top[slot[a * N + b] * n + r]) == in.toks[r];
+            out.data[a * N + b] = float(hit) / float(n);
+        }
+    return GpuRun::Done;
+}
+
+}  // namespace
+#endif
+
 float ov_path_copying(const Model& m, const std::vector<std::pair<int64_t, int64_t>>& path, int64_t max_tokens) {
     if (path.empty()) throw std::invalid_argument("OV path needs at least one head");
     for (size_t i = 1; i < path.size(); ++i)
@@ -1340,6 +1718,15 @@ float ov_path_copying(const Model& m, const std::vector<std::pair<int64_t, int64
 
 Tensor ov_copying_scores(const Model& m, int64_t max_tokens) {
     const int64_t L = m.cfg().n_layers, H = m.max_heads();
+#ifdef TFI_USE_ACCELERATE
+    try {
+        Tensor out({L, H}, kNaN);
+        GpuRun r = ov_copying_gpu(m, max_tokens, out, gpu_fp16());
+        if (r == GpuRun::Overflow) r = ov_copying_gpu(m, max_tokens, out, false);
+        if (r == GpuRun::Done) return out;
+    } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+    }
+#endif
     const OvPaths ov(m, max_tokens);
     std::vector<std::pair<int64_t, int64_t>> ids;
     for (int64_t i = 0; i < L; ++i)
@@ -1358,6 +1745,15 @@ Tensor ov_pair_copying_scores(const Model& m, int64_t max_tokens) {
     for (int64_t i = 0; i < m.cfg().n_layers; ++i)
         for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) ids.emplace_back(i, h);
     const int64_t N = static_cast<int64_t>(ids.size());
+#ifdef TFI_USE_ACCELERATE
+    try {
+        Tensor out({N, N}, kNaN);
+        GpuRun r = ov_pair_copying_gpu(m, max_tokens, ids, out, gpu_fp16());
+        if (r == GpuRun::Overflow) r = ov_pair_copying_gpu(m, max_tokens, ids, out, false);
+        if (r == GpuRun::Done) return out;
+    } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+    }
+#endif
     const OvPaths ov(m, max_tokens);
     std::vector<HeadWeights> w(N);
     std::vector<Tensor> A(N);  // each head as the writer: (n, D)

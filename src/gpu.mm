@@ -203,6 +203,64 @@ static float tg_sum(float v, threadgroup float* part, uint lane, uint sg, uint n
 
 struct NormArgs { uint d; float eps; uint layernorm; uint has_b; };
 
+// One threadgroup per block: the sum of squares of a bm x bn block of a matrix with row stride ld.
+struct BlockArgs { uint ld, bm, bn, nbc; };
+kernel void block_sumsq_k(device const float* c [[buffer(0)]], device float* out [[buffer(1)]],
+                          constant BlockArgs& a [[buffer(2)]], uint blk [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float part[32];
+    const uint bi = blk / a.nbc, bj = blk % a.nbc;
+    device const float* base = c + ulong(bi) * a.bm * a.ld + ulong(bj) * a.bn;
+    float s = 0.f;
+    for (uint r = 0; r < a.bm; ++r)
+        for (uint j = tid; j < a.bn; j += tg) {
+            const float v = base[ulong(r) * a.ld + j];
+            s += v * v;
+        }
+    s = tg_sum(s, part, lane, sg, nsg);
+    if (tid == 0) out[blk] = s;
+}
+
+// One threadgroup per row: the index of the row's largest value, the first on ties.
+struct ArgmaxArgs { uint n, ld; };
+kernel void row_argmax_k(device const float* c [[buffer(0)]], device uint* out [[buffer(1)]],
+                         constant ArgmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float pv[32];
+    threadgroup uint pi[32];
+    device const float* r = c + ulong(row) * a.ld;
+    float best = -INFINITY;
+    uint idx = 0xFFFFFFFFu;
+    for (uint j = tid; j < a.n; j += tg) {
+        const float v = r[j];
+        if (idx == 0xFFFFFFFFu || v > best) {
+            best = v;
+            idx = j;
+        }
+    }
+    const float m = simd_max(best);
+    const uint i = simd_min(best == m ? idx : 0xFFFFFFFFu);
+    if (lane == 0) {
+        pv[sg] = m;
+        pi[sg] = i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float bv = pv[0];
+        uint bix = pi[0];
+        for (uint s = 1; s < nsg; ++s)
+            if (pv[s] > bv || (pv[s] == bv && pi[s] < bix)) {
+                bv = pv[s];
+                bix = pi[s];
+            }
+        out[row] = bix;
+    }
+}
+
 // One threadgroup per row.
 kernel void norm_k(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], device const float* w [[buffer(2)]],
                    device const float* b [[buffer(3)]], constant NormArgs& a [[buffer(4)]],
@@ -370,7 +428,8 @@ struct Gpu::Impl {
 
     // Gpu::Seq's kernels, compiled on first use.
     std::once_flag kernels_once;
-    id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k;
+    id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
+        block_sumsq_k, row_argmax_k;
 
     void load_kernels() {
         std::call_once(kernels_once, [this] {
@@ -398,6 +457,8 @@ struct Gpu::Impl {
                 norm_bwd_k = make("norm_bwd_k");
                 act_bwd_k = make("act_bwd_k");
                 glu_bwd_k = make("glu_bwd_k");
+                block_sumsq_k = make("block_sumsq_k");
+                row_argmax_k = make("row_argmax_k");
             }
         });
     }
@@ -964,6 +1025,297 @@ void Gpu::Seq::run(bool fp16) {
         ~Clear() { ops.clear(); }
     } clear{s.ops};
     if (s.attempt(fp16)) s.attempt(false);
+}
+
+// --- Gpu::Batch -------------------------------------------------------------------------
+
+struct Gpu::Batch::Impl {
+    Gpu::Impl& g;
+    struct Buf {
+        id<MTLBuffer> buf = nil;
+        bool half = false;   // fp16 values (a weight)
+        bool owned = false;  // from the pool (released at the end), not a weight's own memory
+    };
+    struct Op {
+        enum Kind { MatMul, BlockSumsq, Argmax, ToHalf } kind;
+        Mat a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0};
+        int64_t m = 0, n = 0, k = 0, bm = 0, bn = 0;
+        bool trans_b = false;
+        int out = 0;
+        int64_t out_offset = 0;
+        double flops = 0;
+    };
+    std::vector<Buf> bufs;
+    id<MTLBuffer> flag = nil;  // set by half_k when a value doesn't fit fp16
+    std::vector<std::vector<Op>> groups;
+    std::vector<Op> current;
+    std::map<std::tuple<int64_t, int64_t, int64_t, bool>, MPSMatrixMultiplication*> mms;
+
+    explicit Impl(Gpu::Impl& gpu) : g(gpu) {}
+
+    Buf& at(int i) {
+        if (i < 0 || static_cast<size_t>(i) >= bufs.size() || !bufs[i].buf)
+            throw std::logic_error("Gpu::Batch: no buffer " + std::to_string(i));
+        return bufs[i];
+    }
+    static uint32_t u32(int64_t n) {
+        if (n < 0 || n > static_cast<int64_t>(UINT32_MAX)) throw std::length_error("Gpu::Batch: operation too large");
+        return static_cast<uint32_t>(n);
+    }
+    // Results go in the batch's own buffers, never in a model's weights (which the GPU uses in place).
+    void writable(int i) {
+        if (!at(i).owned) throw std::invalid_argument("Gpu::Batch: results go in a buffer(), not in a weight");
+    }
+    // Checks that rows x cols at m.offset with stride m.ld fit the buffer.
+    void check(const Mat& m, int64_t rows, int64_t cols) {
+        Buf& b = at(m.buf);
+        const int64_t size = b.half ? 2 : 4;
+        if (rows < 0 || cols < 0 || m.offset < 0 || (rows && m.ld < cols))
+            throw std::invalid_argument("Gpu::Batch: bad matrix layout");
+        if (rows && cols && static_cast<uint64_t>((m.offset + (rows - 1) * m.ld + cols) * size) > b.buf.length)
+            throw std::out_of_range("Gpu::Batch: matrix runs past its buffer");
+    }
+    MPSMatrix* matrix(const Mat& m, int64_t rows, int64_t cols) {
+        Buf& b = at(m.buf);
+        const NSUInteger size = b.half ? sizeof(__fp16) : sizeof(float);
+        MPSMatrixDescriptor* d = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(rows)
+                                                                       columns:static_cast<NSUInteger>(cols)
+                                                                      rowBytes:static_cast<NSUInteger>(m.ld) * size
+                                                                      dataType:b.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
+        return [[MPSMatrix alloc] initWithBuffer:b.buf offset:static_cast<NSUInteger>(m.offset) * size descriptor:d];
+    }
+    MPSMatrixMultiplication* mm(int64_t m, int64_t n, int64_t k, bool trans_b) {
+        const auto key = std::make_tuple(m, n, k, trans_b);
+        auto it = mms.find(key);
+        if (it != mms.end()) return it->second;
+        MPSMatrixMultiplication* p = [[MPSMatrixMultiplication alloc] initWithDevice:g.device
+                                                                       transposeLeft:NO
+                                                                      transposeRight:trans_b ? YES : NO
+                                                                          resultRows:static_cast<NSUInteger>(m)
+                                                                       resultColumns:static_cast<NSUInteger>(n)
+                                                                     interiorColumns:static_cast<NSUInteger>(k)
+                                                                               alpha:1.0
+                                                                                beta:0.0];
+        mms.emplace(key, p);
+        return p;
+    }
+
+    void encode(id<MTLCommandBuffer> cmd, const Op& op) {
+        if (op.kind == Op::ToHalf) {
+            if (op.n == 0) return;
+            id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+            const uint32_t cnt = u32(op.n);
+            [e setComputePipelineState:g.half_k];
+            [e setBuffer:at(op.c.buf).buf offset:0 atIndex:0];
+            [e setBuffer:at(op.out).buf offset:0 atIndex:1];
+            [e setBuffer:flag offset:0 atIndex:2];
+            [e setBytes:&cnt length:sizeof cnt atIndex:3];
+            const NSUInteger tg = std::min<NSUInteger>(256, g.half_k.maxTotalThreadsPerThreadgroup);
+            [e dispatchThreads:MTLSizeMake(NSUInteger(cnt), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            [e endEncoding];
+            return;
+        }
+        if (op.kind == Op::MatMul) {
+            if (op.m == 0 || op.n == 0) return;
+            MPSMatrix* A = matrix(op.a, op.m, op.k);
+            MPSMatrix* B = op.trans_b ? matrix(op.b, op.n, op.k) : matrix(op.b, op.k, op.n);
+            MPSMatrix* C = matrix(op.c, op.m, op.n);
+            [mm(op.m, op.n, op.k, op.trans_b) encodeToCommandBuffer:cmd leftMatrix:A rightMatrix:B resultMatrix:C];
+            return;
+        }
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        Buf& c = at(op.c.buf);
+        Buf& out = at(op.out);
+        if (op.kind == Op::BlockSumsq) {
+            const uint32_t nbr = u32(op.m / op.bm), nbc = u32(op.n / op.bn);
+            struct { uint32_t ld, bm, bn, nbc; } args{u32(op.c.ld), u32(op.bm), u32(op.bn), nbc};
+            [e setComputePipelineState:g.block_sumsq_k];
+            [e setBuffer:c.buf offset:static_cast<NSUInteger>(op.c.offset) * sizeof(float) atIndex:0];
+            [e setBuffer:out.buf offset:static_cast<NSUInteger>(op.out_offset) * sizeof(float) atIndex:1];
+            [e setBytes:&args length:sizeof args atIndex:2];
+            const NSUInteger tg = std::min<NSUInteger>(256, g.block_sumsq_k.maxTotalThreadsPerThreadgroup);
+            if (nbr && nbc)
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(nbr) * nbc, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        } else {
+            struct { uint32_t n, ld; } args{u32(op.n), u32(op.c.ld)};
+            [e setComputePipelineState:g.row_argmax_k];
+            [e setBuffer:c.buf offset:static_cast<NSUInteger>(op.c.offset) * sizeof(float) atIndex:0];
+            [e setBuffer:out.buf offset:static_cast<NSUInteger>(op.out_offset) * sizeof(uint32_t) atIndex:1];
+            [e setBytes:&args length:sizeof args atIndex:2];
+            const NSUInteger tg = std::min<NSUInteger>(256, g.row_argmax_k.maxTotalThreadsPerThreadgroup);
+            if (op.m && op.n)
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(op.m), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        }
+        [e endEncoding];
+    }
+
+    // run_chunks' Metal side: a chunk is one command buffer.
+    struct Backend : ChunkBackend {
+        Impl& s;
+        std::vector<id<MTLCommandBuffer>> cmds;
+        explicit Backend(Impl& impl) : s(impl) {}
+        size_t submit(const Chunk& c) override {
+            id<MTLCommandBuffer> cmd = [s.g.queue commandBuffer];
+            for (size_t i = c.first; i < c.last; ++i)
+                for (const Op& op : s.groups[i]) s.encode(cmd, op);
+            [cmd commit];
+            cmds.push_back(cmd);
+            return cmds.size() - 1;
+        }
+        bool wait(size_t ticket) override {
+            [cmds[ticket] waitUntilCompleted];
+            return cmds[ticket].status == MTLCommandBufferStatusCompleted;
+        }
+    };
+};
+
+Gpu::Batch::Batch(Gpu& gpu) : impl_(new Impl(*gpu.impl_)) {
+    gpu.impl_->load_kernels();
+    impl_->flag = gpu.impl_->acquire(sizeof(uint32_t));
+    *static_cast<uint32_t*>(impl_->flag.contents) = 0;
+}
+
+Gpu::Batch::~Batch() {
+    for (Impl::Buf& b : impl_->bufs)
+        if (b.buf && b.owned) impl_->g.release(b.buf);
+    if (impl_->flag) impl_->g.release(impl_->flag);
+}
+
+int Gpu::Batch::buffer(int64_t count, bool fp16) {
+    if (count < 0) throw std::invalid_argument("Gpu::Batch: negative buffer size");
+    Impl::Buf b;
+    b.buf = impl_->g.acquire(static_cast<size_t>(std::max<int64_t>(count, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float)));
+    b.half = fp16;
+    b.owned = true;
+    impl_->bufs.push_back(b);
+    return static_cast<int>(impl_->bufs.size() - 1);
+}
+
+float* Gpu::Batch::floats(int buf) {
+    Impl::Buf& b = impl_->at(buf);
+    if (b.half) throw std::logic_error("Gpu::Batch: an fp16 buffer has no float32 values");
+    return static_cast<float*>(b.buf.contents);
+}
+
+uint16_t* Gpu::Batch::halves(int buf) {
+    Impl::Buf& b = impl_->at(buf);
+    if (!b.half || !b.owned) throw std::logic_error("Gpu::Batch: halves() is for the batch's own fp16 buffers");
+    return static_cast<uint16_t*>(b.buf.contents);
+}
+
+bool Gpu::Batch::is_fp16(int buf) { return impl_->at(buf).half; }
+
+bool Gpu::Batch::overflowed() { return *static_cast<uint32_t*>(impl_->flag.contents) != 0; }
+
+void Gpu::Batch::to_half(int src, int dst, int64_t n) {
+    Impl& s = *impl_;
+    if (s.at(src).half || !s.at(dst).half) throw std::invalid_argument("Gpu::Batch: to_half goes from float32 to fp16");
+    s.writable(dst);
+    s.check(Mat{src, 0, n}, n ? 1 : 0, n);
+    s.check(Mat{dst, 0, n}, n ? 1 : 0, n);
+    Impl::Op op{Impl::Op::ToHalf};
+    op.c = Mat{src, 0, n};
+    op.out = dst;
+    op.n = n;
+    op.flops = double(n);
+    s.current.push_back(op);
+}
+
+int Gpu::Batch::weight(const Weight& W, bool fp16) {
+    const Gpu::Impl::WBuf w = impl_->g.weight_for(W, fp16);
+    Impl::Buf b;
+    b.buf = w.buf;
+    b.half = w.half;
+    impl_->bufs.push_back(b);
+    return static_cast<int>(impl_->bufs.size() - 1);
+}
+
+void Gpu::Batch::release(int buf) {
+    Impl::Buf& b = impl_->at(buf);
+    if (b.owned) impl_->g.release(b.buf);
+    b = Impl::Buf();
+}
+
+void Gpu::Batch::matmul(Mat A, Mat B, Mat C, int64_t m, int64_t n, int64_t k, bool trans_b) {
+    Impl& s = *impl_;
+    s.check(A, m, k);
+    if (trans_b) s.check(B, n, k);
+    else s.check(B, k, n);
+    s.check(C, m, n);
+    s.writable(C.buf);
+    if (s.at(C.buf).half) throw std::invalid_argument("Gpu::Batch: multiplies write float32 (to_half converts)");
+    Impl::Op op{Impl::Op::MatMul};
+    op.a = A;
+    op.b = B;
+    op.c = C;
+    op.m = m;
+    op.n = n;
+    op.k = k;
+    op.trans_b = trans_b;
+    op.flops = 2.0 * double(m) * double(n) * double(k);
+    s.current.push_back(op);
+}
+
+void Gpu::Batch::block_sumsq(Mat C, int64_t rows, int64_t cols, int64_t bm, int64_t bn, int out, int64_t out_offset) {
+    Impl& s = *impl_;
+    if (bm <= 0 || bn <= 0 || rows % bm || cols % bn) throw std::invalid_argument("Gpu::Batch: blocks must tile the matrix");
+    s.check(C, rows, cols);
+    s.check(Mat{out, out_offset, (rows / bm) * (cols / bn)}, rows ? 1 : 0, (rows / bm) * (cols / bn));
+    if (s.at(C.buf).half) throw std::invalid_argument("Gpu::Batch: block sums read float32 values");
+    s.writable(out);
+    Impl::Op op{Impl::Op::BlockSumsq};
+    op.c = C;
+    op.m = rows;
+    op.n = cols;
+    op.bm = bm;
+    op.bn = bn;
+    op.out = out;
+    op.out_offset = out_offset;
+    op.flops = 2.0 * double(rows) * double(cols);
+    s.current.push_back(op);
+}
+
+void Gpu::Batch::row_argmax(Mat C, int64_t rows, int64_t n, int out, int64_t out_offset) {
+    Impl& s = *impl_;
+    s.check(C, rows, n);
+    s.check(Mat{out, out_offset, rows}, rows ? 1 : 0, rows);
+    if (s.at(C.buf).half) throw std::invalid_argument("Gpu::Batch: argmaxes read float32 values");
+    s.writable(out);
+    Impl::Op op{Impl::Op::Argmax};
+    op.c = C;
+    op.m = rows;
+    op.n = n;
+    op.out = out;
+    op.out_offset = out_offset;
+    op.flops = double(rows) * double(n);
+    s.current.push_back(op);
+}
+
+void Gpu::Batch::end_group() {
+    Impl& s = *impl_;
+    if (!s.current.empty()) s.groups.push_back(std::move(s.current));
+    s.current.clear();
+}
+
+void Gpu::Batch::run() {
+    Impl& s = *impl_;
+    end_group();
+    struct Clear {
+        std::vector<std::vector<Impl::Op>>& groups;
+        ~Clear() { groups.clear(); }
+    } clear{s.groups};
+    if (s.groups.empty()) return;
+    std::vector<double> flops;
+    for (const std::vector<Impl::Op>& group : s.groups) {
+        double f = 0;
+        for (const Impl::Op& op : group) f += op.flops;
+        flops.push_back(f);
+    }
+    *static_cast<uint32_t*>(s.flag.contents) = 0;
+    @autoreleasepool {
+        Impl::Backend backend(s);
+        run_chunks(backend, pack_chunks(flops, gpu_chunk_flops()));
+    }
 }
 
 }  // namespace detail
