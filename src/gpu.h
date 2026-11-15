@@ -83,6 +83,42 @@ class Gpu::Seq {
     void linear_t(int dy, int dx, int64_t rows, const Weight& W);
     void norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& w, bool layernorm, float eps);
     void act_backward(int dpost, int pre, int dpre, int64_t n, GpuAct act);
+    // RoPE ("rotate half") on the first `rot` values of each of `heads` heads of D per row, y = rope(x):
+    // row r is at position meta[4 r] (uint32), and inv_freq holds the rot / 2 frequencies. inverse:
+    // rotates back (RoPE's backward pass).
+    void rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse = false);
+    // Causal attention of every row's query, as Model::attend: z (rows, H D) from q (rows, H D) and
+    // k, v (rows, Hkv D). meta has 4 uint32 per row: its position, its segment's start position, its
+    // segment's first row and its segment's number of rows. Keys and values before the segment's start come from pk, pv (Hkv, Tp, D),
+    // the rest from the segment's own rows. Scores are scaled, then softcapped (cap > 0), then ALiBi'd
+    // (slopes: one per head, if has_slopes), within `window` keys if window > 0. Float32.
+    // With `blocks` > 0 and D a multiple of 8 up to 128, slot `blk` divides the rows into that many
+    // blocks of up to kAttnBlockRows consecutive rows of one segment (4 uint32 each: first row, rows,
+    // segment start position, segment's first row), and each block's keys are read once for all its
+    // rows, on the matrix units (faster).
+    struct AttnShape {
+        int64_t rows, H, Hkv, D, Tp, window;
+        float scale, cap;
+        bool has_slopes;
+        int64_t blocks = 0;
+    };
+    // lse >= 0: also each (row, head)'s log of the sum of exp(score) into that slot (rows, H), for
+    // attention_backward.
+    void attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk = 0,
+                   int lse = -1);
+    // attention()'s backward pass with no earlier positions (shape.Tp = 0): from dz (rows, H D) and
+    // the forward pass's q, k, v, z and lse, dq into `dq` (rows, H D), dk and dv into `dk`, `dv`
+    // (rows, Hkv D); `delta` is scratch (rows, H).
+    struct AttnSlots {
+        int q, k, v, z, dz, lse, meta, slopes;
+    };
+    void attention_backward(const AttnSlots& in, int delta, int dq, int dk, int dv, const AttnShape& shape);
+    // One whole sequence (shape.rows rows at positions 0..rows-1, Tp = 0): the attention pattern P
+    // (H, rows, rows) from q, k and attention()'s lse, as Model::attend's hook_pattern; and z = P v.
+    void attention_pattern(int q, int k, int lse, int slopes, int P, const AttnShape& shape);
+    void attention_apply(int P, int v, int z, const AttnShape& shape);
+    // Rows per attention block (AttnShape::blocks).
+    static constexpr int64_t kAttnBlockRows = 32;
     void glu_backward(int dpost, int pre, int up, int dpre, int dup, int64_t n, GpuAct act);
 
     // Run everything recorded since the last run in one submission and wait. With fp16, linear()
@@ -151,13 +187,14 @@ class Gpu::Batch {
 };
 
 // Batched passes and linear layers with at least this many rows use the GPU (smaller ones are
-// faster on the CPU).
+// faster on the CPU). GPU-only mode (Device::Gpu): 1.
 int64_t gpu_min_rows();
 // For tests: 0 restores the default; a very large value turns the GPU off.
 void set_gpu_min_rows(int64_t rows);
 // A command uses the GPU only if the multiply-adds its GPU-sized batches would run add up to at
 // least this many (rows x layers x each layer's weights; a gradient run counts 3 passes). Below it,
 // the CPU finishes before the GPU would repay its start-up (about 35 ms in a fresh process).
+// GPU-only mode: 0.
 double gpu_min_work();
 // For tests: 0 restores the default.
 void set_gpu_min_work(double multiply_adds);

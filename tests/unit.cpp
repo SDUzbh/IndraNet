@@ -354,11 +354,25 @@ static Tensor naive_patch_heads(const Model& m, const Tokens& clean, const Token
     return out;
 }
 
+// Bit for bit equal, NaN matching NaN (the sites or heads a layer doesn't have).
+static bool same_values(const Tensor& a, const Tensor& b) {
+    if (a.shape != b.shape) return false;
+    for (int64_t i = 0; i < a.numel(); ++i)
+        if (!(a.data[i] == b.data[i] || (std::isnan(a.data[i]) && std::isnan(b.data[i])))) return false;
+    return true;
+}
+
+// Two computations of the same thing that add numbers in different orders (batched vs per pass, GPU
+// vs CPU): close relative to each value, plus a little relative to the tensor's largest value, since
+// rounding errors scale with the numbers summed (models without norms reach ~100 in a small output).
 static void check_close(const Tensor& got, const Tensor& want) {
     CHECK(got.shape == want.shape);
+    float scale = 0;
+    for (float v : want.data)
+        if (!std::isnan(v)) scale = std::max(scale, std::fabs(v));
     for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i) {
         if (std::isnan(want.data[i])) CHECK(std::isnan(got.data[i]));
-        else CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])));
+        else CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])) + 1e-5 * scale);
     }
 }
 
@@ -398,7 +412,8 @@ static void check_ablation_matches_naive(const Model& m, const Tokens& t) {
             for (int64_t l = 0; l < m.cfg().n_layers; ++l)
                 for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h) {
                     const Hooks hk = ablate_head(m, l, h, mode, mode == Ablation::Mean ? &means : nullptr);
-                    CHECK_NEAR(got.at({l, h}), next_token_loss(m.forward(t, &hk), t) - base, 1e-5);
+                    // float rounding grows with the loss (models without norms reach losses in the hundreds)
+                    CHECK_NEAR(got.at({l, h}), next_token_loss(m.forward(t, &hk), t) - base, 1e-5 * std::max(1.f, std::fabs(base)));
                 }
         }
     }
@@ -454,15 +469,15 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         const Tensor h1 = patch_heads(m, t, corrupt, 8, 1, 2).effect;
         set_num_threads(4);
         CHECK(num_threads() == 4);
-        CHECK(max_abs_diff(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, p1) == 0.f);
-        CHECK(max_abs_diff(patch_heads(m, t, corrupt, 8, 1, 2).effect, h1) == 0.f);
+        CHECK(same_values(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, p1));
+        CHECK(same_values(patch_heads(m, t, corrupt, 8, 1, 2).effect, h1));
         set_num_threads(1);
         const std::vector<Tokens> refs = {seq(9, 61), seq(9, 62), seq(9, 63), seq(5, 64)};
         const Tensor a1 = head_ablation(m, t, Ablation::Mean, {refs.begin(), refs.begin() + 3});
         const Tensor pooled1 = head_means(m, refs, 9).layers.back();
         set_num_threads(4);
-        CHECK(max_abs_diff(head_ablation(m, t, Ablation::Mean, {refs.begin(), refs.begin() + 3}), a1) == 0.f);
-        CHECK(max_abs_diff(head_means(m, refs, 9).layers.back(), pooled1) == 0.f);
+        CHECK(same_values(head_ablation(m, t, Ablation::Mean, {refs.begin(), refs.begin() + 3}), a1));
+        CHECK(same_values(head_means(m, refs, 9).layers.back(), pooled1));
         set_num_threads(0);
     }
     detail::set_patch_batch_rows(0, 0);
@@ -483,8 +498,8 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         detail::set_gpu_min_rows(1);
     detail::set_gpu_min_work(1);
         set_use_gpu(false);
-        CHECK(max_abs_diff(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu) == 0.f);
-        CHECK(max_abs_diff(patch_heads(m, t, corrupt, 8, 1, 2).effect, cpu_heads) == 0.f);
+        CHECK(same_values(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu));
+        CHECK(same_values(patch_heads(m, t, corrupt, 8, 1, 2).effect, cpu_heads));
         set_use_gpu(true);
 
         // fp16 GPU multiplies: really used, close to naive patching (errors around 1e-3 relative),
@@ -508,10 +523,10 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         set_num_threads(1);
         const Tensor f1 = patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect;
         set_num_threads(4);
-        CHECK(max_abs_diff(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, f1) == 0.f);
+        CHECK(same_values(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, f1));
         set_num_threads(0);
         set_use_gpu(false);
-        CHECK(max_abs_diff(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu) == 0.f);
+        CHECK(same_values(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu));
         set_use_gpu(true);
         set_gpu_fp16(false);
     }
@@ -1422,6 +1437,218 @@ static std::vector<std::pair<std::string, ModelConfig>> gpu_block_configs() {
     return v;
 }
 
+// GPU attention on sequences longer than its blocks (32 rows) and tiles (16 keys): several per
+// segment, segments starting mid-block, prefixes of earlier keys longer than a tile, windows shorter
+// and longer than a tile, and head sizes the tiled kernel takes (multiples of 8 up to 128) and does
+// not. Both GPU kernels = the CPU's attention, in batched passes.
+static std::vector<std::pair<std::string, ModelConfig>> long_attention_configs() {
+    auto cfg = [](int64_t d_model, int64_t heads, std::function<void(ModelConfig&)> edit) {
+        return tiny([&](ModelConfig& c) {
+            c.d_model = d_model;
+            c.n_heads = heads;
+            c.max_seq_len = 64;
+            if (edit) edit(c);
+        });
+    };
+    return {
+        {"D=4 (per-row kernel), rope, window 5", cfg(16, 4, [](ModelConfig& c) { c.sliding_window = 5; })},
+        {"D=24, rope, window 40, softcap", cfg(48, 2, [](ModelConfig& c) { c.sliding_window = 40; c.attn_logit_softcap = 3.0; })},
+        {"D=64, alibi, GQA, window 20, softcap", cfg(128, 2, [](ModelConfig& c) {
+             c.positional = "alibi"; c.n_kv_heads = 1; c.sliding_window = 20; c.attn_logit_softcap = 5.0;
+         })},
+        {"D=128, partial rope, qk_norm, GQA", cfg(512, 4, [](ModelConfig& c) { c.rope_fraction = 0.5; c.qk_norm = true; c.n_kv_heads = 2; })},
+        {"D=160 (per-row kernel), learned", cfg(320, 2, [](ModelConfig& c) { c.positional = "learned"; c.tie_embeddings = false; })},
+    };
+}
+
+static void test_gpu_attention_long() {
+    for (const auto& [name, c] : long_attention_configs()) {
+        const Model m = random_model(c, 51);
+        if (!m.gpu()) {
+            std::printf("     (no Metal device: GPU path not tested)\n");
+            return;
+        }
+        detail::set_gpu_min_rows(1);
+        detail::set_gpu_min_work(1);
+        const int64_t L = c.n_layers, d = c.d_model, T = 48;
+        ActivationCache cache;
+        m.run_with_cache(seq(T, 9), cache);
+        auto lp = [](int64_t i) { return "blocks." + std::to_string(i) + "."; };
+        detail::RowBatch rb;
+        for (int64_t i = 0; i < L; ++i) {
+            rb.prefix_k.push_back(&cache.at(lp(i) + "attn.hook_k"));
+            rb.prefix_v.push_back(&cache.at(lp(i) + "attn.hook_v"));
+        }
+        rb.gpu = m.gpu();
+        for (const auto& [s0, n] : std::vector<std::pair<int64_t, int64_t>>{{0, T}, {17, T - 17}, {40, 8}, {3, 21}, {33, 1}}) rb.add(s0, n);
+        Tensor x({rb.rows(), d}), want({rb.rows(), d});
+        const Tensor fin = m.final_norm(cache.at(lp(L - 1) + "hook_resid_post"));
+        const Tensor& pre = cache.at(lp(0) + "hook_resid_pre");
+        for (size_t s = 0; s < rb.start.size(); ++s) {
+            std::copy(pre.ptr() + rb.start[s] * d, pre.ptr() + (rb.start[s] + rb.len[s]) * d, x.ptr() + rb.offset[s] * d);
+            std::copy(fin.ptr() + rb.start[s] * d, fin.ptr() + (rb.start[s] + rb.len[s]) * d, want.ptr() + rb.offset[s] * d);
+        }
+        const Tensor cpu = m.forward_rows_final(0, x, rb, nullptr);
+        check_close(cpu, want);
+        detail::set_gpu_attention(true);
+        for (bool tiled : {true, false}) {
+            detail::set_gpu_attention_tiled(tiled);
+            check_close(m.forward_rows_final(0, x, rb, nullptr), cpu);
+        }
+        detail::set_gpu_attention_tiled(true);
+        detail::set_gpu_attention(false);
+        detail::set_gpu_min_rows(0);
+        detail::set_gpu_min_work(0);
+    }
+}
+
+// Single passes in GPU-only mode run on the GPU (Model::forward_from through run_rows), hooks
+// included: every activation run_with_cache keeps (hook_pattern too) and the logits = the CPU's,
+// with and without the resident path; hooks that edit every activation (the pattern too, so z is
+// recomputed from it) have the same effect as on the CPU and are called as often. In both mode,
+// short sequences stay on the CPU, bit for bit. Activations are compared relative to each one's
+// largest value: nearly one-hot patterns (the large random model) magnify rounding differences.
+static void test_gpu_single_pass(const Model& m, int64_t T) {
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    const Tokens t = seq(T, 31);
+    std::map<std::string, int> calls;
+    Hooks edit;  // nudges every activation, differently at each element
+    edit.add_filter([](const std::string& n) { return n != "hook_embed" && n != "hook_pos_embed"; },
+                    [&](const std::string& n, Tensor& a) {
+                        ++calls[n];
+                        for (int64_t i = 0; i < a.numel(); ++i) a.data[i] *= 1.f + 0.01f * static_cast<float>(i % 5);
+                    });
+    auto near = [](const Tensor& got, const Tensor& want) {
+        CHECK(got.shape == want.shape);
+        if (got.shape == want.shape) CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
+    };
+    auto pass = [&](Device dev, bool resident, ActivationCache& cache, Tensor& edited, std::map<std::string, int>& n_calls) {
+        set_device(dev);
+        detail::set_gpu_resident(resident);
+        const Tensor logits = m.run_with_cache(t, cache);
+        calls.clear();
+        edited = m.forward(t, &edit);
+        n_calls = calls;
+        detail::set_gpu_resident(true);
+        set_device(Device::Both);
+        return logits;
+    };
+    ActivationCache cpu;
+    Tensor cpu_edited;
+    std::map<std::string, int> cpu_calls;
+    const Tensor cpu_logits = pass(Device::Cpu, true, cpu, cpu_edited, cpu_calls);
+    CHECK(cpu.count("blocks.0.attn.hook_pattern") == 1);
+    for (bool resident : {true, false}) {
+        ActivationCache gpu;
+        Tensor gpu_edited;
+        std::map<std::string, int> gpu_calls;
+        near(pass(Device::Gpu, resident, gpu, gpu_edited, gpu_calls), cpu_logits);
+        CHECK(gpu.size() == cpu.size());
+        for (const auto& [name, want] : cpu) {
+            CHECK(gpu.count(name) == 1);
+            if (gpu.count(name)) {
+                CHECK(gpu.at(name).shape == want.shape);
+                if (gpu.at(name).shape == want.shape) CHECK(max_abs_diff(gpu.at(name), want) <= 1e-3f * std::max(1.f, max_abs(want)));
+            }
+        }
+        near(gpu_edited, cpu_edited);
+        CHECK(gpu_calls == cpu_calls);
+        if (resident) CHECK(max_abs_diff(gpu_edited, cpu_edited) > 0.f);  // the GPU really ran
+    }
+    // Both mode: from gpu_min_rows rows with enough work, the GPU (its attention too).
+    {
+        detail::set_gpu_min_rows(1);
+        detail::set_gpu_min_work(1);
+        ActivationCache both;
+        Tensor both_edited;
+        std::map<std::string, int> both_calls;
+        near(pass(Device::Both, true, both, both_edited, both_calls), cpu_logits);
+        near(both_edited, cpu_edited);
+        CHECK(both_calls == cpu_calls);
+        CHECK(max_abs_diff(both_edited, cpu_edited) > 0.f);
+        detail::set_gpu_min_rows(0);
+        detail::set_gpu_min_work(0);
+    }
+    // Both mode, default thresholds: where the rule says the CPU, the CPU, bit for bit.
+    double weights = 0;
+    for (const auto& kv : m.weights())
+        if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) weights += static_cast<double>(kv.second.numel());
+    const int64_t L = m.cfg().n_layers;
+    if (!detail::single_pass_on_gpu(T, L, weights / static_cast<double>(L), true, detail::gpu_min_rows(), detail::gpu_min_work())) {
+        ActivationCache both;
+        Tensor both_edited;
+        std::map<std::string, int> both_calls;
+        CHECK(same_values(pass(Device::Both, true, both, both_edited, both_calls), cpu_logits));
+        CHECK(same_values(both_edited, cpu_edited));
+    }
+}
+
+// Capture hooks (Hooks::add_capture, which the GPU hands over after its runs instead of stopping)
+// next to hooks that edit every activation, registered before and after them: in GPU-only mode the
+// captured activations and the logits = the CPU's, where a capture registered after an edit sees
+// the edited activation and one registered before sees it unedited.
+static void test_gpu_captures(const Model& m, int64_t T) {
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    const Tokens t = seq(T, 32);
+    auto all = [](const std::string& n) { return n != "hook_embed" && n != "hook_pos_embed"; };
+    HookFn nudge = [](const std::string&, Tensor& a) {
+        for (int64_t i = 0; i < a.numel(); ++i) a.data[i] *= 1.f + 0.01f * static_cast<float>(i % 3);
+    };
+    auto pass = [&](Device dev, bool capture_first, ActivationCache& got) {
+        set_device(dev);
+        Hooks h;
+        auto store = [&got](const std::string& n, Tensor& a) { got[n] = a; };
+        if (capture_first) h.add_capture(all, store);
+        h.add_filter([](const std::string& n) { return n.find("blocks.0.") == 0; }, nudge);  // edits in block 0 only
+        if (!capture_first) h.add_capture(all, store);
+        const Tensor logits = m.forward(t, &h);
+        set_device(Device::Both);
+        return logits;
+    };
+    for (bool capture_first : {true, false}) {
+        ActivationCache cpu, gpu;
+        const Tensor want = pass(Device::Cpu, capture_first, cpu);
+        const Tensor got = pass(Device::Gpu, capture_first, gpu);
+        CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
+        CHECK(gpu.size() == cpu.size());
+        for (const auto& [name, w] : cpu) {
+            CHECK(gpu.count(name) == 1);
+            if (gpu.count(name) && gpu.at(name).shape == w.shape) CHECK(max_abs_diff(gpu.at(name), w) <= 1e-3f * std::max(1.f, max_abs(w)));
+            else CHECK(false);
+        }
+        CHECK(max_abs_diff(got, want) > 0.f);  // the GPU really ran
+    }
+}
+
+// Both mode with the default thresholds, once the GPU has started: a model with 3M weights per
+// layer sends a single pass of 2 rows to the GPU, and keeps one of 1 row on the CPU, bit for bit.
+static void test_gpu_single_pass_defaults() {
+    const Model m = random_model(tiny([](ModelConfig& c) { c.d_model = 512; c.n_heads = 8; }), 55);
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    double weights = 0;
+    for (const auto& kv : m.weights())
+        if (kv.second.dim() == 2 && kv.first.rfind("blocks.0.", 0) == 0) weights += static_cast<double>(kv.second.numel());
+    CHECK(weights >= detail::kSinglePassLayerWeights);
+    for (int64_t T : {1, 2}) {
+        const Tokens t = seq(T, 33);
+        set_device(Device::Cpu);
+        const Tensor cpu = m.forward(t);
+        set_device(Device::Both);
+        const Tensor both = m.forward(t);
+        if (T == 1) CHECK(same_values(both, cpu));
+        else CHECK(max_abs_diff(both, cpu) > 0.f && max_abs_diff(both, cpu) <= 1e-4f * std::max(1.f, max_abs(cpu)));
+    }
+}
+
 // Batched passes with the residual stream kept on the GPU (Model::run_rows): unpatched rows equal
 // the plain forward pass, and every pass equals the one-linear-layer-at-a-time GPU path, with hooks
 // on CPU-side activations (q, z) and on GPU-side ones (which bring that block back to the CPU).
@@ -1499,13 +1726,14 @@ static void test_gpu_resident(const Model& m) {
 
 // Batched gradient passes on the GPU (Model::gradients_rows) = one run_with_gradients per sequence,
 // at every hook point they support, for log p(target) and a logit difference at each sequence's end.
-static void test_gpu_gradients(const Model& m) {
+static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens = {9, 5, 12}) {
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
     }
     const int64_t L = m.cfg().n_layers, V = m.cfg().vocab_size, d = m.cfg().d_model;
-    const std::vector<Tokens> seqs = {seq(9, 21), seq(5, 22), seq(12, 23)};
+    std::vector<Tokens> seqs;
+    for (size_t i = 0; i < lens.size(); ++i) seqs.push_back(seq(lens[i], 21 + i));
     detail::RowBatch rb;
     rb.gpu = m.gpu();
     for (const Tokens& t : seqs) rb.add(0, static_cast<int64_t>(t.size()));
@@ -1543,6 +1771,8 @@ static void test_gpu_gradients(const Model& m) {
         CHECK(got.size() == seqs.size());
         for (size_t g = 0; g < seqs.size() && g < got.size(); ++g) {
             ActivationCache want;
+            const Device dev = device();
+            set_device(Device::Cpu);  // the reference
             m.run_with_gradients(
                 seqs[g],
                 [&](const Tensor& logits) {
@@ -1552,6 +1782,7 @@ static void test_gpu_gradients(const Model& m) {
                     return dl;
                 },
                 want);
+            set_device(dev);
             for (const std::string& n : names) {
                 CHECK(got[g].count(n) == want.count(n));
                 if (!got[g].count(n) || !want.count(n)) continue;
@@ -2106,6 +2337,81 @@ static void test_gpu_circuits(const Model& m) {
 }
 #endif
 
+// Which single passes go to the GPU (detail::single_pass_on_gpu), with the default thresholds and
+// GPU-only mode's.
+static void test_single_pass_rule() {
+    using detail::single_pass_on_gpu;
+    const int64_t rows = 256;
+    const double work = 6e10, l = 12.6e6, xxs = 0.8e6;  // weights per layer of 24x1024 and 4x256 models
+    CHECK(!single_pass_on_gpu(1, 24, l, true, rows, work));     // a matrix-vector pass: the CPU
+    CHECK(single_pass_on_gpu(2, 24, l, true, rows, work));      // a big model, the GPU running
+    CHECK(!single_pass_on_gpu(2, 24, l, false, rows, work));    // ... but not to start it
+    CHECK(!single_pass_on_gpu(16, 4, xxs, true, rows, work));   // a small model, few rows: the CPU
+    CHECK(single_pass_on_gpu(64, 4, xxs, true, rows, work));    // ... enough rows x weights
+    CHECK(single_pass_on_gpu(300, 2, 1e3, true, rows, work));   // the batched passes' rule
+    CHECK(!single_pass_on_gpu(300, 2, 1e3, false, rows, work));
+    CHECK(single_pass_on_gpu(5000, 24, l, false, rows, work));  // enough work to start the GPU
+    CHECK(!single_pass_on_gpu(4, 0, l, true, rows, work));      // no blocks to run
+    CHECK(single_pass_on_gpu(1, 2, 1e3, false, 1, 0));          // GPU-only: everything
+}
+
+#ifdef TFI_USE_ACCELERATE
+// One control for where computations run: Cpu, Both (sizes decide), Gpu (no thresholds, no CPU
+// fallback). set_use_gpu is the earlier interface to the same setting.
+static void test_device_modes() {
+    set_device(Device::Cpu);
+    CHECK(device() == Device::Cpu && !use_gpu() && !detail::gpu_only());
+    set_use_gpu(true);
+    CHECK(device() == Device::Both && use_gpu());
+    set_use_gpu(false);
+    CHECK(device() == Device::Cpu);
+    set_device(Device::Both);
+    if (!detail::Gpu::create()) {
+        CHECK_THROWS(set_device(Device::Gpu));
+        return;
+    }
+    // A tiny model: Both keeps it on the CPU (too little work), Gpu runs it on the GPU anyway.
+    const ModelConfig cfg = tiny();
+    const Tokens clean = seq(12, 1), corrupt = [&] { Tokens t = clean; t[5] = (t[5] + 1) % 50; return t; }();
+    const Model both = random_model(cfg, 2);
+    const Tensor rb = patch_residual(both, clean, corrupt, "resid_pre", 11, 1, 2).effect;
+    const Tensor ab = attribution_patch_residual(both, clean, corrupt, "resid_pre", 11, 1, 2, 8).effect;
+    const Tensor zb = head_ablation(both, clean, Ablation::Zero, {});
+    const Composition cb = composition_scores(both);
+    CHECK(!both.has_gpu());
+    set_device(Device::Gpu);
+    CHECK(device() == Device::Gpu && use_gpu() && detail::gpu_only());
+    CHECK(detail::gpu_min_rows() == 1 && detail::gpu_min_work() == 0);
+    const Model g = random_model(cfg, 2);
+    check_close(patch_residual(g, clean, corrupt, "resid_pre", 11, 1, 2).effect, rb);
+    CHECK(g.has_gpu());
+    check_close(attribution_patch_residual(g, clean, corrupt, "resid_pre", 11, 1, 2, 8).effect, ab);
+    check_close(head_ablation(g, clean, Ablation::Zero, {}), zb);
+    const Composition cg = composition_scores(g);
+    for (int64_t i = 0; i < cb.q.numel(); ++i)
+        CHECK(std::isnan(cb.q.data[i]) ? std::isnan(cg.q.data[i]) : std::fabs(cg.q.data[i] - cb.q.data[i]) <= 1e-5f);
+    // GPU work that keeps failing: Gpu reports it, Both quietly uses the CPU.
+    detail::set_gpu_fail_chunks(1 << 30);
+    bool threw = false;
+    try {
+        composition_scores(g);
+    } catch (const detail::GpuFailure&) {
+        threw = true;
+    }
+    CHECK(threw);
+    set_device(Device::Both);
+    detail::set_gpu_min_work(1);
+    const Composition fb = composition_scores(g);  // falls back to the CPU: its exact results
+    bool same = true;
+    for (int64_t i = 0; i < cb.q.numel(); ++i)
+        same &= std::isnan(cb.q.data[i]) ? std::isnan(fb.q.data[i]) : fb.q.data[i] == cb.q.data[i];
+    CHECK(same);
+    detail::set_gpu_fail_chunks(0);
+    detail::set_gpu_min_work(0);
+    CHECK(detail::gpu_min_rows() == 256 && detail::gpu_min_work() == 6e10);
+}
+#endif
+
 int main() {
     auto run = [](const std::string& name, const std::function<void()>& fn) {
         const int before = g_failures;
@@ -2161,9 +2467,11 @@ int main() {
     run("post-norm DLA refused", test_post_norm_dla_refused);
     run("vector math", test_vector_math);
     run("chunked GPU work: packing, retries, failure", test_gpu_chunks);
+    run("which single passes go to the GPU", test_single_pass_rule);
 #ifdef TFI_USE_ACCELERATE
     run("GPU linear layer (macOS)", test_gpu_linear);
     run("GPU used only with enough work (macOS)", test_gpu_work_threshold);
+    run("device modes: cpu, both, gpu (macOS)", test_device_modes);
     run("GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);
     for (const auto& kv : gpu_block_configs())
         run("circuits on the GPU = CPU, chunked, retried, falling back (macOS): " + kv.first,
@@ -2172,6 +2480,44 @@ int main() {
     for (const auto& kv : gpu_block_configs())
         run("GPU-resident batched passes = per-layer and plain (macOS): " + kv.first,
             [&] { test_gpu_resident(random_model(kv.second, 43)); });
+    for (const auto& kv : gpu_block_configs())
+        run("attention on the GPU: batched passes = per-layer and plain (macOS): " + kv.first, [&] {
+            detail::set_gpu_attention(true);
+            for (bool tiled : {true, false}) {
+                detail::set_gpu_attention_tiled(tiled);
+                test_gpu_resident(random_model(kv.second, 43));
+                test_optimized_patching_matches_naive(random_model(kv.second, 47));
+            }
+            detail::set_gpu_attention_tiled(true);
+            detail::set_gpu_attention(false);
+        });
+    run("attention on the GPU: long sequences, both kernels = CPU (macOS)", test_gpu_attention_long);
+    for (const auto& kv : gpu_block_configs())
+        run("attention + its backward on the GPU: batched gradients = run_with_gradients, attribution = CPU (macOS): " + kv.first, [&] {
+            detail::set_gpu_attention(true);
+            for (bool tiled : {true, false}) {
+                detail::set_gpu_attention_tiled(tiled);
+                test_gpu_gradients(random_model(kv.second, 44));
+            }
+            detail::set_gpu_attention_tiled(true);
+            test_gpu_attribution(random_model(kv.second, 45));
+            detail::set_gpu_attention(false);
+        });
+    for (const auto& kv : gpu_block_configs())
+        run("single passes on the GPU in GPU-only mode = CPU, hooks included (macOS): " + kv.first,
+            [&] { test_gpu_single_pass(random_model(kv.second, 53), 9); });
+    for (const auto& kv : gpu_block_configs())
+        run("capture hooks on the GPU next to editing hooks = CPU (macOS): " + kv.first,
+            [&] { test_gpu_captures(random_model(kv.second, 56), 9); });
+    run("single passes in both mode with the default thresholds (macOS)", test_gpu_single_pass_defaults);
+    run("single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
+        for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);
+    });
+    run("attention + its backward on the GPU: long sequences, gradients = run_with_gradients (macOS)", [&] {
+        detail::set_gpu_attention(true);
+        for (const auto& kv : long_attention_configs()) test_gpu_gradients(random_model(kv.second, 52), {48, 17, 33, 1});
+        detail::set_gpu_attention(false);
+    });
     for (const auto& kv : gpu_block_configs())
         run("GPU batched gradients = run_with_gradients (macOS): " + kv.first,
             [&] { test_gpu_gradients(random_model(kv.second, 44)); });

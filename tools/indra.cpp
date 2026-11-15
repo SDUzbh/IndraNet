@@ -56,9 +56,11 @@ Token input
 
 Performance
   --threads N                  threads for patch / ablate (default: TFI_THREADS, else all cores)
-  --no-gpu                     patch / ablate / circuits: keep everything on the CPU (default: the GPU
-                               when there is one and enough work to repay starting it, macOS
-                               only; TFI_NO_GPU=1 does the same)
+  --device cpu|both|gpu        where computations run (default both). both: the GPU (macOS) for
+                               work large enough to repay starting it, the CPU for the rest.
+                               cpu: everything on the CPU (also --no-gpu, or TFI_NO_GPU=1).
+                               gpu: the GPU for everything it can run, whatever the size, and an
+                               error rather than the CPU if there is no Metal GPU
 
 Precision
   --fp32                       weights in float32 (the default)
@@ -567,7 +569,14 @@ int main(int argc, char** argv) {
     try {
         const Args a = parse_args(argc, argv);
         if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
-        if (a.has("no-gpu")) set_use_gpu(false);
+        if (a.has("device") || a.has("no-gpu")) {
+            const std::string dev = a.has("device") ? a.get("device") : "cpu";
+            if (a.has("device") && a.has("no-gpu") && dev != "cpu") throw std::invalid_argument("--no-gpu contradicts --device " + dev);
+            if (dev == "cpu") set_device(Device::Cpu);
+            else if (dev == "both") set_device(Device::Both);
+            else if (dev == "gpu") set_device(Device::Gpu);
+            else throw std::invalid_argument("--device must be cpu, both or gpu, got '" + dev + "'");
+        }
         if (a.has("fp16") && a.has("fp32")) throw std::invalid_argument("give --fp16 or --fp32, not both");
         const bool fp16 = a.has("fp16");
         set_gpu_fp16(fp16);

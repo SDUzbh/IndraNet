@@ -26,13 +26,19 @@ float next_token_loss(const Tensor& logits, const Tokens& tokens);
 void set_num_threads(int n);
 int num_threads();
 
-// On macOS with a Metal device, the batched passes of exact patching, ablation and reference means,
-// and attribution patching's gradient runs, run everything but attention on the GPU, and the
-// circuits computations (composition scores, OV copying) run their multiplies there, when they add up
-// to enough work to repay starting it (small models and short inputs stay on the CPU, which is then
-// faster). set_use_gpu(false) keeps everything on the CPU; results agree up to float rounding. Until it is
-// called, the TFI_NO_GPU environment variable (any value but 0) does the same. use_gpu() says
-// whether the GPU is allowed, not whether there is one.
+// Where the computations run (results agree up to float rounding):
+//   Both (the default): on macOS with a Metal GPU, the GPU for the work large enough to repay
+//     starting it (the batched passes of patching, ablation and reference means, attribution's
+//     gradient runs, the circuits computations), the CPU for the rest;
+//   Cpu: everything on the CPU;
+//   Gpu: the GPU for everything it can run, whatever the size, and never the CPU instead: setting it
+//     throws if there is no Metal GPU (or not macOS), and GPU work that keeps failing is an error.
+// Until set_device is called, the TFI_NO_GPU environment variable (any value but 0) selects Cpu.
+enum class Device { Cpu, Both, Gpu };
+void set_device(Device device);
+Device device();
+// The earlier interface: set_use_gpu(false) is set_device(Device::Cpu), set_use_gpu(true) is
+// set_device(Device::Both); use_gpu() is device() != Device::Cpu.
 void set_use_gpu(bool use);
 bool use_gpu();
 // Optional, off by default: the GPU's multiplies take fp16 inputs (accumulating in fp32). Patching

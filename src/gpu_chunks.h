@@ -47,6 +47,11 @@ class ChunkBackend {
 // can run again after the others.
 void run_chunks(ChunkBackend& backend, const std::vector<Chunk>& chunks, int retries = 2);
 
+// GPU-only mode (Device::Gpu in tfi/analysis.h): every size threshold is ignored, and GPU work is
+// never replaced by the CPU's.
+bool gpu_only();
+void set_gpu_only(bool on);
+
 // Chunks hold at most this many floating-point operations (about 0.25 s of work on an M5 Pro).
 double gpu_chunk_flops();
 // For tests: 0 restores the default.

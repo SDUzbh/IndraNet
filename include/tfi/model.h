@@ -45,13 +45,23 @@ class Hooks {
   public:
     Hooks& add(const std::string& name, HookFn fn);       // exact hook name
     Hooks& add_filter(NameFilter filter, HookFn fn);      // every hook the filter accepts
+    // A hook that only reads (e.g. caches) the activations the filter accepts: on the GPU it may be
+    // called after the pass has moved on, and out of order with other hooks, with a copy of the
+    // activation as it was at the hook point, so the pass need not stop for it.
+    Hooks& add_capture(NameFilter filter, HookFn fn);
     Hooks& extend(const Hooks& other);
     void run(const std::string& name, Tensor& act) const;  // in registration order
     bool matches(const std::string& name) const;            // whether run(name) would call anything
+    bool changes(const std::string& name) const;            // ... anything but captures
     bool empty() const { return entries_.empty(); }
 
   private:
-    std::vector<std::pair<NameFilter, HookFn>> entries_;
+    struct Entry {
+        NameFilter filter;
+        HookFn fn;
+        bool capture;
+    };
+    std::vector<Entry> entries_;
 };
 
 class Model {

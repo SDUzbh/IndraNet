@@ -9,6 +9,7 @@ import itertools
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,19 @@ def test_cli_commands(tools, tmp_path, opts):
     fp16_cpu = subprocess.run(patch_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
     assert fp16_cpu.returncode == 0 and "weights are stored in fp16" in fp16_cpu.stdout, fp16_cpu.stderr
     assert fp16_cpu.stdout.split("\n\n")[-1] != default.stdout.split("\n\n")[-1]  # really rounded
+    # --device: cpu = --no-gpu; both is the default; gpu runs even this tiny model on the GPU (macOS).
+    for dev, want in [("cpu", no_gpu.stdout), ("both", default.stdout)]:
+        r = subprocess.run(patch_args + ["--device", dev], capture_output=True, text=True)
+        assert r.returncode == 0 and r.stdout == want, r.stderr
+    gpu = subprocess.run(patch_args + ["--device", "gpu"], capture_output=True, text=True)
+    if sys.platform == "darwin":
+        assert gpu.returncode == 0, gpu.stderr
+    else:
+        assert gpu.returncode == 1 and "GPU-only" in gpu.stderr
+    bad = subprocess.run(patch_args + ["--device", "tpu"], capture_output=True, text=True)
+    assert bad.returncode == 1 and "--device must be cpu, both or gpu" in bad.stderr
+    clash = subprocess.run(patch_args + ["--device", "gpu", "--no-gpu"], capture_output=True, text=True)
+    assert clash.returncode == 1 and "contradicts" in clash.stderr
     fp32 = subprocess.run(patch_args + ["--fp32"], capture_output=True, text=True)
     assert fp32.returncode == 0 and fp32.stdout == default.stdout
     both = subprocess.run(patch_args + ["--fp16", "--fp32"], capture_output=True, text=True)

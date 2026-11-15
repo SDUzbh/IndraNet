@@ -29,11 +29,13 @@ std::atomic<double> g_min_work{0};
 }  // namespace
 
 int64_t gpu_min_rows() {
+    if (gpu_only()) return 1;  // GPU-only: no threshold
     const int64_t r = g_min_rows.load();
     return r > 0 ? r : kDefaultMinRows;
 }
 void set_gpu_min_rows(int64_t rows) { g_min_rows = rows; }
 double gpu_min_work() {
+    if (gpu_only()) return 0;  // GPU-only: no threshold
     const double w = g_min_work.load();
     return w > 0 ? w : kDefaultMinWork;
 }
@@ -203,6 +205,391 @@ static float tg_sum(float v, threadgroup float* part, uint lane, uint sg, uint n
 
 struct NormArgs { uint d; float eps; uint layernorm; uint has_b; };
 
+static float tg_max(float v, threadgroup float* part, uint lane, uint sg, uint nsg) {
+    v = simd_max(v);
+    if (lane == 0) part[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float t = -INFINITY;
+    for (uint i = 0; i < nsg; ++i) t = max(t, part[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return t;
+}
+
+// RoPE, rotate-half, out of place (inverse: rotated back): one thread per (row, head, i < half).
+struct RopeArgs { uint heads, D, nhalf, n, inverse; };
+kernel void rope_k(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], device const float* inv [[buffer(2)]],
+                   device const uint* meta [[buffer(3)]], constant RopeArgs& a [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    if (t >= a.n) return;
+    const uint i = t % a.nhalf, rh = t / a.nhalf;  // rh = row * heads + head
+    const uint row = rh / a.heads;
+    const float ang = float(meta[4 * row]) * inv[i];
+    const float c = precise::cos(ang), s = a.inverse != 0 ? -precise::sin(ang) : precise::sin(ang);
+    device const float* v = x + ulong(rh) * a.D;
+    device float* o = y + ulong(rh) * a.D;
+    const float x1 = v[i], x2 = v[i + a.nhalf];
+    o[i] = x1 * c - x2 * s;
+    o[i + a.nhalf] = x2 * c + x1 * s;
+}
+
+// The values of each head that RoPE leaves alone (rot <= j < D): copied, one thread each.
+struct PassArgs { uint D, rot, n; };
+kernel void rope_pass_k(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant PassArgs& a [[buffer(2)]],
+                        uint t [[thread_position_in_grid]]) {
+    if (t >= a.n) return;
+    const uint w = a.D - a.rot, rh = t / w, j = a.rot + t % w;
+    y[ulong(rh) * a.D + j] = x[ulong(rh) * a.D + j];
+}
+
+// Causal attention, one threadgroup per (row, head): the row's allowed keys in tiles of 1024 with a
+// running softmax (max m, sum l), the weighted values accumulated per dimension (at most 4 per thread).
+struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
+kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                   device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
+                   device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
+                   device float* lse [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float qs[512];
+    threadgroup float ss[1024];
+    threadgroup float part[32];
+    const uint D = a.D, r = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    const uint pos = meta[4 * r], start = meta[4 * r + 1], off = meta[4 * r + 2];
+    device const float* qr = q + (ulong(r) * a.H + h) * D;
+    for (uint d = tid; d < D; d += tg) qs[d] = qr[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    float m = -INFINITY, l = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (uint c0 = lo; c0 <= pos; c0 += 1024) {
+        const uint n = min(1024u, pos + 1 - c0);
+        float cmax = -INFINITY;
+        for (uint jj = tid; jj < n; jj += tg) {
+            const uint j = c0 + jj;
+            device const float* kr = j < start ? pk + (ulong(g) * a.Tp + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
+            float s = 0.f;
+            for (uint d = 0; d < D; ++d) s += qs[d] * kr[d];
+            s *= a.scale;
+            if (a.cap != 0.f) s = a.cap * vtanh(s / a.cap);
+            if (slope != 0.f) s += -slope * float(pos - j);
+            ss[jj] = s;
+            cmax = max(cmax, s);
+        }
+        cmax = tg_max(cmax, part, lane, sg, nsg);
+        const float mnew = max(m, cmax), keep = m == -INFINITY ? 0.f : vexp(m - mnew);
+        float lsum = 0.f;
+        for (uint jj = tid; jj < n; jj += tg) {
+            const float p = vexp(ss[jj] - mnew);
+            ss[jj] = p;
+            lsum += p;
+        }
+        lsum = tg_sum(lsum, part, lane, sg, nsg);
+        l = l * keep + lsum;
+        uint t = 0;
+        for (uint d = tid; d < D; d += tg, ++t) {
+            float s = acc[t] * keep;
+            for (uint jj = 0; jj < n; ++jj) {
+                const uint j = c0 + jj;
+                device const float* vr = j < start ? pv + (ulong(g) * a.Tp + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
+                s += ss[jj] * vr[d];
+            }
+            acc[t] = s;
+        }
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* zr = z + (ulong(r) * a.H + h) * D;
+    uint t = 0;
+    for (uint d = tid; d < D; d += tg, ++t) zr[d] = acc[t] / l;
+    if (a.has_lse != 0 && tid == 0) lse[ulong(r) * a.H + h] = m + log(l);
+}
+
+// Attention's backward pass, from dz and what the forward pass kept: q, k, v, z and each (row,
+// head)'s log-sum-exp of its scores (lse), so that the pattern is recomputed instead of stored. With
+// p = exp(score - lse), dp = dz . v and delta = dz . z (= sum of p dp):
+// dscore = p (dp - delta) x the softcap's derivative x scale; dq = sum over keys of dscore k,
+// dk = sum over queries of dscore q, dv = sum over queries of p dz. No earlier positions (Tp = 0).
+// meta has 4 uint32 per row: position, segment start (0), segment's first row, segment's rows.
+
+// delta of each (row, head): one thread each.
+kernel void attn_delta_k(device const float* dz [[buffer(0)]], device const float* z [[buffer(1)]], device float* delta [[buffer(2)]],
+                         constant uint2& a [[buffer(3)]], uint t [[thread_position_in_grid]]) {  // a: D, rows * H
+    if (t >= a.y) return;
+    device const float* x = dz + ulong(t) * a.x;
+    device const float* y = z + ulong(t) * a.x;
+    float s = 0.f;
+    for (uint d = 0; d < a.x; ++d) s += x[d] * y[d];
+    delta[t] = s;
+}
+
+// The score of query row i (position pos_i, head h) and key j (position pos_j) as the forward pass
+// computed it from raw = q . k, and the derivative of the softcap (1 when there is none).
+static float attn_score(float raw, constant AttnArgs& a, float slope, uint pos_i, uint pos_j, thread float& dcap) {
+    float s = raw * a.scale;
+    dcap = 1.f;
+    if (a.cap != 0.f) {
+        const float th = vtanh(s / a.cap);
+        s = a.cap * th;
+        dcap = 1.f - th * th;
+    }
+    if (slope != 0.f) s += -slope * float(pos_i - pos_j);
+    return s;
+}
+
+// One whole sequence (rows at positions 0..T-1): the attention pattern P (H, T, T) from q, k and the
+// forward pass's lse, as Model::attend's hook_pattern (entries a row may not attend to are 0), one
+// thread per entry; and z (T, H D) = P v, one thread per value.
+kernel void attn_pattern_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* lse [[buffer(2)]],
+                           device const float* slopes [[buffer(3)]], constant AttnArgs& a [[buffer(4)]], device float* P [[buffer(5)]],
+                           constant uint& T [[buffer(6)]], uint t [[thread_position_in_grid]]) {
+    if (t >= a.H * T * T) return;
+    const uint j = t % T, i = (t / T) % T, h = t / (T * T), g = h / (a.H / a.Hkv);
+    const uint lo = (a.window != 0 && i + 1 > a.window) ? i + 1 - a.window : 0;
+    float p = 0.f;
+    if (j <= i && j >= lo) {
+        device const float* qr = q + (ulong(i) * a.H + h) * a.D;
+        device const float* kr = k + (ulong(j) * a.Hkv + g) * a.D;
+        float raw = 0.f;
+        for (uint d = 0; d < a.D; ++d) raw += qr[d] * kr[d];
+        float dcap;
+        p = vexp(attn_score(raw, a, a.has_slopes != 0 ? slopes[h] : 0.f, i, j, dcap) - lse[ulong(i) * a.H + h]);
+    }
+    P[t] = p;
+}
+kernel void attn_apply_k(device const float* P [[buffer(0)]], device const float* v [[buffer(1)]], device float* z [[buffer(2)]],
+                         constant AttnArgs& a [[buffer(3)]], constant uint& T [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    if (t >= T * a.H * a.D) return;
+    const uint d = t % a.D, h = (t / a.D) % a.H, i = t / (a.D * a.H), g = h / (a.H / a.Hkv);
+    device const float* pr = P + (ulong(h) * T + i) * T;
+    float s = 0.f;
+    for (uint j = 0; j < T; ++j) s += pr[j] * v[(ulong(j) * a.Hkv + g) * a.D + d];
+    z[t] = s;
+}
+
+// dq: one threadgroup per (row, head), its keys in tiles of 1024 (as attn_k).
+kernel void attn_bwd_dq_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                          device const float* dz [[buffer(3)]], device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],
+                          device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
+                          device float* dq [[buffer(9)]],
+                          uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]]) {
+    threadgroup float qs[512];
+    threadgroup float gs[512];
+    threadgroup float ds[1024];
+    const uint D = a.D, r = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    const uint pos = meta[4 * r], off = meta[4 * r + 2];
+    for (uint d = tid; d < D; d += tg) {
+        qs[d] = q[(ulong(r) * a.H + h) * D + d];
+        gs[d] = dz[(ulong(r) * a.H + h) * D + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    const float L = lse[ulong(r) * a.H + h], dl = delta[ulong(r) * a.H + h];
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (uint c0 = lo; c0 <= pos; c0 += 1024) {
+        const uint n = min(1024u, pos + 1 - c0);
+        for (uint jj = tid; jj < n; jj += tg) {
+            const uint j = c0 + jj;
+            device const float* kr = k + (ulong(off + j) * a.Hkv + g) * D;
+            device const float* vr = v + (ulong(off + j) * a.Hkv + g) * D;
+            float raw = 0.f, dp = 0.f;
+            for (uint d = 0; d < D; ++d) {
+                raw += qs[d] * kr[d];
+                dp += gs[d] * vr[d];
+            }
+            float dcap;
+            const float p = vexp(attn_score(raw, a, slope, pos, j, dcap) - L);
+            ds[jj] = p * (dp - dl) * dcap * a.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint t = 0;
+        for (uint d = tid; d < D; d += tg, ++t) {
+            float s = acc[t];
+            for (uint jj = 0; jj < n; ++jj) s += ds[jj] * k[(ulong(off + c0 + jj) * a.Hkv + g) * D + d];
+            acc[t] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint t = 0;
+    for (uint d = tid; d < D; d += tg, ++t) dq[(ulong(r) * a.H + h) * D + d] = acc[t];
+}
+
+// dk, dv: one threadgroup per (key row, kv head), over the query heads that share it and the
+// segment's later rows that attend to it, in tiles of 1024.
+kernel void attn_bwd_dkv_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                           device const float* dz [[buffer(3)]], device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],
+                           device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
+                           device float* dk [[buffer(9)]], device float* dv [[buffer(10)]],
+                           uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]]) {
+    threadgroup float ks[512];
+    threadgroup float vs[512];
+    threadgroup float ps[1024];
+    threadgroup float ds[1024];
+    const uint D = a.D, r = tgid / a.Hkv, g = tgid % a.Hkv, rep = a.H / a.Hkv;
+    const uint pos = meta[4 * r], off = meta[4 * r + 2], len = meta[4 * r + 3];
+    for (uint d = tid; d < D; d += tg) {
+        ks[d] = k[(ulong(r) * a.Hkv + g) * D + d];
+        vs[d] = v[(ulong(r) * a.Hkv + g) * D + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint hi = len;  // query positions pos..hi-1 attend to this key
+    if (a.window != 0) hi = min(hi, pos + a.window);
+    float ak[4] = {0.f, 0.f, 0.f, 0.f}, av[4] = {0.f, 0.f, 0.f, 0.f};
+    for (uint h = g * rep; h < (g + 1) * rep; ++h) {
+        const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+        for (uint c0 = pos; c0 < hi; c0 += 1024) {
+            const uint n = min(1024u, hi - c0);
+            for (uint ii = tid; ii < n; ii += tg) {
+                const ulong qh = ulong(off + c0 + ii) * a.H + h;
+                device const float* qr = q + qh * D;
+                device const float* gr = dz + qh * D;
+                float raw = 0.f, dp = 0.f;
+                for (uint d = 0; d < D; ++d) {
+                    raw += qr[d] * ks[d];
+                    dp += gr[d] * vs[d];
+                }
+                float dcap;
+                const float p = vexp(attn_score(raw, a, slope, c0 + ii, pos, dcap) - lse[qh]);
+                ps[ii] = p;
+                ds[ii] = p * (dp - delta[qh]) * dcap * a.scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint t = 0;
+            for (uint d = tid; d < D; d += tg, ++t) {
+                float sk = ak[t], sv = av[t];
+                for (uint ii = 0; ii < n; ++ii) {
+                    const ulong qh = ulong(off + c0 + ii) * a.H + h;
+                    sk += ds[ii] * q[qh * D + d];
+                    sv += ps[ii] * dz[qh * D + d];
+                }
+                ak[t] = sk;
+                av[t] = sv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    uint t = 0;
+    for (uint d = tid; d < D; d += tg, ++t) {
+        dk[(ulong(r) * a.Hkv + g) * D + d] = ak[t];
+        dv[(ulong(r) * a.Hkv + g) * D + d] = av[t];
+    }
+}
+
+
+// Tiled causal attention on the matrix units, for head sizes that are multiples of 8 up to 128: one
+// threadgroup of 4 simdgroups per block of up to 32 consecutive query rows of one segment, for one
+// head; simdgroup i takes rows 8i..8i+7. Each tile of 16 keys and values is loaded once into
+// threadgroup memory for all 32 rows, and the scores (Q K^T) and outputs (P V) are 8x8 matrix
+// products, with the softmax kept online (a running max and sum per row). blk: 4 uint32 per block
+// (first row, rows, segment start position, segment's first row).
+//
+// In an 8x8 simdgroup matrix, lane l holds the elements at row 4*b4 + 2*b2 + b1 and columns
+// 4*b3 + 2*b0 and the next one (bi: bit i of l), so a row's 8 values are spread over the 4 lanes
+// differing in bits 0 and 3: row reductions are shuffles by 1 and 8.
+#define AQ 32
+#define AK 16
+#define AD 128
+kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                       device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
+                       device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
+                       device float* lse [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sh[AQ * AD];          // the block's queries, then each tile's keys and values
+    threadgroup float* Ks = sh;
+    threadgroup float* Vs = sh + AK * AD;
+    const uint D = a.D, b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    const uint off = blk[4 * b], nq = blk[4 * b + 1], start = blk[4 * b + 2], seg = blk[4 * b + 3];
+    const uint pos0 = start + (off - seg);   // position of the block's first row
+    const uint last = pos0 + nq - 1;
+    const uint lo = (a.window != 0 && pos0 + 1 > a.window) ? pos0 + 1 - a.window : 0;
+    const uint fm = 4 * ((lane >> 4) & 1) + 2 * ((lane >> 2) & 1) + ((lane >> 1) & 1);  // this lane's row
+    const uint fn = 4 * ((lane >> 3) & 1) + 2 * (lane & 1);                              // and first column
+    const uint qi = 8 * sg + fm;             // this lane's query row in the block
+    const uint pos = pos0 + qi;
+    const bool live = qi < nq;
+    const uint row_lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    const uint nd = D / 8;
+    for (uint e = tid; e < AQ * D; e += 128) {
+        const uint r = e / D, d = e % D;
+        sh[e] = r < nq ? q[(ulong(off + r) * a.H + h) * D + d] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Q[AD / 8], O[AD / 8];
+    for (uint t = 0; t < nd; ++t) {
+        simdgroup_load(Q[t], sh, D, ulong2(8 * t, 8 * sg));
+        O[t] = simdgroup_float8x8(0.f);
+    }
+    float m = -INFINITY, l = 0.f;
+    for (uint j0 = lo; j0 <= last; j0 += AK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // the queries or the previous tile are no longer read
+        for (uint e = tid; e < AK * D; e += 128) {
+            const uint jj = e / D, d = e % D, j = j0 + jj;
+            float kv = 0.f, vv = 0.f;
+            if (j <= last) {
+                const ulong src = j < start ? (ulong(g) * a.Tp + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
+                kv = j < start ? pk[src] : k[src];
+                vv = j < start ? pv[src] : v[src];
+            }
+            Ks[e] = kv;
+            Vs[e] = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 S[AK / 8];
+        for (uint c = 0; c < AK / 8; ++c) {
+            S[c] = simdgroup_float8x8(0.f);
+            for (uint t = 0; t < nd; ++t) {
+                simdgroup_float8x8 Kt;
+                simdgroup_load(Kt, Ks, D, ulong2(8 * t, 8 * c), true);  // keys 8c.. as columns, dims 8t.. as rows
+                simdgroup_multiply_accumulate(S[c], Q[t], Kt, S[c]);
+            }
+        }
+        // Scale, softcap, ALiBi and mask this lane's 4 scores, then the online softmax for its row.
+        float sc[AK / 4];
+        float tmax = -INFINITY;
+        for (uint c = 0; c < AK / 8; ++c)
+            for (uint u = 0; u < 2; ++u) {
+                const uint j = j0 + 8 * c + fn + u;
+                float x = -INFINITY;
+                if (live && j <= pos && j >= row_lo) {
+                    x = S[c].thread_elements()[u] * a.scale;
+                    if (a.cap != 0.f) x = a.cap * vtanh(x / a.cap);
+                    if (slope != 0.f) x += -slope * float(pos - j);
+                }
+                sc[2 * c + u] = x;
+                tmax = max(tmax, x);
+            }
+        tmax = max(tmax, simd_shuffle_xor(tmax, 1));
+        tmax = max(tmax, simd_shuffle_xor(tmax, 8));
+        const float mnew = max(m, tmax);
+        const float keep = m == -INFINITY ? 0.f : vexp(m - mnew);
+        float psum = 0.f;
+        for (uint c = 0; c < AK / 8; ++c)
+            for (uint u = 0; u < 2; ++u) {
+                const float p = sc[2 * c + u] == -INFINITY ? 0.f : vexp(sc[2 * c + u] - mnew);
+                S[c].thread_elements()[u] = p;
+                psum += p;
+            }
+        psum += simd_shuffle_xor(psum, 1);
+        psum += simd_shuffle_xor(psum, 8);
+        l = l * keep + psum;
+        m = mnew;
+        for (uint t = 0; t < nd; ++t) {
+            O[t].thread_elements() *= keep;  // both of this lane's elements are in its row
+            for (uint c = 0; c < AK / 8; ++c) {
+                simdgroup_float8x8 Vb;
+                simdgroup_load(Vb, Vs, D, ulong2(8 * t, 8 * c));
+                simdgroup_multiply_accumulate(O[t], S[c], Vb, O[t]);
+            }
+        }
+    }
+    if (!live) return;
+    device float* zr = z + (ulong(off + qi) * a.H + h) * D;
+    for (uint t = 0; t < nd; ++t) {
+        zr[8 * t + fn] = O[t].thread_elements()[0] / l;
+        zr[8 * t + fn + 1] = O[t].thread_elements()[1] / l;
+    }
+    if (a.has_lse != 0 && fn == 0) lse[ulong(off + qi) * a.H + h] = m + log(l);
+}
+
 // One threadgroup per block: the sum of squares of a bm x bn block of a matrix with row stride ld.
 struct BlockArgs { uint ld, bm, bn, nbc; };
 kernel void block_sumsq_k(device const float* c [[buffer(0)]], device float* out [[buffer(1)]],
@@ -335,6 +722,9 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
 struct ActArgs { uint32_t n; int32_t kind; float k; };
 struct BiasArgs { uint32_t n, cols; };
 struct NormArgs { uint32_t d; float eps; uint32_t layernorm, has_b; };
+struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; };
+struct PassArgs { uint32_t D, rot, n; };
+struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
 
 // Write src as fp16; false if a value is outside fp16's range (or not finite).
 bool to_half(const float* src, __fp16* dst, int64_t n) {
@@ -429,7 +819,7 @@ struct Gpu::Impl {
     // Gpu::Seq's kernels, compiled on first use.
     std::once_flag kernels_once;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
-        block_sumsq_k, row_argmax_k;
+        block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
 
     void load_kernels() {
         std::call_once(kernels_once, [this] {
@@ -459,6 +849,15 @@ struct Gpu::Impl {
                 glu_bwd_k = make("glu_bwd_k");
                 block_sumsq_k = make("block_sumsq_k");
                 row_argmax_k = make("row_argmax_k");
+                rope_k = make("rope_k");
+                rope_pass_k = make("rope_pass_k");
+                attn_k = make("attn_k");
+                attn_mma_k = make("attn_mma_k");
+                attn_delta_k = make("attn_delta_k");
+                attn_bwd_dq_k = make("attn_bwd_dq_k");
+                attn_bwd_dkv_k = make("attn_bwd_dkv_k");
+                attn_pattern_k = make("attn_pattern_k");
+                attn_apply_k = make("attn_apply_k");
             }
         });
     }
@@ -592,8 +991,11 @@ struct Gpu::Seq::Impl {
         int64_t floats = 0;
     };
     struct Op {
-        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd } kind;
-        int a = 0, b = 0, c = 0, d = 0, e = 0;
+        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply } kind;
+        int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0, j = -1;
+        int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
+        Gpu::Seq::AttnShape attn{};      // Attention
+        int64_t heads = 0, D = 0, rot = 0;  // Rope
         int64_t rows = 0, n = 0;
         const Tensor* W = nullptr;     // Norm, NormBwd
         const Tensor* bias = nullptr;  // Norm
@@ -602,6 +1004,7 @@ struct Gpu::Seq::Impl {
         GpuAct act = GpuAct::Relu;
         float eps = 0.f;
         bool layernorm = false;
+        bool inverse = false;  // Rope
     };
     std::vector<Slot> slots;
     std::vector<Op> ops;
@@ -827,6 +1230,171 @@ struct Gpu::Seq::Impl {
                 dispatch(op.kind == Op::Act ? g.act_k : g.glu_k, op.n);
                 break;
             }
+            case Op::Rope: {
+                const int64_t half = op.rot / 2, rows = op.rows * op.heads;
+                need(op.a, rows * op.D);
+                need(op.c, rows * op.D);
+                need(op.d, std::max<int64_t>(half, 1));
+                need(op.e, 4 * op.rows);
+                const int64_t n_rot = rows * half, n_pass = rows * (op.D - op.rot);
+                if (n_rot) {
+                    const RopeArgs args{u32(op.heads), u32(op.D), u32(half), u32(n_rot), op.inverse ? 1u : 0u};
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.rope_k];
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                    [e setBuffer:slot(op.e).buf offset:0 atIndex:3];
+                    [e setBytes:&args length:sizeof args atIndex:4];
+                    dispatch(g.rope_k, n_rot);
+                }
+                if (n_pass) {
+                    const PassArgs args{u32(op.D), u32(op.rot), u32(n_pass)};
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.rope_pass_k];
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e setBytes:&args length:sizeof args atIndex:2];
+                    dispatch(g.rope_pass_k, n_pass);
+                }
+                break;
+            }
+            case Op::Attention: {
+                const Gpu::Seq::AttnShape& A = op.attn;
+                if (A.D <= 0 || A.D > 512) throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to 512");
+                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                need(op.a, A.rows * A.H * A.D);
+                need(op.b, A.rows * A.Hkv * A.D);
+                need(op.d, A.rows * A.Hkv * A.D);
+                need(op.c, A.rows * A.H * A.D);
+                need(op.e, std::max<int64_t>(A.Hkv * A.Tp * A.D, 1));
+                need(op.f, std::max<int64_t>(A.Hkv * A.Tp * A.D, 1));
+                need(op.g, 4 * A.rows);
+                if (A.has_slopes) need(op.h, A.H);
+                if (op.j >= 0) need(op.j, A.rows * A.H);
+                if (A.rows == 0) break;
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), u32(A.Tp), u32(A.window), A.has_slopes ? 1u : 0u, op.j >= 0 ? 1u : 0u, A.scale, A.cap};
+                const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
+                if (tiled) need(op.i, 4 * A.blocks);
+                id<MTLComputeCommandEncoder> e = compute();
+                [e setComputePipelineState:tiled ? g.attn_mma_k : g.attn_k];
+                [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                [e setBuffer:slot(op.c).buf offset:0 atIndex:3];
+                [e setBuffer:slot(op.e).buf offset:0 atIndex:4];
+                [e setBuffer:slot(op.f).buf offset:0 atIndex:5];
+                [e setBuffer:slot(tiled ? op.i : op.g).buf offset:0 atIndex:6];
+                [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
+                [e setBytes:&args length:sizeof args atIndex:8];
+                [e setBuffer:slot(op.j >= 0 ? op.j : op.c).buf offset:0 atIndex:9];
+                if (tiled) {
+                    if (g.attn_mma_k.maxTotalThreadsPerThreadgroup < 128) throw std::runtime_error("GPU: the attention kernel needs 128 threads");
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    break;
+                }
+                const NSUInteger tg = std::min<NSUInteger>(128, g.attn_k.maxTotalThreadsPerThreadgroup);
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                break;
+            }
+            case Op::Pattern:
+            case Op::Apply: {
+                const Gpu::Seq::AttnShape& A = op.attn;
+                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                const int64_t T = A.rows;
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, A.scale, A.cap};
+                const uint32_t t32 = u32(T);
+                id<MTLComputeCommandEncoder> e = compute();
+                if (op.kind == Op::Pattern) {  // q a, k b, lse f, slopes h, P c
+                    need(op.a, T * A.H * A.D);
+                    need(op.b, T * A.Hkv * A.D);
+                    need(op.f, T * A.H);
+                    if (A.has_slopes) need(op.h, A.H);
+                    need(op.c, A.H * T * T);
+                    if (T == 0) break;
+                    [e setComputePipelineState:g.attn_pattern_k];
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.f).buf offset:0 atIndex:2];
+                    [e setBuffer:slot(A.has_slopes ? op.h : op.f).buf offset:0 atIndex:3];
+                    [e setBytes:&args length:sizeof args atIndex:4];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:5];
+                    [e setBytes:&t32 length:sizeof t32 atIndex:6];
+                    dispatch(g.attn_pattern_k, A.H * T * T);
+                } else {  // P a, v d, z c
+                    need(op.a, A.H * T * T);
+                    need(op.d, T * A.Hkv * A.D);
+                    need(op.c, T * A.H * A.D);
+                    if (T == 0) break;
+                    [e setComputePipelineState:g.attn_apply_k];
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.d).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:2];
+                    [e setBytes:&args length:sizeof args atIndex:3];
+                    [e setBytes:&t32 length:sizeof t32 atIndex:4];
+                    dispatch(g.attn_apply_k, T * A.H * A.D);
+                }
+                break;
+            }
+            case Op::AttentionBwd: {
+                const Gpu::Seq::AttnShape& A = op.attn;
+                if (A.D <= 0 || A.D > 512) throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to 512");
+                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                const int64_t nq = A.rows * A.H * A.D, nkv = A.rows * A.Hkv * A.D;
+                need(op.a, nq);
+                need(op.b, nkv);
+                need(op.d, nkv);
+                need(op.c, nq);
+                need(op.e, nq);
+                need(op.f, A.rows * A.H);
+                need(op.g, 4 * A.rows);
+                if (A.has_slopes) need(op.h, A.H);
+                need(op.more[0], A.rows * A.H);
+                need(op.more[1], nq);
+                need(op.more[2], nkv);
+                need(op.more[3], nkv);
+                if (A.rows == 0) break;
+                {
+                    const uint32_t args[2] = {u32(A.D), u32(A.rows * A.H)};
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.attn_delta_k];
+                    [e setBuffer:slot(op.e).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.more[0]).buf offset:0 atIndex:2];
+                    [e setBytes:args length:sizeof args atIndex:3];
+                    dispatch(g.attn_delta_k, A.rows * A.H);
+                }
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, A.scale, A.cap};
+                auto common = [&](id<MTLComputeCommandEncoder> e) {
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                    [e setBuffer:slot(op.e).buf offset:0 atIndex:3];
+                    [e setBuffer:slot(op.f).buf offset:0 atIndex:4];
+                    [e setBuffer:slot(op.more[0]).buf offset:0 atIndex:5];
+                    [e setBuffer:slot(op.g).buf offset:0 atIndex:6];
+                    [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
+                    [e setBytes:&args length:sizeof args atIndex:8];
+                };
+                {
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.attn_bwd_dq_k];
+                    common(e);
+                    [e setBuffer:slot(op.more[1]).buf offset:0 atIndex:9];
+                    const NSUInteger tg = std::min<NSUInteger>(128, g.attn_bwd_dq_k.maxTotalThreadsPerThreadgroup);
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+                {
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.attn_bwd_dkv_k];
+                    common(e);
+                    [e setBuffer:slot(op.more[2]).buf offset:0 atIndex:9];
+                    [e setBuffer:slot(op.more[3]).buf offset:0 atIndex:10];
+                    const NSUInteger tg = std::min<NSUInteger>(128, g.attn_bwd_dkv_k.maxTotalThreadsPerThreadgroup);
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.Hkv)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+                break;
+            }
             case Op::Add:
             case Op::Copy: {
                 need(op.a, op.n);
@@ -992,6 +1560,86 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     op.W = &w;
     op.layernorm = layernorm;
     op.eps = eps;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse) {
+    if (rot < 0 || rot % 2 || rot > D) throw std::invalid_argument("Gpu::Seq: RoPE rotates an even number of values, at most D");
+    if (x == y) throw std::invalid_argument("Gpu::Seq: RoPE works out of place");
+    Impl::Op op{Impl::Op::Rope};
+    op.a = x;
+    op.c = y;
+    op.d = inv_freq;
+    op.e = meta;
+    op.rows = rows;
+    op.heads = heads;
+    op.D = D;
+    op.rot = rot;
+    op.inverse = inverse;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk, int lse) {
+    if (z == q || z == k || z == v) throw std::invalid_argument("Gpu::Seq: attention writes z to a slot of its own");
+    if (lse >= 0 && (lse == q || lse == k || lse == v || lse == z)) throw std::invalid_argument("Gpu::Seq: attention writes lse to a slot of its own");
+    Impl::Op op{Impl::Op::Attention};
+    op.a = q;
+    op.b = k;
+    op.c = z;
+    op.d = v;
+    op.e = pk;
+    op.f = pv;
+    op.g = meta;
+    op.h = slopes;
+    op.i = blk;
+    op.j = lse;
+    op.attn = shape;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention_pattern(int q, int k, int lse, int slopes, int P, const AttnShape& shape) {
+    if (P == q || P == k || P == lse) throw std::invalid_argument("Gpu::Seq: the pattern goes to a slot of its own");
+    Impl::Op op{Impl::Op::Pattern};
+    op.a = q;
+    op.b = k;
+    op.f = lse;
+    op.h = slopes;
+    op.c = P;
+    op.attn = shape;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention_apply(int P, int v, int z, const AttnShape& shape) {
+    if (z == P || z == v) throw std::invalid_argument("Gpu::Seq: attention writes z to a slot of its own");
+    Impl::Op op{Impl::Op::Apply};
+    op.a = P;
+    op.d = v;
+    op.c = z;
+    op.attn = shape;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention_backward(const AttnSlots& in, int delta, int dq, int dk, int dv, const AttnShape& shape) {
+    for (int o : {delta, dq, dk, dv})
+        for (int i : {in.q, in.k, in.v, in.z, in.dz, in.lse, in.meta, in.slopes})
+            if (o == i) throw std::invalid_argument("Gpu::Seq: attention's backward pass writes to slots of its own");
+    if (delta == dq || delta == dk || delta == dv || dq == dk || dq == dv || dk == dv)
+        throw std::invalid_argument("Gpu::Seq: attention's backward pass writes four different slots");
+    if (shape.Tp != 0) throw std::invalid_argument("Gpu::Seq: attention's backward pass takes no earlier positions");
+    Impl::Op op{Impl::Op::AttentionBwd};
+    op.a = in.q;
+    op.b = in.k;
+    op.d = in.v;
+    op.c = in.z;
+    op.e = in.dz;
+    op.f = in.lse;
+    op.g = in.meta;
+    op.h = in.slopes;
+    op.more[0] = delta;
+    op.more[1] = dq;
+    op.more[2] = dk;
+    op.more[3] = dv;
+    op.attn = shape;
     impl_->ops.push_back(op);
 }
 

@@ -30,8 +30,10 @@ make test       # C++ unit tests
 ```
 
 Or with CMake: `cmake -S . -B build-cmake && cmake --build build-cmake`. On macOS, matrix
-multiplies use Accelerate and batched passes use the GPU; elsewhere a portable loop is used.
-macOS builds need macOS 15 or newer.
+multiplies use Accelerate and the GPU; elsewhere a portable loop is used. `indra --device` picks
+where work runs: `both` (the default) sends work to the GPU when it is large enough to repay it,
+`cpu` never uses the GPU (also `--no-gpu`), and `gpu` runs everything it can on the GPU, attention
+included. macOS builds need macOS 15 or newer.
 
 ## Get a model
 
@@ -290,7 +292,10 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   checked for 14 model types, including post-norm and every activation, with hooks on both sides.
   On the same 14 types, batched GPU gradients must match one CPU backward pass per sequence at
   every hook point they report. Attribution and mixed patching on the GPU must match the CPU for
-  any batch size and keep the CPU tests' invariants.
+  any batch size and keep the CPU tests' invariants. Attention on the GPU (both kernels) and its
+  backward pass must match the CPU's, also on sequences longer than the kernels' tiles, with head
+  sizes from 4 to 160. In GPU-only mode a single pass must match the CPU at every activation it
+  caches, with hooks that edit every activation (the pattern too) and capture hooks among them.
 - **fp16 weights** (also `tests/unit.cpp`): the fp16 conversion must round trip every fp16 value,
   round to nearest-even and match the hardware's on arm64. A model with fp16 weights must compute
   what the float32 model with the rounded weights computes (forward and gradients), and so must
@@ -326,8 +331,7 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   formats with unpredictable parts (like the arithmetic prompts) the per-head numbers include that
   noise.
 - **Scope:** one sequence at a time, float32 arithmetic (weights in fp16 and fp16 GPU inputs with
-  `--fp16`), CPU plus the GPU for
-  batched passes on macOS, no tokenizer (token ids only). Only built-in
+  `--fp16`), CPU plus the GPU on macOS (`--device`), no tokenizer (token ids only). Only built-in
   indranet components can be exported.
 
 ## Examples

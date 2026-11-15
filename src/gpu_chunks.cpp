@@ -11,6 +11,7 @@ namespace {
 constexpr double kDefaultChunkFlops = 1.5e12;  // about 0.25 s at the fp32 multiply rate of an M5 Pro
 std::atomic<double> g_chunk_flops{0};
 std::atomic<int> g_fail_chunks{0};
+std::atomic<bool> g_gpu_only{false};
 
 // Whether a test asked for this finished chunk to count as failed (using up one request).
 bool injected_failure() {
@@ -25,6 +26,9 @@ bool finished_ok(ChunkBackend& backend, size_t ticket) {
 }
 
 }  // namespace
+
+bool gpu_only() { return g_gpu_only.load(); }
+void set_gpu_only(bool on) { g_gpu_only = on; }
 
 double gpu_chunk_flops() {
     const double f = g_chunk_flops.load();

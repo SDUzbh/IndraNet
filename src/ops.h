@@ -59,15 +59,32 @@ void set_patch_batch_rows(int64_t residual, int64_t heads);
 // For tests (macOS): false runs a batched pass's GPU work one linear layer at a time, the residual
 // stream returning to the CPU after each, instead of keeping it on the GPU (Model::run_rows).
 void set_gpu_resident(bool on);
+// For tests (macOS): true computes a batched pass's attention (and, in gradient passes, its backward
+// pass) on the GPU outside GPU-only mode too. By default only GPU-only mode and single passes do:
+// elsewhere the CPU's attention, overlapping the GPU's work on other batches, is faster than the GPU
+// kernels (tiled: 0.83-0.94x at 128 tokens, 0.59-0.86x at 512).
+void set_gpu_attention(bool on);
+// For tests (macOS): false computes GPU attention with the per-row kernel instead of the tiled one
+// (head sizes that are multiples of 8 up to 128; other heads always use the per-row kernel).
+void set_gpu_attention_tiled(bool on);
 // For tests (macOS): the GPU's circuits computations keep each run's inputs under this many bytes,
 // splitting the work into several runs if needed; 0 restores the default (512 MB).
 void set_circuits_run_bytes(int64_t bytes);
 
+// Whether a single pass (Model::forward_from) of T rows through `layers` blocks of `layer_weights`
+// weights each goes to the GPU, `started` saying whether it is running, with the batched passes'
+// thresholds min_rows and min_work (gpu_min_rows, gpu_min_work). The batched passes' rule, or, once
+// the GPU is running, from 2 rows when a layer holds kSinglePassLayerWeights weights or the rows x
+// a layer's weights reach kSinglePassRowWork (tuned on an M5 Pro, models of 4x256 to 24x1024).
+constexpr double kSinglePassLayerWeights = 3e6, kSinglePassRowWork = 5e7;
+bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows, double min_work);
+
 struct RowBatch {
     std::vector<int64_t> start, len, offset;
     std::vector<const Tensor*> prefix_k, prefix_v;  // per layer; unused when every start is 0
-    Gpu* gpu = nullptr;  // macOS: if set and rows() >= gpu_min_rows(), the blocks run on the GPU (Model::run_rows)
+    Gpu* gpu = nullptr;  // macOS: if set, the blocks run on the GPU (Model::run_rows)
     bool fp16 = false;   // ... with fp16 multiply inputs (Gpu::linear, Gpu::Seq)
+    bool whole = false;  // one whole sequence (a single pass, Model::forward_from): hook_pattern runs as there
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());

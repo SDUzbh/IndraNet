@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "gpu.h"
+#include "gpu_chunks.h"
 #include "half.h"
 #include "ops.h"
 
@@ -27,7 +28,7 @@ namespace tfi {
 namespace {
 
 std::atomic<int> g_threads{0};  // 0 = TFI_THREADS, else every core
-std::atomic<int> g_use_gpu{-1};  // -1 = TFI_NO_GPU decides
+std::atomic<int> g_device{-1};  // a Device, or -1: TFI_NO_GPU decides
 std::atomic<bool> g_gpu_fp16{false};
 
 // Run fn(0..n-1) on up to num_threads() threads. Jobs are independent; the first exception any job
@@ -153,16 +154,30 @@ CompScores compose(const HeadCache& writer, const HeadCache& reader) {
 
 void set_num_threads(int n) { g_threads = n < 0 ? 0 : n; }
 
-void set_use_gpu(bool use) { g_use_gpu = use ? 1 : 0; }
+void set_device(Device d) {
+    if (d == Device::Gpu) {
+#ifdef TFI_USE_ACCELERATE
+        if (!detail::Gpu::create()) throw std::runtime_error("GPU-only: this Mac has no Metal GPU");
+#else
+        throw std::runtime_error("GPU-only needs macOS with a Metal GPU");
+#endif
+    }
+    g_device = static_cast<int>(d);
+    detail::set_gpu_only(d == Device::Gpu);
+}
+
+Device device() {
+    if (const int d = g_device.load(); d >= 0) return static_cast<Device>(d);
+    const char* env = std::getenv("TFI_NO_GPU");
+    return !env || !*env || std::string(env) == "0" ? Device::Both : Device::Cpu;
+}
+
+void set_use_gpu(bool use) { set_device(use ? Device::Both : Device::Cpu); }
 
 void set_gpu_fp16(bool fp16) { g_gpu_fp16 = fp16; }
 bool gpu_fp16() { return g_gpu_fp16; }
 
-bool use_gpu() {
-    if (const int u = g_use_gpu.load(); u >= 0) return u == 1;
-    const char* env = std::getenv("TFI_NO_GPU");
-    return !env || !*env || std::string(env) == "0";
-}
+bool use_gpu() { return device() != Device::Cpu; }
 
 int num_threads() {
     if (const int n = g_threads.load(); n > 0) return n;
@@ -762,7 +777,8 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     Tensor e_clean, e_corrupt;
     if (steps > 1) {
         Hooks grab;
-        grab.add("hook_embed", [&](const std::string&, Tensor& e) { (e_clean.numel() ? e_corrupt : e_clean) = e; });
+        grab.add_capture([](const std::string& n) { return n == "hook_embed"; },
+                         [&](const std::string&, Tensor& e) { (e_clean.numel() ? e_corrupt : e_clean) = e; });
         m.embed(c, &grab);
         m.embed(x, &grab);
     }
@@ -1040,16 +1056,18 @@ HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64
         Tensor x({rb.rows(), m.cfg().d_model});
         for (size_t s = 0; s < inputs.size(); ++s)
             std::copy(inputs[s].data.begin(), inputs[s].data.end(), x.ptr() + rb.offset[s] * m.cfg().d_model);
-        Hooks hooks;
-        for (int64_t i = 0; i < L; ++i)
-            hooks.add(lp(i) + "attn.hook_z", [&, i](const std::string&, Tensor& z) {  // (rows, H, D)
+        Hooks hooks;  // captures: they only read, so a GPU pass need not stop for them
+        for (int64_t i = 0; i < L; ++i) {
+            auto keep_z = [&, i](const std::string&, Tensor& z) {  // (rows, H, D)
                 const int64_t row = z.numel() / z.shape[0];
                 for (size_t s = 0; s < b.items.size(); ++s) {
                     Tensor& dst = zs[b.items[s]][i];
                     dst = Tensor({rb.len[s], z.shape[1], z.shape[2]});
                     std::copy(z.ptr() + rb.offset[s] * row, z.ptr() + (rb.offset[s] + rb.len[s]) * row, dst.ptr());
                 }
-            });
+            };
+            hooks.add_capture([name = lp(i) + "attn.hook_z"](const std::string& n) { return n == name; }, keep_z);
+        }
         m.forward_rows(0, std::move(x), rb, &hooks);
     });
     for (int64_t n = 0; n < R; ++n) {  // reduce in reference order: deterministic sums
@@ -1399,6 +1417,7 @@ Composition composition_scores(const Model& m) {
         if (r == GpuRun::Overflow) r = composition_gpu(m, ids, heads, c, false);
         if (r == GpuRun::Done) return c;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+        if (detail::gpu_only()) throw;  // ... except in GPU-only mode
     }
 #endif
     parallel_for(static_cast<int64_t>(pairs.size()), [&](int64_t n) {
@@ -1725,6 +1744,7 @@ Tensor ov_copying_scores(const Model& m, int64_t max_tokens) {
         if (r == GpuRun::Overflow) r = ov_copying_gpu(m, max_tokens, out, false);
         if (r == GpuRun::Done) return out;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+        if (detail::gpu_only()) throw;  // ... except in GPU-only mode
     }
 #endif
     const OvPaths ov(m, max_tokens);
@@ -1752,6 +1772,7 @@ Tensor ov_pair_copying_scores(const Model& m, int64_t max_tokens) {
         if (r == GpuRun::Overflow) r = ov_pair_copying_gpu(m, max_tokens, ids, out, false);
         if (r == GpuRun::Done) return out;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
+        if (detail::gpu_only()) throw;  // ... except in GPU-only mode
     }
 #endif
     const OvPaths ov(m, max_tokens);

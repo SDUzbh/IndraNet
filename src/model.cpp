@@ -8,6 +8,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "tfi/analysis.h"
 #include "tfi/safetensors.h"
 #include "half.h"
 #include "ops.h"
@@ -19,12 +20,17 @@ namespace tfi {
 // --- hooks ---------------------------------------------------------------------
 
 Hooks& Hooks::add(const std::string& name, HookFn fn) {
-    entries_.emplace_back([name](const std::string& n) { return n == name; }, std::move(fn));
+    entries_.push_back({[name](const std::string& n) { return n == name; }, std::move(fn), false});
     return *this;
 }
 
 Hooks& Hooks::add_filter(NameFilter filter, HookFn fn) {
-    entries_.emplace_back(std::move(filter), std::move(fn));
+    entries_.push_back({std::move(filter), std::move(fn), false});
+    return *this;
+}
+
+Hooks& Hooks::add_capture(NameFilter filter, HookFn fn) {
+    entries_.push_back({std::move(filter), std::move(fn), true});
     return *this;
 }
 
@@ -35,12 +41,18 @@ Hooks& Hooks::extend(const Hooks& other) {
 
 void Hooks::run(const std::string& name, Tensor& act) const {
     for (const auto& e : entries_)
-        if (!e.first || e.first(name)) e.second(name, act);
+        if (!e.filter || e.filter(name)) e.fn(name, act);
 }
 
 bool Hooks::matches(const std::string& name) const {
     for (const auto& e : entries_)
-        if (!e.first || e.first(name)) return true;
+        if (!e.filter || e.filter(name)) return true;
+    return false;
+}
+
+bool Hooks::changes(const std::string& name) const {
+    for (const auto& e : entries_)
+        if (!e.capture && (!e.filter || e.filter(name))) return true;
     return false;
 }
 
@@ -588,6 +600,7 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
     const ModelConfig& c = layer_cfgs_[layer];
     const std::string p = layer_prefix(layer) + "attn.";
     const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv;
+    if (batch && batch->whole) batch = nullptr;  // one whole sequence: as a single pass, hook_pattern included
 
     Tensor q = split_heads(q2, T, H, D);
     Tensor k = split_heads(k2, T, Hkv, D);
@@ -725,7 +738,8 @@ Tensor Model::logits_from_final(const Tensor& normed) const { return logits_from
 Tensor Model::logits_from_final(const Tensor& normed, const detail::RowBatch* batch) const {
     Tensor logits;
 #ifdef TFI_USE_ACCELERATE
-    if (batch && batch->gpu && normed.size(-1) && normed.numel() / normed.size(-1) >= detail::gpu_min_rows())
+    // A single pass on the GPU (batch->whole) unembeds there too: its rows were already judged worth it.
+    if (batch && batch->gpu && normed.size(-1) && (batch->whole || normed.numel() / normed.size(-1) >= detail::gpu_min_rows()))
         logits = batch->gpu->linear(normed, unembed(), nullptr, batch->fp16);
     else
 #else
@@ -763,19 +777,62 @@ Tensor Model::embed(const Tokens& tokens, const Hooks* hooks) const {
     return x;
 }
 
+#ifdef TFI_USE_ACCELERATE
+namespace {
+detail::Gpu* single_pass_gpu(const Model& m, int64_t layer, int64_t T);
+}  // namespace
+#endif
+
 Tensor Model::forward_from(int64_t layer, Tensor x, const Hooks* hooks) const {
     if (layer < 0 || layer > cfg_.n_layers) throw std::out_of_range("forward_from: layer out of range");
     if (x.dim() != 2 || x.shape[1] != cfg_.d_model)
         throw std::invalid_argument("forward_from: residual must be (T, d_model), got " + shape_str(x.shape));
-    for (int64_t i = layer; i < cfg_.n_layers; ++i) x = block(i, std::move(x), hooks);
+    detail::RowBatch rb;  // the GPU's, if this pass goes to it: one whole sequence
+#ifdef TFI_USE_ACCELERATE
+    rb.gpu = layer < cfg_.n_layers ? single_pass_gpu(*this, layer, x.shape[0]) : nullptr;
+    if (rb.gpu) {
+        rb.whole = true;
+        rb.fp16 = gpu_fp16();
+        rb.add(0, x.shape[0]);
+        x = run_rows(layer, std::move(x), rb, hooks);
+    }
+#endif
+    if (!rb.gpu)
+        for (int64_t i = layer; i < cfg_.n_layers; ++i) x = block(i, std::move(x), hooks);
     Tensor f = final_norm(x);
     hook(hooks, "hook_final", f);
-    return logits_from_final(f);
+    return logits_from_final(f, rb.gpu ? &rb : nullptr);
 }
 
 namespace {
 std::mutex g_gpu_mutex;  // guards each model's one-time GPU context creation; Gpu itself is thread-safe
+
+#ifdef TFI_USE_ACCELERATE
+// The GPU for a single pass of T rows from `layer` (detail::single_pass_on_gpu), unless the device
+// is the CPU.
+detail::Gpu* single_pass_gpu(const Model& m, int64_t layer, int64_t T) {
+    if (!use_gpu()) return nullptr;
+    const int64_t L = m.cfg().n_layers;
+    double weights = 0;
+    for (const auto& kv : m.weights())
+        if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) weights += static_cast<double>(kv.second.numel());
+    const bool on = detail::single_pass_on_gpu(T, L - layer, weights / static_cast<double>(std::max<int64_t>(1, L)), m.has_gpu(),
+                                               detail::gpu_min_rows(), detail::gpu_min_work());
+    return on ? m.gpu() : nullptr;
+}
+#endif
 }  // namespace
+
+bool detail::single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows, double min_work) {
+    const double work = static_cast<double>(T) * static_cast<double>(layers) * layer_weights;
+    if (work <= 0) return false;
+    if (T >= min_rows && (started || work >= min_work)) return true;  // the batched passes' rule
+    // Once the GPU has started, shorter passes too, where it measured faster (M5 Pro): from 2 rows (a
+    // 1-row pass is a matrix-vector product, cheap on the CPU), when each layer's weights take the
+    // CPU longer to read than the GPU's fixed cost per layer (about 0.4 ms), or the multiply-adds
+    // take it longer to do.
+    return started && T >= 2 && (layer_weights >= kSinglePassLayerWeights || static_cast<double>(T) * layer_weights >= kSinglePassRowWork);
+}
 
 detail::Gpu* Model::gpu() const {
 #ifdef TFI_USE_ACCELERATE
@@ -805,9 +862,13 @@ void check_rows(const Model& m, int64_t layer, const Tensor& x, const detail::Ro
 
 namespace {
 std::atomic<bool> g_gpu_resident{true};
+std::atomic<bool> g_gpu_attention{false};  // tests: GPU attention outside GPU-only mode
+std::atomic<bool> g_attn_tiled{true};      // tests: false uses the per-row attention kernel
 }  // namespace
 
 void detail::set_gpu_resident(bool on) { g_gpu_resident = on; }
+void detail::set_gpu_attention(bool on) { g_gpu_attention = on; }
+void detail::set_gpu_attention_tiled(bool on) { g_attn_tiled = on; }
 
 #ifdef TFI_USE_ACCELERATE
 namespace {
@@ -832,8 +893,22 @@ GpuAct gpu_act(const std::string& act) {
 enum Slot : int { kResid0, kResid1, kAttnIn, kQ, kK, kV, kZ, kAttnOut, kAttnNormed, kMlpIn, kGate, kUp, kMlpOut,
                   kMlpRaw, kPar0, kPar1, kTmp,
                   kDZ, kDQ, kDK, kDV, kDIn, kDPost, kDPre, kDUp, kDMlpIn, kTmpB, kTmpC, kTmpD, kTop,  // backward
+                  // attention on the GPU: q, k, v of odd layers; q, k after qk_norm / RoPE; per-row
+                  // positions; RoPE frequencies; ALiBi slopes; earlier positions' keys and values
+                  kQ2, kK2, kV2, kQn, kKn, kQr, kKr, kMeta, kInvFreq, kSlopes, kPK, kPV, kBlocks,
+                  // attention's backward on the GPU: dz of odd layers, delta, dq and dk between steps
+                  kDZ2, kDelta, kDQ1, kDQ2, kDK1, kDK2,
+                  // a whole sequence's attention pattern (hook_pattern) and the lse it is made from
+                  kPattern, kLse,
                   kLayerSlots = 64 };
-constexpr int kSlotsPerLayer = 12;
+constexpr int kSlotsPerLayer = 21;
+// Hooked activations of inference passes (GpuBlocks::at), in turn: the layer slots, which only
+// gradient passes use (and they have no hooks). More than two blocks' hook points, so a slot is
+// never reused while it may still be read.
+constexpr int kHand0 = kLayerSlots, kHandSlots = 32;
+// Activations that only capture hooks want (GpuBlocks::defer), copied on the GPU and handed over
+// after each run: next to the hooked ones.
+constexpr int kCapture0 = kHand0 + kHandSlots, kCaptureSlots = 64;
 
 // Where one block's activations go.
 struct LayerSlots {
@@ -864,6 +939,16 @@ GradSlots grad_slots(int64_t layer) {
     const int b = kLayerSlots + kSlotsPerLayer * static_cast<int>(layer);
     return {b + 7, b + 8, b + 9, b + 10};
 }
+// Gradient passes with attention on the GPU: what attention's backward pass reads.
+struct AttnLayerSlots {
+    int q0, k0, v;      // the projections' outputs
+    int qn, kn, qr, kr; // q, k after qk_norm and after RoPE
+    int z, lse;         // attention's output and each (row, head)'s log-sum-exp of its scores
+};
+AttnLayerSlots attn_slots(int64_t layer) {
+    const int b = kLayerSlots + kSlotsPerLayer * static_cast<int>(layer) + 11;
+    return {b, b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8};
+}
 
 // The GPU half of each block (everything but attention) for a batched pass, built from the same
 // weights and config as Model::block, and its backward pass (as grad.cpp's Backward::block).
@@ -871,6 +956,124 @@ struct GpuBlocks {
     const Model& m;
     detail::Gpu::Seq& s;
     int64_t R, d;
+    int qs = kQ, ks = kK, vs = kV;          // where before_attention puts q, k and v
+    int qn = kQn, kn = kKn, qr = kQr, kr = kKr;  // where qk() puts q, k after qk_norm and RoPE
+    int zs = kZ, lse = -1;                  // where attention() puts z (and lse, if >= 0)
+    int dzs = kDZ;                          // where backward_before puts dL/dz
+    int64_t blocks = 0;                     // attention blocks in kBlocks (0: the per-row kernel)
+    const Hooks* hooks = nullptr;           // inference: the pass's hooks (GpuBlocks::at)
+    bool fp16 = false;                      // ... and how its runs multiply
+    int par_out = -1;                       // a parallel-residual MLP's output (set by mlp())
+    int next_hand = 0;
+
+    // A hook point on the activation in `slot` (rows x width). If a hook wants it, everything
+    // recorded so far runs, the hook gets the activation as Model::block passes it ((rows, width);
+    // Heads: (width / D, rows, D), as q, k, v; RowsHeads: (rows, width / D, D), as z), and what the
+    // hook leaves goes to a slot of its own, returned, that the rest of the pass reads instead (so no
+    // later run overwrites a value it read, which Gpu::Seq::run's repeat of a run would need).
+    // Otherwise returns `slot`.
+    // When every hook that wants it only captures (Hooks::add_capture), the pass does not stop: the
+    // activation is copied on the GPU and handed over after the run (defer).
+    enum class View { Rows, Heads, RowsHeads, Whole };
+    Tensor view_of(const float* src, int64_t width, View view, int64_t D) const {
+        const int64_t n = R * width;
+        return view == View::Heads ? detail::split_heads(src, R, width / D, D)
+                                   : Tensor(view == View::Rows ? Shape{R, width} : Shape{R, width / D, D}, std::vector<float>(src, src + n));
+    }
+    int at(const std::string& name, int slot, int64_t width, View view = View::Rows, int64_t D = 0) {
+        if (!hooks || !hooks->matches(name)) return slot;
+        const int64_t n = R * width;
+        if (!hooks->changes(name)) {
+            const int dst = capture_slot(n);
+            s.copy(slot, dst, n);
+            defer(name, dst, Shape{}, view, width, D);
+            return slot;
+        }
+        run();
+        const float* src = s.data(slot);
+        Tensor t = view_of(src, width, view, D);
+        hook(hooks, name, t);
+        if (t.numel() != n) throw std::runtime_error(name + ": a hook changed the activation's size");
+        const Tensor back = view == View::Heads ? detail::merge_heads(t) : std::move(t);
+        const int dst = kHand0 + next_hand++ % kHandSlots;
+        std::copy(back.ptr(), back.ptr() + n, s.reserve(dst, n));
+        return dst;
+    }
+    // Captures waiting for the end of the run: the slot the GPU copied the activation into, and how
+    // to hand it over (View::Whole: as `shape`, e.g. a pattern).
+    struct Capture {
+        std::string name;
+        int slot;
+        Shape shape;
+        View view;
+        int64_t width, D;
+    };
+    std::vector<Capture> captures = {};
+    // A free capture slot of n floats (running what is recorded first if they are all taken).
+    int capture_slot(int64_t n) {
+        if (captures.size() == static_cast<size_t>(kCaptureSlots)) run();
+        const int dst = kCapture0 + static_cast<int>(captures.size());
+        s.reserve(dst, n);
+        return dst;
+    }
+    void defer(const std::string& name, int slot, Shape shape, View view, int64_t width, int64_t D) {
+        captures.push_back({name, slot, std::move(shape), view, width, D});
+    }
+    // Runs what is recorded, then hands the captured activations to their hooks.
+    void run() {
+        s.run(fp16);
+        std::vector<Capture> done;
+        done.swap(captures);
+        for (const Capture& c : done) {
+            const float* src = s.data(c.slot);
+            Tensor t = c.view == View::Whole ? Tensor(c.shape, std::vector<float>(src, src + numel(c.shape)))
+                                             : view_of(src, c.width, c.view, c.D);
+            hook(hooks, c.name, t);
+        }
+    }
+    static int64_t numel(const Shape& shape) {
+        int64_t n = 1;
+        for (int64_t x : shape) n *= x;
+        return n;
+    }
+
+    // For attention on the GPU: each row's position, segment start, segment's first row and
+    // segment's rows (kMeta), and blocks of rows for the tiled kernel (kBlocks, unless `tiled` is false).
+    void write_rows(const detail::RowBatch& batch, bool tiled) {
+        const int64_t S = static_cast<int64_t>(batch.start.size());
+        uint32_t* meta = reinterpret_cast<uint32_t*>(s.reserve(kMeta, 4 * R));
+        std::vector<uint32_t> blk;
+        for (int64_t sg = 0; sg < S; ++sg) {
+            const auto off = static_cast<uint32_t>(batch.offset[sg]), start = static_cast<uint32_t>(batch.start[sg]);
+            const auto len = static_cast<uint32_t>(batch.len[sg]);
+            for (uint32_t r = 0; r < len; ++r) {
+                uint32_t* row = meta + 4 * (off + r);
+                row[0] = start + r;
+                row[1] = start;
+                row[2] = off;
+                row[3] = len;
+            }
+            for (uint32_t r = 0; r < len; r += detail::Gpu::Seq::kAttnBlockRows)
+                blk.insert(blk.end(), {off + r, std::min<uint32_t>(detail::Gpu::Seq::kAttnBlockRows, len - r), start, off});
+        }
+        blocks = tiled ? static_cast<int64_t>(blk.size() / 4) : 0;
+        if (blocks) std::copy(blk.begin(), blk.end(), reinterpret_cast<uint32_t*>(s.reserve(kBlocks, blk.size())));
+    }
+    // What block `layer`'s attention (and its backward pass) reads besides q, k, v and kMeta: RoPE
+    // frequencies (kInvFreq) and ALiBi slopes (kSlopes). Written between runs.
+    void write_layer_inputs(int64_t layer) {
+        const ModelConfig& c = m.layer_cfg(layer);
+        if (c.positional == "rope") {
+            const int64_t rot = rope_dims(c), half = rot / 2;
+            float* inv = s.reserve(kInvFreq, half);
+            for (int64_t i = 0; i < half; ++i)  // as apply_rope_
+                inv[i] = 1.0f / std::pow(static_cast<float>(c.rope_theta), static_cast<float>(2 * i) / static_cast<float>(rot));
+        }
+        if (c.positional == "alibi") {
+            const std::vector<float> slopes = alibi_slopes(c.n_heads);
+            std::copy(slopes.begin(), slopes.end(), s.reserve(kSlopes, c.n_heads));
+        }
+    }
 
     static std::string prefix(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
     static bool sandwich_norm(const ModelConfig& c) { return c.norm_position == "sandwich" && c.norm != "none"; }
@@ -910,53 +1113,154 @@ struct GpuBlocks {
         const std::string p = prefix(layer) + "mlp.";
         const GpuAct act = gpu_act(c.mlp_activation());
         const bool glu = c.mlp != "mlp";
+        in = at(prefix(layer) + "hook_mlp_in", in, d);
         linear(in, ls.pre, p + (glu ? "gate" : "up"));
-        const int64_t n = R * m.weight(p + (glu ? "gate" : "up") + ".weight").shape[0];
+        const int64_t width = m.weight(p + (glu ? "gate" : "up") + ".weight").shape[0], n = R * width;
+        const int pre = at(p + "hook_pre", ls.pre, width);
         s.reserve(kGate, n);
-        if (ls.pre != kGate) s.copy(ls.pre, kGate, n);  // keep the pre-activation
+        if (pre != kGate) s.copy(pre, kGate, n);  // keep the pre-activation
         if (glu) {
             linear(in, ls.up, p + "up");
             s.glu(kGate, ls.up, n, act);
         } else {
             s.activate(kGate, n, act);
         }
-        linear(kGate, ls.mlp_raw, p + "down");
-        return sandwich_norm(c) ? norm(prefix(layer) + "ln2_post", c, ls.mlp_raw, ls.mlp_out) : ls.mlp_raw;
+        linear(at(p + "hook_post", kGate, width), ls.mlp_raw, p + "down");
+        const int out = sandwich_norm(c) ? norm(prefix(layer) + "ln2_post", c, ls.mlp_raw, ls.mlp_out) : ls.mlp_raw;
+        return par_out = at(prefix(layer) + "hook_mlp_out", out, d);
     }
-    // Block `layer` up to the attention projections (into kQ, kK, kV); a parallel-residual MLP also
-    // runs here, since it reads the block's input.
-    void before_attention(int64_t layer, const LayerSlots& ls) {
+    // Block `layer` up to the attention projections (into qs, ks, vs); a parallel-residual MLP also
+    // runs here, since it reads the block's input. A hook on hook_resid_pre moves ls.x.
+    void before_attention(int64_t layer, LayerSlots&& ls) { before_attention(layer, ls); }  // no hooks to move ls.x
+    void before_attention(int64_t layer, LayerSlots& ls) {
         const ModelConfig& c = m.layer_cfg(layer);
         const std::string p = prefix(layer);
-        const int in = c.norm_position == "post" ? ls.x : norm(p + "ln1", c, ls.x, kAttnIn);
-        linear(in, kQ, p + "attn.q_proj");
-        linear(in, kK, p + "attn.k_proj");
-        linear(in, kV, p + "attn.v_proj");
+        ls.x = at(p + "hook_resid_pre", ls.x, d);
+        const int in = at(p + "hook_attn_in", c.norm_position == "post" ? ls.x : norm(p + "ln1", c, ls.x, kAttnIn), d);
+        linear(in, qs, p + "attn.q_proj");
+        linear(in, ks, p + "attn.k_proj");
+        linear(in, vs, p + "attn.v_proj");
         if (c.parallel_residual && c.has_mlp()) mlp(layer, norm(p + "ln2", c, ls.x, kMlpIn), ls);
     }
-    // The rest of block `layer` from z (slot kZ): o_proj, residual adds, norms and the MLP.
-    void after_attention(int64_t layer, const LayerSlots& ls) {
+    // Block `layer`'s qk_norm and RoPE of q and k (in slots q, k) on the GPU; returns the slots that
+    // hold the results. RoPE needs kMeta and kInvFreq written.
+    std::pair<int, int> qk(int64_t layer, int q, int k) {
+        const ModelConfig& c = m.layer_cfg(layer);
+        const std::string p = prefix(layer) + "attn.";
+        const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
+        if (c.qk_norm) {
+            ModelConfig qc = c;
+            if (qc.norm == "none") qc.norm = "rmsnorm";
+            const bool layernorm = qc.norm == "layernorm";
+            auto norm_heads = [&](const std::string& name, int src, int dst, int64_t heads) {
+                const Tensor& w = m.weight(p + name + ".weight").f32();
+                if (w.numel() != D) throw std::runtime_error(p + name + ".weight does not match the head size");
+                const Weight* b = layernorm ? m.weight_or_null(p + name + ".bias") : nullptr;
+                s.reserve(dst, R * heads * D);
+                s.norm(src, dst, R * heads, w, b ? &b->f32() : nullptr, layernorm, static_cast<float>(qc.norm_eps));
+            };
+            norm_heads("q_norm", q, qn, H);
+            norm_heads("k_norm", k, kn, Hkv);
+            q = qn;
+            k = kn;
+        }
+        if (c.positional == "rope") {
+            const int64_t rot = rope_dims(c);
+            s.reserve(qr, R * H * D);
+            s.reserve(kr, R * Hkv * D);
+            s.rope(q, qr, R, H, D, rot, kInvFreq, kMeta);
+            s.rope(k, kr, R, Hkv, D, rot, kInvFreq, kMeta);
+            q = qr;
+            k = kr;
+        }
+        return {q, k};
+    }
+    static int64_t rope_dims(const ModelConfig& c) {
+        int64_t rot = static_cast<int64_t>(c.head_dim() * c.rope_fraction);
+        rot -= rot % 2;
+        if (rot == 0) throw std::runtime_error("rope_fraction * head_dim leaves no dimensions to rotate");
+        return rot;
+    }
+    detail::Gpu::Seq::AttnShape attn_shape(int64_t layer, int64_t Tp) const {
+        const ModelConfig& c = m.layer_cfg(layer);
+        const int64_t D = c.head_dim();
+        return {R, c.n_heads, c.kv_heads(), D, Tp, c.sliding_window ? *c.sliding_window : 0,
+                static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D))),
+                c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f, c.positional == "alibi", blocks};
+    }
+    // Block `layer`'s attention on the GPU, into zs; with Tp > 0, positions before each segment's
+    // start read kPK / kPV (Hkv, Tp, D). Needs write_rows and write_layer_inputs.
+    void attention(int64_t layer, int q, int k, int v, int64_t Tp) {
+        const detail::Gpu::Seq::AttnShape shape = attn_shape(layer, Tp);
+        s.reserve(zs, R * shape.H * shape.D);
+        if (lse >= 0) s.reserve(lse, R * shape.H);
+        s.attention(q, k, v, zs, Tp ? kPK : k, Tp ? kPV : v, kMeta, shape.has_slopes ? kSlopes : kMeta, shape, kBlocks, lse);
+    }
+    // Block `layer`'s attention backward pass on the GPU, from dL/dz in slot `dz` to the q, k, v
+    // projections' gradients (kDQ, kDK, kDV): attention, then RoPE and qk_norm backward. `a` holds
+    // the forward pass's slots (attention() with lse, after qk() into a's slots); q, k are the
+    // slots qk() returned. Needs write_rows and write_layer_inputs.
+    void attention_backward(int64_t layer, const AttnLayerSlots& a, int q, int k, int dz) {
+        const ModelConfig& c = m.layer_cfg(layer);
+        const detail::Gpu::Seq::AttnShape shape = attn_shape(layer, 0);
+        const int64_t H = shape.H, Hkv = shape.Hkv, D = shape.D;
+        const bool rope = c.positional == "rope";
+        // Each step writes the next slot; the last writes kDQ / kDK.
+        int dq = c.qk_norm && rope ? kDQ2 : c.qk_norm || rope ? kDQ1 : kDQ;
+        int dk = c.qk_norm && rope ? kDK2 : c.qk_norm || rope ? kDK1 : kDK;
+        s.reserve(kDelta, R * H);
+        s.reserve(dq, R * H * D);
+        s.reserve(dk, R * Hkv * D);
+        s.reserve(kDV, R * Hkv * D);
+        s.attention_backward({q, k, a.v, a.z, dz, a.lse, kMeta, shape.has_slopes ? kSlopes : kMeta}, kDelta, dq, dk, kDV, shape);
+        if (rope) {
+            const int64_t rot = rope_dims(c);
+            const int nq = c.qk_norm ? kDQ1 : kDQ, nk = c.qk_norm ? kDK1 : kDK;
+            s.reserve(nq, R * H * D);
+            s.reserve(nk, R * Hkv * D);
+            s.rope(dq, nq, R, H, D, rot, kInvFreq, kMeta, /*inverse=*/true);
+            s.rope(dk, nk, R, Hkv, D, rot, kInvFreq, kMeta, /*inverse=*/true);
+            dq = nq;
+            dk = nk;
+        }
+        if (c.qk_norm) {
+            const std::string p = prefix(layer) + "attn.";
+            const bool layernorm = c.norm == "layernorm";
+            const float eps = static_cast<float>(c.norm_eps);
+            s.reserve(kDQ, R * H * D);
+            s.reserve(kDK, R * Hkv * D);
+            s.norm_backward(a.q0, dq, kDQ, R * H, m.weight(p + "q_norm.weight").f32(), layernorm, eps);
+            s.norm_backward(a.k0, dk, kDK, R * Hkv, m.weight(p + "k_norm.weight").f32(), layernorm, eps);
+        }
+    }
+    // The rest of block `layer` from z (slot z, or zs if z < 0): o_proj, residual adds, norms and the
+    // MLP. Returns the slot of the block's output (ls.out, unless hook_resid_post moved it).
+    int after_attention(int64_t layer, const LayerSlots& ls, int z = -1) {
         const ModelConfig& c = m.layer_cfg(layer);
         const std::string p = prefix(layer);
         const bool post = c.norm_position == "post";
-        linear(kZ, ls.attn_raw, p + "attn.o_proj");
-        const int attn = c.norm_position == "sandwich" ? norm(p + "ln1_post", c, ls.attn_raw, kAttnNormed) : ls.attn_raw;
+        linear(z < 0 ? zs : z, ls.attn_raw, p + "attn.o_proj");
+        const int attn = at(p + "hook_attn_out", c.norm_position == "sandwich" ? norm(p + "ln1_post", c, ls.attn_raw, kAttnNormed) : ls.attn_raw, d);
         s.reserve(ls.out, R * d);
         if (c.parallel_residual) {
             s.add(ls.x, attn, ls.out, R * d);
-            if (c.has_mlp()) s.add(ls.out, sandwich_norm(c) ? ls.mlp_out : ls.mlp_raw, ls.out, R * d);
-            return;
+            const int mid = at(p + "hook_resid_mid", ls.out, d);
+            if (c.has_mlp()) s.add(mid, par_out, ls.out, R * d);
+            else if (mid != ls.out) s.copy(mid, ls.out, R * d);
+            return at(p + "hook_resid_post", ls.out, d);
         }
         s.reserve(ls.mid, R * d);
         if (post) add_norm(p + "ln1", c, ls.x, attn, ls.mid);
         else s.add(ls.x, attn, ls.mid, R * d);
+        const int mid = at(p + "hook_resid_mid", ls.mid, d);
         if (!c.has_mlp()) {
-            if (ls.mid != ls.out) s.copy(ls.mid, ls.out, R * d);
-            return;
+            if (mid != ls.out) s.copy(mid, ls.out, R * d);
+            return at(p + "hook_resid_post", ls.out, d);
         }
-        const int o = mlp(layer, post ? ls.mid : norm(p + "ln2", c, ls.mid, kMlpIn), ls);
-        if (post) add_norm(p + "ln2", c, ls.mid, o, ls.out);
-        else s.add(ls.mid, o, ls.out, R * d);
+        const int o = mlp(layer, post ? mid : norm(p + "ln2", c, mid, kMlpIn), ls);
+        if (post) add_norm(p + "ln2", c, mid, o, ls.out);
+        else s.add(mid, o, ls.out, R * d);
+        return at(p + "hook_resid_post", ls.out, d);
     }
 
     // --- backward ---
@@ -1043,7 +1347,7 @@ struct GpuBlocks {
             base = gx;
         }
         const int g = c.norm_position == "sandwich" ? norm_bwd(p + "ln1_post", c, ls.attn_raw, gx, kTmpD) : gx;
-        linear_t(g, kDZ, p + "attn.o_proj");
+        linear_t(g, dzs, p + "attn.o_proj");
         return base;
     }
     // The rest of block `layer`'s backward pass from the q, k, v projections' gradients (kDQ, kDK,
@@ -1062,22 +1366,13 @@ struct GpuBlocks {
     }
 };
 
-// Hook points that Model::block calls on activations the GPU path keeps on the GPU.
-bool gpu_side_hooked(const Hooks* hooks, int64_t layer) {
-    if (!hooks) return false;
-    const std::string p = layer_prefix(layer);
-    for (const char* name : {"hook_attn_in", "hook_attn_out", "hook_resid_mid", "hook_mlp_in", "mlp.hook_pre",
-                             "mlp.hook_post", "hook_mlp_out", "hook_resid_post"})
-        if (hooks->matches(p + name)) return true;
-    return false;
-}
-
 }  // namespace
 #endif
 
-// On the GPU, each run of blocks with no hook on a GPU-side activation keeps the residual stream on
-// the GPU: one submission per block (Gpu::Seq), the CPU doing only attention in between. A block
-// with such a hook, or the CPU path, runs Model::block (linear layers still go to the GPU).
+// On the GPU, the residual stream stays on the GPU from `layer` to the end: one submission per block
+// (Gpu::Seq), the CPU doing only attention in between (or nothing, with attention on the GPU), and
+// hooks getting their activations through GpuBlocks::at. Otherwise (the CPU, or set_gpu_resident
+// false) Model::block, its linear layers still on the GPU if batch.gpu is set.
 Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows) const {
     const int64_t L = cfg_.n_layers, d = cfg_.d_model, S = static_cast<int64_t>(batch.start.size());
     // Each segment's last row of a (rows, d) residual stream at `src`.
@@ -1091,42 +1386,96 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
     };
 #ifdef TFI_USE_ACCELERATE
     const int64_t R = batch.rows();
-    if (g_gpu_resident.load() && batch.gpu && R >= detail::gpu_min_rows()) {
+    // A single pass (batch.whole) comes here only if single_pass_on_gpu chose the GPU for it.
+    if (g_gpu_resident.load() && batch.gpu && (batch.whole || R >= detail::gpu_min_rows())) {
         detail::Gpu::Seq s(*batch.gpu);
         GpuBlocks gb{*this, s, R, d};
-        int64_t i = layer;
-        while (i < L) {
-            if (gpu_side_hooked(hooks, i)) {
-                x = block(i, std::move(x), hooks, &batch);
-                ++i;
-                continue;
+        // The CPU's attention is faster only while it overlaps the GPU's work on other batches; a
+        // single pass has none to overlap, so its attention runs on the GPU too.
+        const bool gpu_attention = detail::gpu_only() || g_gpu_attention.load() || batch.whole;
+        // q, k, v alternate between two sets of slots by layer, so that a run never overwrites the
+        // slots its attention reads (Gpu::Seq::run may repeat a run).
+        const int qkv[2][3] = {{kQ, kK, kV}, {kQ2, kK2, kV2}};
+        auto use_qkv = [&](int64_t l) {
+            gb.qs = qkv[l & 1][0];
+            gb.ks = qkv[l & 1][1];
+            gb.vs = qkv[l & 1][2];
+        };
+        const bool prefixed = std::any_of(batch.start.begin(), batch.start.end(), [](int64_t st) { return st > 0; });
+        if (gpu_attention) gb.write_rows(batch, g_attn_tiled.load());
+        // What layer l's attention reads besides q, k, v: RoPE frequencies, ALiBi slopes and the earlier
+        // positions' keys and values (Hkv, Tp, D). Written between runs. Returns Tp (0: none needed).
+        auto attention_inputs = [&](int64_t l) {
+            const ModelConfig& c = layer_cfgs_[l];
+            const int64_t Hkv = c.kv_heads(), D = c.head_dim();
+            gb.write_layer_inputs(l);
+            if (!prefixed) return int64_t(0);
+            const Tensor* pk = batch.prefix_k.at(l);
+            const Tensor* pv = batch.prefix_v.at(l);
+            if (!pk || !pv || pk->dim() != 3 || pk->shape[0] != Hkv || pk->shape[2] != D || pv->shape != pk->shape)
+                throw std::invalid_argument("forward_rows: prefix keys / values must be (Hkv, T, D) for every layer");
+            std::copy(pk->ptr(), pk->ptr() + pk->numel(), s.reserve(kPK, pk->numel()));
+            std::copy(pv->ptr(), pv->ptr() + pv->numel(), s.reserve(kPV, pv->numel()));
+            return pk->shape[1];
+        };
+        gb.hooks = hooks;
+        gb.fp16 = batch.fp16;
+        auto other = [](int slot) { return slot == kResid0 ? static_cast<int>(kResid1) : static_cast<int>(kResid0); };
+        s.reserve(kResid1, R * d);
+        std::copy(x.ptr(), x.ptr() + R * d, s.reserve(kResid0, R * d));
+        int cur = kResid0;
+        LayerSlots ls = inference_slots(layer_cfgs_[layer], layer, cur, other(cur));
+        use_qkv(layer);
+        gb.before_attention(layer, ls);
+        if (!gpu_attention) gb.run();
+        for (int64_t l = layer; l < L; ++l) {
+            const ModelConfig& c = layer_cfgs_[l];
+            const std::string p = layer_prefix(l) + "attn.";
+            const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
+            const int q0 = qkv[l & 1][0], k0 = qkv[l & 1][1], v0 = qkv[l & 1][2];
+            int z = kZ;
+            if (gpu_attention) {
+                // One run per block: q, k, v never leave the GPU unless a hook asks for them.
+                const int64_t Tp = attention_inputs(l);  // the previous run has finished with these slots
+                auto [q, k] = gb.qk(l, q0, k0);
+                q = gb.at(p + "hook_q", q, H * D, GpuBlocks::View::Heads, D);
+                k = gb.at(p + "hook_k", k, Hkv * D, GpuBlocks::View::Heads, D);
+                const int v = gb.at(p + "hook_v", v0, Hkv * D, GpuBlocks::View::Heads, D);
+                const bool pattern = batch.whole && hooks && hooks->matches(p + "hook_pattern");
+                gb.lse = pattern ? static_cast<int>(kLse) : -1;
+                gb.attention(l, q, k, v, Tp);
+                gb.lse = -1;
+                const detail::Gpu::Seq::AttnShape shape = gb.attn_shape(l, 0);
+                if (pattern && !hooks->changes(p + "hook_pattern")) {  // only captured: computed and handed over after the run
+                    const int dst = gb.capture_slot(H * R * R);
+                    s.attention_pattern(q, k, kLse, shape.has_slopes ? kSlopes : kLse, dst, shape);
+                    gb.defer(p + "hook_pattern", dst, Shape{H, R, R}, GpuBlocks::View::Whole, 0, 0);
+                } else if (pattern) {  // the pattern itself, handed to the hook, then z from what it leaves
+                    s.reserve(kPattern, H * R * R);
+                    s.attention_pattern(q, k, kLse, shape.has_slopes ? kSlopes : kLse, kPattern, shape);
+                    gb.run();
+                    Tensor P({H, R, R}, std::vector<float>(s.data(kPattern), s.data(kPattern) + H * R * R));
+                    hook(hooks, p + "hook_pattern", P);
+                    if (P.numel() != H * R * R) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
+                    std::copy(P.ptr(), P.ptr() + P.numel(), s.data(kPattern));
+                    s.attention_apply(kPattern, v, kZ, shape);
+                }
+                z = gb.at(p + "hook_z", kZ, H * D, GpuBlocks::View::RowsHeads, D);
+            } else {  // attention on the CPU, reading q, k, v and writing z in the GPU's slots
+                float* zp = s.reserve(kZ, R * H * D);
+                attend_into(l, s.data(q0), s.data(k0), s.data(v0), R, hooks, &batch, zp);
             }
-            // Blocks i..j-1 stay on the GPU; a later hook_resid_pre needs the CPU.
-            int64_t j = i + 1;
-            while (j < L && !gpu_side_hooked(hooks, j) && !(hooks && hooks->matches(layer_prefix(j) + "hook_resid_pre")))
-                ++j;
-            hook(hooks, layer_prefix(i) + "hook_resid_pre", x);
-            s.reserve(kResid1, R * d);
-            std::copy(x.ptr(), x.ptr() + R * d, s.reserve(kResid0, R * d));
-            int cur = kResid0;
-            gb.before_attention(i, inference_slots(layer_cfgs_[i], i, cur, kResid1));
-            s.run(batch.fp16);
-            for (int64_t l = i; l < j; ++l) {
-                const ModelConfig& c = layer_cfgs_[l];
-                // Attention reads q, k, v from their GPU buffers and writes z into its own: no copies.
-                float* z = s.reserve(kZ, R * c.n_heads * c.head_dim());
-                attend_into(l, s.data(kQ), s.data(kK), s.data(kV), R, hooks, &batch, z);
-                const int next = cur == kResid0 ? kResid1 : kResid0;
-                gb.after_attention(l, inference_slots(c, l, cur, next));
-                cur = next;
-                if (l + 1 < j) gb.before_attention(l + 1, inference_slots(layer_cfgs_[l + 1], l + 1, cur, cur == kResid0 ? kResid1 : kResid0));
-                s.run(batch.fp16);
+            cur = gb.after_attention(l, ls, z);
+            if (l + 1 < L) {
+                ls = inference_slots(layer_cfgs_[l + 1], l + 1, cur, other(cur));
+                use_qkv(l + 1);
+                gb.before_attention(l + 1, ls);
             }
-            if (j == L && last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
-            x = Tensor({R, d});
-            std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());
-            i = j;
+            gb.run();
         }
+        if (last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
+        x = Tensor({R, d});
+        std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());
         return last_rows ? lasts(x.ptr()) : x;
     }
 #endif
@@ -1138,6 +1487,8 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
 // (saved_slots) and each segment's attention tensors on the CPU. Backward: from the last layer
 // down, one submission per block (GpuBlocks::backward_after of one block, backward_before of the
 // next), with attention's backward on the CPU in between, per segment (detail::attention_backward).
+// With attention on the GPU (GPU-only mode), attention and its backward pass run inside those
+// submissions instead, from what the forward pass kept on the GPU (attn_slots).
 std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detail::RowBatch& batch,
                                                    const std::function<Tensor(int64_t, const Tensor&)>& dmetric,
                                                    const NameFilter& filter) const {
@@ -1152,6 +1503,21 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
 
     detail::Gpu::Seq s(*batch.gpu);
     GpuBlocks gb{*this, s, R, d};
+    const bool gpu_attention = detail::gpu_only() || g_gpu_attention.load();
+    if (gpu_attention) gb.write_rows(batch, g_attn_tiled.load());
+    std::vector<std::pair<int, int>> qk_slots(L);  // with gpu_attention: each layer's q, k after qk()
+    auto use_attn_slots = [&](int64_t l) {
+        const AttnLayerSlots a = attn_slots(l);
+        gb.qs = a.q0;
+        gb.ks = a.k0;
+        gb.vs = a.v;
+        gb.qn = a.qn;
+        gb.kn = a.kn;
+        gb.qr = a.qr;
+        gb.kr = a.kr;
+        gb.zs = a.z;
+        gb.lse = a.lse;
+    };
     // Each segment's attention inputs (after qk_norm and RoPE), pattern, and projections before qk_norm.
     struct SegAttn {
         Tensor q, k, v, pattern, q0, k0;
@@ -1165,12 +1531,26 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
     };
 
     std::copy(x0.ptr(), x0.ptr() + R * d, s.reserve(saved_slots(0).x, R * d));
+    if (gpu_attention) use_attn_slots(0);
     gb.before_attention(0, saved_slots(0));
-    s.run(false);
+    if (!gpu_attention) s.run(false);
     for (int64_t l = 0; l < L; ++l) {
         const ModelConfig& c = layer_cfgs_[l];
         const std::string p = layer_prefix(l) + "attn.";
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
+        if (gpu_attention) {  // one run per block, attention's inputs and outputs kept per layer
+            const AttnLayerSlots a = attn_slots(l);
+            gb.write_layer_inputs(l);
+            qk_slots[l] = gb.qk(l, a.q0, a.k0);
+            gb.attention(l, qk_slots[l].first, qk_slots[l].second, a.v, 0);
+            gb.after_attention(l, saved_slots(l));
+            if (l + 1 < L) {
+                use_attn_slots(l + 1);
+                gb.before_attention(l + 1, saved_slots(l + 1));
+            }
+            s.run(false);
+            continue;
+        }
         float* z = s.reserve(kZ, R * H * D);
         for (int64_t g = 0; g < S; ++g) {
             SegAttn& a = saved[l][g];
@@ -1183,11 +1563,12 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
                 a.q0 = detail::split_heads(q2, n, H, D);
                 a.k0 = detail::split_heads(k2, n, Hkv, D);
             }
-            Hooks keep;
-            keep.add(p + "hook_q", [&](const std::string&, Tensor& t) { a.q = t; });
-            keep.add(p + "hook_k", [&](const std::string&, Tensor& t) { a.k = t; });
-            keep.add(p + "hook_v", [&](const std::string&, Tensor& t) { a.v = t; });
-            keep.add(p + "hook_pattern", [&](const std::string&, Tensor& t) { a.pattern = t; });
+            Hooks keep;  // captures: they only read
+            auto only = [](std::string name) { return [name](const std::string& n) { return n == name; }; };
+            keep.add_capture(only(p + "hook_q"), [&](const std::string&, Tensor& t) { a.q = t; });
+            keep.add_capture(only(p + "hook_k"), [&](const std::string&, Tensor& t) { a.k = t; });
+            keep.add_capture(only(p + "hook_v"), [&](const std::string&, Tensor& t) { a.v = t; });
+            keep.add_capture(only(p + "hook_pattern"), [&](const std::string&, Tensor& t) { a.pattern = t; });
             attend_into(l, q2, k2, v2, n, &keep, nullptr, z + off * H * D);
         }
         gb.after_attention(l, saved_slots(l));
@@ -1224,12 +1605,39 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
     std::vector<GpuBlocks::Reported> rep(L);
     std::vector<int> base(L);
     std::vector<ActivationCache> out(S);
+    // With gpu_attention, dL/dz alternates between two slots by layer: a run reads one layer's and
+    // writes the next one's (Gpu::Seq::run may repeat a run).
+    auto dz_slot = [&](int64_t l) { return gpu_attention && (l & 1) ? static_cast<int>(kDZ2) : static_cast<int>(kDZ); };
+    gb.dzs = dz_slot(L - 1);
     base[L - 1] = gb.backward_before(L - 1, saved_slots(L - 1), grad_slots(L - 1), g_post(L - 1), rep[L - 1]);
-    s.run(false);
+    if (!gpu_attention) s.run(false);
     for (int64_t l = L - 1; l >= 0; --l) {
         const ModelConfig& c = layer_cfgs_[l];
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
         const bool want_z = wanted(layer_prefix(l) + "attn.hook_z");
+        if (gpu_attention) {
+            if (l < L - 1 && want_z) {  // dL/dz of this layer, written by the previous run
+                const float* dz = s.data(dz_slot(l));
+                for (int64_t g = 0; g < S; ++g)
+                    out[g][layer_prefix(l) + "attn.hook_z"] =
+                        Tensor({batch.len[g], H, D}, std::vector<float>(dz + batch.offset[g] * H * D, dz + (batch.offset[g] + batch.len[g]) * H * D));
+            }
+            gb.write_layer_inputs(l);
+            gb.attention_backward(l, attn_slots(l), qk_slots[l].first, qk_slots[l].second, dz_slot(l));
+            gb.backward_after(l, saved_slots(l), grad_slots(l), base[l]);
+            if (l > 0) {
+                gb.dzs = dz_slot(l - 1);
+                base[l - 1] = gb.backward_before(l - 1, saved_slots(l - 1), grad_slots(l - 1), g_post(l - 1), rep[l - 1]);
+            }
+            s.run(false);
+            if (l == L - 1 && want_z) {  // the last layer's dL/dz was computed in this same run
+                const float* dz = s.data(dz_slot(l));
+                for (int64_t g = 0; g < S; ++g)
+                    out[g][layer_prefix(l) + "attn.hook_z"] =
+                        Tensor({batch.len[g], H, D}, std::vector<float>(dz + batch.offset[g] * H * D, dz + (batch.offset[g] + batch.len[g]) * H * D));
+            }
+            continue;
+        }
         float* dq = s.reserve(kDQ, R * H * D);
         float* dk = s.reserve(kDK, R * Hkv * D);
         float* dv = s.reserve(kDV, R * Hkv * D);
@@ -1286,7 +1694,7 @@ Tensor Model::forward_rows(int64_t layer, Tensor x, const detail::RowBatch& batc
 Tensor Model::run_with_cache(const Tokens& tokens, ActivationCache& cache, NameFilter filter, const Hooks* hooks) const {
     Hooks all;
     if (hooks) all.extend(*hooks);
-    all.add_filter(std::move(filter), [&cache](const std::string& name, Tensor& act) { cache[name] = act; });
+    all.add_capture(std::move(filter), [&cache](const std::string& name, Tensor& act) { cache[name] = act; });
     return forward(tokens, &all);
 }
 
