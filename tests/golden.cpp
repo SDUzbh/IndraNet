@@ -3,8 +3,8 @@
 //   tfi_golden model.safetensors reference.safetensors [tolerance] [fp16]
 //
 // Checks the logits and every cached activation, and, when the reference was written with a
-// metric, every hook point's gradient of it (PyTorch autograd vs. tfi's backward pass). The
-// tolerance is relative to each tensor's largest magnitude. With fp16 the model is loaded with
+// metric, every hook point's gradient of it (PyTorch autograd vs. tfi's backward pass). A reference
+// with "partial" in its metadata checks only the tensors it holds. The tolerance is relative to each tensor's largest magnitude. With fp16 the model is loaded with
 // WeightFormat::fp16. Exit code 0 means everything matched.
 #include <algorithm>
 #include <cstdio>
@@ -66,7 +66,10 @@ int main(int argc, char** argv) {
                 ++failures;
             }
         }
+        // A partial reference (e.g. a Hugging Face model's logits and residual stream) checks only what it has.
+        const bool partial = ref.metadata.count("partial") > 0;
         for (const auto& kv : cache) {
+            if (partial) break;
             const bool bare = kv.first == "logits" || kv.first.rfind("grad.", 0) == 0;
             const std::string key = bare ? kv.first : "cache." + kv.first;
             if (!ref.tensors.count(key)) {

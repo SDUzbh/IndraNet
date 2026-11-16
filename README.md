@@ -64,6 +64,14 @@ Or train an example circuit and export it in one go:
 python examples/induction_heads.py --export induction.safetensors
 ```
 
+Or convert a pretrained Hugging Face checkpoint (Llama, Mistral, Qwen2/3, Phi-3, Gemma 1/2/3,
+GPT-2, Pythia) with the independent converter in [python/indranet_hf](python/indranet_hf/README.md),
+which needs only numpy:
+
+```bash
+python -m indranet_hf path/to/checkpoint model.safetensors    # or a Hub repo id
+```
+
 ## Commands
 
 | Command | Kind | What it answers |
@@ -281,6 +289,9 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   softcaps, parallel residual, per-layer overrides and all presets. Agreement is at float32
   rounding level, about 3e-7 relative. The same configurations check the backward pass: the
   gradient of a metric at every hook point must match PyTorch autograd's to 1e-4.
+- **Hugging Face golden tests** (`python/tests/test_hf.py`, with `transformers` installed) build a
+  tiny random model of each supported family, convert it, and check the engine reproduces
+  transformers' logits and every layer's residual stream, from float32 and bf16 checkpoints.
 - **Unit tests** (`tests/unit.cpp`) check invariants on random models: DLA parts sum to the real
   logit difference, the last logit-lens stage equals the model's output, patching the only
   changed input restores the clean run exactly, the fast low-rank composition formula equals the
@@ -395,6 +406,6 @@ hyphen, such as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action v
 
 ## Not included (yet)
 
-Loading pretrained Hugging Face weights (so models like Qwen or Gemma can't be studied yet), a
-tokenizer in the engine, padding masks for batched prompts of different lengths, and
-mixture-of-experts layers.
+RoPE scaling (so Llama 3.1+ and long-context models can't be converted yet), loading Hugging Face
+folders directly in the engine (they go through the converter), a tokenizer in the engine, padding
+masks for batched prompts of different lengths, and mixture-of-experts layers.

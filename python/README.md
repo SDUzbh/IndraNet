@@ -110,6 +110,9 @@ scripts take `--fp16` for the same: `induction_heads.py --export path --fp16` an
 `.bfloat16()`; only a value that rounds to infinity keeps a weight float32); `indra` loads it as
 float32 exactly, and `indra --fp16` converts it to fp16.
 
+Pretrained Hugging Face checkpoints don't go through `indranet`: the separate converter in
+[indranet_hf/](indranet_hf/README.md) writes the same file format from them, with numpy only.
+
 Then `build/indra info model.safetensors` from the repository root. Only built-in components can
 be exported; `indranet.export.export_reference` writes the PyTorch activations the golden tests
 compare against.
