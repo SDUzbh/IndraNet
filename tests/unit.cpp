@@ -15,6 +15,7 @@
 #include <string>
 #include <cstring>
 #include <unistd.h>
+#include <vector>
 
 #include "tfi/analysis.h"
 #include "tfi/json.h"
@@ -2412,8 +2413,62 @@ static void test_device_modes() {
 }
 #endif
 
-int main() {
-    auto run = [](const std::string& name, const std::function<void()>& fn) {
+// Test groups, for running part of the suite:
+//   core      json, tensors, matmul, vector math, weight shapes
+//   analysis  per model type: cache and hooks, lens, DLA, patching, ablation, circuits
+//   grad      gradients against finite differences, attribution and mixed patching
+//   fp16      fp16 conversion and weights, and the analysis invariants with fp16 weights
+//   gpu       GPU work: chunking and thresholds everywhere; kernels, resident passes, attention on macOS
+static const char* const kGroups[] = {"core", "analysis", "grad", "fp16", "gpu"};
+
+static int usage(const char* argv0) {
+    std::fprintf(stderr,
+                 "usage: %s [--group G[,G...]] [--filter TEXT] [--list]\n"
+                 "  --group   run only these groups: core, analysis, grad, fp16, gpu\n"
+                 "  --filter  run only tests whose name contains TEXT\n"
+                 "  --list    print the selected tests' groups and names, run nothing\n",
+                 argv0);
+    return 2;
+}
+
+int main(int argc, char** argv) {
+    std::vector<std::string> only;
+    std::string filter;
+    bool list = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if ((a == "--group" || a == "--filter") && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (a == "--filter") {
+                filter = v;
+                continue;
+            }
+            for (size_t p = 0; p <= v.size();) {
+                const size_t q = std::min(v.find(',', p), v.size());
+                const std::string g = v.substr(p, q - p);
+                if (std::find_if(std::begin(kGroups), std::end(kGroups), [&](const char* k) { return g == k; }) == std::end(kGroups)) {
+                    std::fprintf(stderr, "unknown group '%s'\n", g.c_str());
+                    return usage(argv[0]);
+                }
+                only.push_back(g);
+                p = q + 1;
+            }
+        } else if (a == "--list") {
+            list = true;
+        } else {
+            return usage(argv[0]);
+        }
+    }
+    int selected = 0;
+    auto run = [&](const std::string& group, const std::string& name, const std::function<void()>& fn) {
+        if ((!only.empty() && std::find(only.begin(), only.end(), group) == only.end()) ||
+            name.find(filter) == std::string::npos)
+            return;
+        ++selected;
+        if (list) {
+            std::printf("%-9s %s\n", group.c_str(), name.c_str());
+            return;
+        }
         const int before = g_failures;
         try {
             fn();
@@ -2423,65 +2478,65 @@ int main() {
         }
         std::printf("%s %s\n", g_failures == before ? "ok  " : "FAIL", name.c_str());
     };
-    run("json", test_json);
-    run("reshape + linear", test_reshape_and_linear);
-    run("matmul", test_matmul);
+    run("core", "json", test_json);
+    run("core", "reshape + linear", test_reshape_and_linear);
+    run("core", "matmul", test_matmul);
     for (const auto& kv : configs()) {
         const Model m = random_model(kv.second, 42);
-        run("cache/hooks/causality: " + kv.first, [&] { test_cache_and_hooks(kv.first, m); });
-        run("logit lens: " + kv.first, [&] { test_logit_lens(m); });
-        run("direct logit attribution: " + kv.first, [&] { test_dla(m); });
-        run("activation patching: " + kv.first, [&] { test_patching(m); });
-        run("patching edge cases (zero gap, missing sites): " + kv.first, [&] { test_patching_edge_cases(m); });
-        run("optimized patching (batched, GPU) and ablation = naive: " + kv.first, [&] { test_optimized_patching_matches_naive(m); });
-        run("ablation + head scores: " + kv.first, [&] { test_ablation_and_scores(m); });
-        run("mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
-        run("gradients = finite differences: " + kv.first, [&] { test_gradients(m); });
-        run("attribution patching: " + kv.first, [&] { test_attribution_patching(m); });
-        run("mixed patching: " + kv.first, [&] { test_mixed_patching(m); });
+        run("analysis", "cache/hooks/causality: " + kv.first, [&] { test_cache_and_hooks(kv.first, m); });
+        run("analysis", "logit lens: " + kv.first, [&] { test_logit_lens(m); });
+        run("analysis", "direct logit attribution: " + kv.first, [&] { test_dla(m); });
+        run("analysis", "activation patching: " + kv.first, [&] { test_patching(m); });
+        run("analysis", "patching edge cases (zero gap, missing sites): " + kv.first, [&] { test_patching_edge_cases(m); });
+        run("analysis", "optimized patching (batched, GPU) and ablation = naive: " + kv.first, [&] { test_optimized_patching_matches_naive(m); });
+        run("analysis", "ablation + head scores: " + kv.first, [&] { test_ablation_and_scores(m); });
+        run("analysis", "mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
+        run("grad", "gradients = finite differences: " + kv.first, [&] { test_gradients(m); });
+        run("grad", "attribution patching: " + kv.first, [&] { test_attribution_patching(m); });
+        run("grad", "mixed patching: " + kv.first, [&] { test_mixed_patching(m); });
         if (kv.second.kv_heads() == kv.second.n_heads)
-            run("composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
-        run("circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
+            run("analysis", "composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
+        run("analysis", "circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
     }
-    run("fp16 conversion", test_half_conversion);
-    run("fp16 weights: reads, linear, matmul", test_fp16_weight);
-    run("fp16 weights: loading converts as it reads", test_fp16_load);
+    run("fp16", "fp16 conversion", test_half_conversion);
+    run("fp16", "fp16 weights: reads, linear, matmul", test_fp16_weight);
+    run("fp16", "fp16 weights: loading converts as it reads", test_fp16_load);
     for (const auto& kv : configs()) {
         const Model m16 = random_model(kv.second, 42, WeightFormat::fp16);
-        run("fp16 weights = float32 with rounded weights: " + kv.first, [&] { test_fp16_model(m16); });
-        run("fp16 weights: lens, DLA, patching, optimized = naive: " + kv.first, [&] {
+        run("fp16", "fp16 weights = float32 with rounded weights: " + kv.first, [&] { test_fp16_model(m16); });
+        run("fp16", "fp16 weights: lens, DLA, patching, optimized = naive: " + kv.first, [&] {
             test_logit_lens(m16);
             test_dla(m16);
             test_patching(m16);
             test_optimized_patching_matches_naive(m16);
         });
-        run("fp16 weights: gradients, attribution, mixed, circuits: " + kv.first, [&] {
+        run("fp16", "fp16 weights: gradients, attribution, mixed, circuits: " + kv.first, [&] {
             test_gradients(m16);
             test_attribution_patching(m16);
             test_mixed_patching(m16);
             test_circuits_fast_paths(m16);
         });
     }
-    run("weight shapes checked when a model is built", test_weight_shapes_checked);
-    run("OV copying + positional QK", test_copying_and_positional);
-    run("post-norm DLA refused", test_post_norm_dla_refused);
-    run("vector math", test_vector_math);
-    run("chunked GPU work: packing, retries, failure", test_gpu_chunks);
-    run("which single passes go to the GPU", test_single_pass_rule);
+    run("core", "weight shapes checked when a model is built", test_weight_shapes_checked);
+    run("analysis", "OV copying + positional QK", test_copying_and_positional);
+    run("analysis", "post-norm DLA refused", test_post_norm_dla_refused);
+    run("core", "vector math", test_vector_math);
+    run("gpu", "chunked GPU work: packing, retries, failure", test_gpu_chunks);
+    run("gpu", "which single passes go to the GPU", test_single_pass_rule);
 #ifdef TFI_USE_ACCELERATE
-    run("GPU linear layer (macOS)", test_gpu_linear);
-    run("GPU used only with enough work (macOS)", test_gpu_work_threshold);
-    run("device modes: cpu, both, gpu (macOS)", test_device_modes);
-    run("GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);
+    run("gpu", "GPU linear layer (macOS)", test_gpu_linear);
+    run("gpu", "GPU used only with enough work (macOS)", test_gpu_work_threshold);
+    run("gpu", "device modes: cpu, both, gpu (macOS)", test_device_modes);
+    run("gpu", "GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);
     for (const auto& kv : gpu_block_configs())
-        run("circuits on the GPU = CPU, chunked, retried, falling back (macOS): " + kv.first,
+        run("gpu", "circuits on the GPU = CPU, chunked, retried, falling back (macOS): " + kv.first,
             [&] { test_gpu_circuits(random_model(kv.second, 46)); });
-    run("GPU block operations (macOS)", test_gpu_seq);
+    run("gpu", "GPU block operations (macOS)", test_gpu_seq);
     for (const auto& kv : gpu_block_configs())
-        run("GPU-resident batched passes = per-layer and plain (macOS): " + kv.first,
+        run("gpu", "GPU-resident batched passes = per-layer and plain (macOS): " + kv.first,
             [&] { test_gpu_resident(random_model(kv.second, 43)); });
     for (const auto& kv : gpu_block_configs())
-        run("attention on the GPU: batched passes = per-layer and plain (macOS): " + kv.first, [&] {
+        run("gpu", "attention on the GPU: batched passes = per-layer and plain (macOS): " + kv.first, [&] {
             detail::set_gpu_attention(true);
             for (bool tiled : {true, false}) {
                 detail::set_gpu_attention_tiled(tiled);
@@ -2491,9 +2546,9 @@ int main() {
             detail::set_gpu_attention_tiled(true);
             detail::set_gpu_attention(false);
         });
-    run("attention on the GPU: long sequences, both kernels = CPU (macOS)", test_gpu_attention_long);
+    run("gpu", "attention on the GPU: long sequences, both kernels = CPU (macOS)", test_gpu_attention_long);
     for (const auto& kv : gpu_block_configs())
-        run("attention + its backward on the GPU: batched gradients = run_with_gradients, attribution = CPU (macOS): " + kv.first, [&] {
+        run("gpu", "attention + its backward on the GPU: batched gradients = run_with_gradients, attribution = CPU (macOS): " + kv.first, [&] {
             detail::set_gpu_attention(true);
             for (bool tiled : {true, false}) {
                 detail::set_gpu_attention_tiled(tiled);
@@ -2504,37 +2559,42 @@ int main() {
             detail::set_gpu_attention(false);
         });
     for (const auto& kv : gpu_block_configs())
-        run("single passes on the GPU in GPU-only mode = CPU, hooks included (macOS): " + kv.first,
+        run("gpu", "single passes on the GPU in GPU-only mode = CPU, hooks included (macOS): " + kv.first,
             [&] { test_gpu_single_pass(random_model(kv.second, 53), 9); });
     for (const auto& kv : gpu_block_configs())
-        run("capture hooks on the GPU next to editing hooks = CPU (macOS): " + kv.first,
+        run("gpu", "capture hooks on the GPU next to editing hooks = CPU (macOS): " + kv.first,
             [&] { test_gpu_captures(random_model(kv.second, 56), 9); });
-    run("single passes in both mode with the default thresholds (macOS)", test_gpu_single_pass_defaults);
-    run("single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
+    run("gpu", "single passes in both mode with the default thresholds (macOS)", test_gpu_single_pass_defaults);
+    run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);
     });
-    run("attention + its backward on the GPU: long sequences, gradients = run_with_gradients (macOS)", [&] {
+    run("gpu", "attention + its backward on the GPU: long sequences, gradients = run_with_gradients (macOS)", [&] {
         detail::set_gpu_attention(true);
         for (const auto& kv : long_attention_configs()) test_gpu_gradients(random_model(kv.second, 52), {48, 17, 33, 1});
         detail::set_gpu_attention(false);
     });
     for (const auto& kv : gpu_block_configs())
-        run("GPU batched gradients = run_with_gradients (macOS): " + kv.first,
+        run("gpu", "GPU batched gradients = run_with_gradients (macOS): " + kv.first,
             [&] { test_gpu_gradients(random_model(kv.second, 44)); });
     for (const auto& kv : gpu_block_configs())
-        run("attribution + mixed patching on the GPU = CPU (macOS): " + kv.first,
+        run("gpu", "attribution + mixed patching on the GPU = CPU (macOS): " + kv.first,
             [&] { test_gpu_attribution(random_model(kv.second, 45)); });
     for (const auto& kv : gpu_block_configs())
-        run("fp16 weights on the GPU: = rounded float32 weights; gradients, attribution = CPU (macOS): " + kv.first, [&] {
+        run("gpu", "fp16 weights on the GPU: = rounded float32 weights; gradients, attribution = CPU (macOS): " + kv.first, [&] {
             test_gpu_fp16_matches_rounded(random_model(kv.second, 43, WeightFormat::fp16));
             test_gpu_gradients(random_model(kv.second, 44, WeightFormat::fp16));
             test_gpu_attribution(random_model(kv.second, 45, WeightFormat::fp16));
         });
 #endif
-    run("NaN never matches", test_nan_never_matches);
-    run("patch gap threshold", test_patch_gap_threshold);
-    run("per-layer head counts", test_heterogeneous_heads);
-    run("attribution patching exact when linear", test_attribution_exact_when_linear);
+    run("analysis", "NaN never matches", test_nan_never_matches);
+    run("analysis", "patch gap threshold", test_patch_gap_threshold);
+    run("analysis", "per-layer head counts", test_heterogeneous_heads);
+    run("grad", "attribution patching exact when linear", test_attribution_exact_when_linear);
+    if (selected == 0) {  // a typo in --filter must not pass as a clean run
+        std::fprintf(stderr, "no tests match\n");
+        return 2;
+    }
+    if (list) return 0;
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

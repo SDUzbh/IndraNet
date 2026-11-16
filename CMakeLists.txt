@@ -44,4 +44,7 @@ add_executable(tfi_tests tests/unit.cpp)
 target_link_libraries(tfi_tests PRIVATE tfi)
 
 enable_testing()
-add_test(NAME unit COMMAND tfi_tests)
+# One test per group (tests/unit.cpp), so ctest -R gpu runs part and ctest -j runs them side by side.
+foreach(group core analysis grad fp16 gpu)
+  add_test(NAME unit_${group} COMMAND tfi_tests --group ${group})
+endforeach()

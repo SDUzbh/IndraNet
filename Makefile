@@ -1,6 +1,8 @@
 # Build the tfi engine (library), the indra CLI and the test tools with make (no CMake needed).
 #   make            -> build/libtfi.a build/indra build/tfi_golden build/tfi_tests
 #   make test       -> C++ unit tests (golden tests against PyTorch run from pytest)
+#   make test GROUPS=gpu,fp16 FILTER=attention -> only those groups / tests whose name contains the text
+#                      (groups: core analysis grad fp16 gpu; build/tfi_tests --list shows them)
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
 #   make CXXFLAGS="-O1 -g -fsanitize=address,undefined" test
 CXXFLAGS ?= -O2
@@ -42,7 +44,7 @@ $(BUILD)/tfi_tests: tests/unit.cpp $(BUILD)/libtfi.a $(HEADERS)
 	$(CXX) $(CXXFLAGS) $< $(BUILD)/libtfi.a $(LDLIBS) -o $@
 
 test: $(BUILD)/tfi_tests
-	$(BUILD)/tfi_tests
+	$(BUILD)/tfi_tests $(if $(GROUPS),--group $(GROUPS)) $(if $(FILTER),--filter "$(FILTER)")
 
 clean:
 	rm -rf $(BUILD)

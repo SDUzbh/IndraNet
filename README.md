@@ -381,6 +381,24 @@ make test       # C++ unit tests
 pytest          # Python tests, golden tests against PyTorch, the indra CLI and the examples
 ```
 
+The C++ unit tests are in five groups, so part of the suite can run on its own:
+
+| Group | Covers |
+|---|---|
+| `core` | JSON, tensors, matrix multiplies, vector math, weight shapes |
+| `analysis` | per model type: cache and hooks, logit lens, DLA, patching, ablation, circuits |
+| `grad` | gradients against finite differences, attribution and mixed patching |
+| `fp16` | fp16 conversion and weights, and the analysis invariants rerun with fp16 weights |
+| `gpu` | GPU work chunking and thresholds; on macOS also the kernels, resident passes, GPU attention and its backward |
+
+```bash
+make test GROUPS=gpu,fp16            # only these groups
+make test FILTER=attention           # only tests whose name contains the text (combines with GROUPS)
+build/tfi_tests --list               # the groups and names a selection would run
+ctest --test-dir build-cmake -R gpu  # CMake builds register one test per group
+pytest python/tests/test_hf.py       # the Python tests are split by file
+```
+
 ## CI/CD
 
 GitHub Actions runs on every push to `main` and every pull request
