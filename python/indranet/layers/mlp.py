@@ -22,9 +22,9 @@ class MLP(nn.Module):
     def __init__(self, cfg, activation: Optional[str] = None):
         super().__init__()
         d_mlp = cfg.d_mlp or 4 * cfg.d_model
-        self.up = nn.Linear(cfg.d_model, d_mlp, bias=cfg.bias)
+        self.up = nn.Linear(cfg.d_model, d_mlp, bias=cfg.has_bias("mlp"))
         self.act = ACTIVATIONS.build(activation or cfg.activation)
-        self.down = nn.Linear(d_mlp, cfg.d_model, bias=cfg.bias)
+        self.down = nn.Linear(d_mlp, cfg.d_model, bias=cfg.has_bias("mlp"))
         self.down.is_residual_out = True
         self.hook_pre, self.hook_post = HookPoint(), HookPoint()
 
@@ -44,10 +44,10 @@ class GatedMLP(nn.Module):
     def __init__(self, cfg, activation: Optional[str] = None):
         super().__init__()
         d_mlp = cfg.d_mlp or _round_up(int(8 * cfg.d_model / 3), cfg.mlp_multiple_of)
-        self.gate = nn.Linear(cfg.d_model, d_mlp, bias=cfg.bias)
-        self.up = nn.Linear(cfg.d_model, d_mlp, bias=cfg.bias)
+        self.gate = nn.Linear(cfg.d_model, d_mlp, bias=cfg.has_bias("mlp"))
+        self.up = nn.Linear(cfg.d_model, d_mlp, bias=cfg.has_bias("mlp"))
         self.act = ACTIVATIONS.build(activation or cfg.activation)
-        self.down = nn.Linear(d_mlp, cfg.d_model, bias=cfg.bias)
+        self.down = nn.Linear(d_mlp, cfg.d_model, bias=cfg.has_bias("mlp"))
         self.down.is_residual_out = True
         self.hook_pre, self.hook_post = HookPoint(), HookPoint()
 

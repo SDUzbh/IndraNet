@@ -6,6 +6,7 @@ from torch import nn
 
 import indranet.layers.attention as attention_module
 from indranet import PRESETS, DecoderLM, ModelConfig, config_from_preset, register
+from indranet.config import BIAS_PARTS
 from indranet.layers import ALiBiPositional, NoPositional, RotaryPositional
 
 V = 97
@@ -455,3 +456,16 @@ def test_export_rejects_unknown_dtype(tmp_path):
     from indranet.export import export_model
     with pytest.raises(ValueError, match="dtype"):
         export_model(DecoderLM(tiny()), tmp_path / "m.safetensors", dtype="int8")
+
+
+def test_bias_parts():
+    """bias as a list builds biases on exactly those parts (Qwen2: q, k, v only)."""
+    cfg = tiny(bias=["qkv"], norm="layernorm")
+    assert cfg.has_bias("qkv") and not cfg.has_bias("o") and not cfg.has_bias("norm")
+    names = {n for n, _ in DecoderLM(cfg).named_parameters() if n.endswith(".bias")}
+    assert names == {f"blocks.{i}.attn.{x}_proj.bias" for i in range(cfg.n_layers) for x in "qkv"}
+    assert ModelConfig.from_dict(cfg.to_dict()) == cfg  # round-trips through JSON
+    assert all(ModelConfig(bias=True).has_bias(p) for p in BIAS_PARTS) and not ModelConfig().has_bias("mlp")
+    for bad in (["attn"], ["qkv", "qkv"]):
+        with pytest.raises(ValueError, match="bias"):
+            ModelConfig(bias=bad)

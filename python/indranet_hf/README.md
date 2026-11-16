@@ -55,9 +55,9 @@ the engine computes them exactly up to that length and refuses longer sequences.
   `--dtype float32|float16|bfloat16`; a matrix with a value outside the asked type's range stays
   float32, with a warning. Norm scales and biases are float32 (Gemma's `1 + w` is folded in
   there). A tied output matrix is stored once. Only one tensor is in memory at a time.
-- **Biases:** the engine uses every bias tensor present, so partial sets such as Qwen2's q/k/v-only
-  biases load as they are. The config's `bias` is true only when every linear layer (and every
-  LayerNorm) has one.
+- **Biases:** the config's `bias` names exactly the parts that have them: `true`, `false`, or a list
+  such as Qwen2's `["qkv"]` (parts: `qkv`, `o`, `mlp`, `norm`). The engine requires those biases and
+  refuses any other. A part that is only partly there (a q bias without k and v) is refused.
 - **Vocabulary:** the tokenizer's token strings (from `tokenizer.json`, or GPT-2's `vocab.json`),
   decoded for display, so results print tokens as text. This is not the model's tokenizer: `indra
   --text` matches the longest token at each point, which can split text differently from BPE. For

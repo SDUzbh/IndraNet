@@ -221,6 +221,7 @@ int cmd_info(const Args&, const Model& m) {
     std::printf("attention     window %s, scale %s, softcap %s%s\n", opt_str(c.sliding_window).c_str(),
                 opt_str(c.attn_scale).c_str(), opt_str(c.attn_logit_softcap).c_str(),
                 c.parallel_residual ? ", parallel residual" : "");
+    std::printf("biases        %s\n", c.bias.str().c_str());
     std::printf("embeddings    %s%s, final softcap %s\n", c.tie_embeddings ? "tied" : "untied",
                 c.embed_scale ? ", scaled by sqrt(d_model)" : "", opt_str(c.final_logit_softcap).c_str());
     for (const auto& kv : c.layer_overrides) {

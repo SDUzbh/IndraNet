@@ -353,18 +353,37 @@ def family(hf: dict):
     return FAMILIES[t]
 
 
-def all_biases(cfg: dict, outs: Dict[str, Out]) -> bool:
-    """Whether the model has every bias IndraNet's ``bias=True`` means: on every linear layer, and on
-    every norm when the norm is LayerNorm. (Other bias sets, such as Qwen2's q/k/v only, still load:
-    the engine uses each bias tensor that is present.)"""
-    want = []
-    for i in range(cfg["n_layers"]):
+BIAS_PARTS = ("qkv", "o", "mlp", "norm")  # as indranet.config.BIAS_PARTS
+
+
+def bias_setting(cfg: dict, outs: Dict[str, Out]):
+    """IndraNet's ``bias`` for the bias tensors the checkpoint has: True, False, or the parts that
+    have them (Qwen2: ["qkv"]). A part counts when every layer has all its biases; a part only partly
+    there is refused. A part with nothing to bias (RMSNorm's "norm", no MLP) doesn't count against True."""
+    def part_names(i: int) -> Dict[str, List[str]]:
         c, B = {**cfg, **cfg["layer_overrides"].get(str(i), {})}, f"blocks.{i}."
-        want += [f"{B}attn.{x}_proj.bias" for x in "qkvo"] + [f"{B}mlp.{x}.bias" for x in ("up", "down")]
-        if c["mlp"] != "mlp":
-            want.append(f"{B}mlp.gate.bias")
+        mlp = [] if c["mlp"] == "none" else ["up", "down"] + (["gate"] if c["mlp"] != "mlp" else [])
+        norms = []
         if c["norm"] == "layernorm":
-            want += [f"{B}ln1.bias", f"{B}ln2.bias"]
+            norms = ["ln1"] + (["ln2"] if mlp else []) + (["ln1_post"] + (["ln2_post"] if mlp else [])
+                                                         if c["norm_position"] == "sandwich" else [])
+            norms += ["attn.q_norm", "attn.k_norm"] if c["qk_norm"] else []
+        return {"qkv": [f"{B}attn.{x}_proj.bias" for x in "qkv"], "o": [f"{B}attn.o_proj.bias"],
+                "mlp": [f"{B}mlp.{x}.bias" for x in mlp], "norm": [f"{B}{x}.bias" for x in norms]}
+    found = {p: set() for p in BIAS_PARTS}  # per part: the answers seen, True / False
+    for i in range(cfg["n_layers"]):
+        for part, names in part_names(i).items():
+            if names:
+                have = [n in outs for n in names]
+                if any(have) and not all(have):
+                    missing = [n for n, h in zip(names, have) if not h]
+                    raise Unsupported(f"some '{part}' biases are there but not {missing[0]}: IndraNet biases whole parts")
+                found[part].add(all(have))
     if cfg["norm"] == "layernorm":
-        want.append("ln_final.bias")
-    return all(w in outs for w in want)
+        found["norm"].add("ln_final.bias" in outs)
+    mixed = [p for p, v in found.items() if len(v) > 1]
+    if mixed:
+        raise Unsupported(f"'{mixed[0]}' biases are in some layers and not others")
+    on = [p for p in BIAS_PARTS if found[p] == {True}]
+    off = [p for p in BIAS_PARTS if found[p] == {False}]
+    return False if not on else True if not off else on

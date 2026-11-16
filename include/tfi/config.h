@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,18 @@ struct RopeScaling {
     std::vector<double> short_factor;                         // longrope
 
     static RopeScaling from_json(const json::Value& v);
+};
+
+// Which parts of a model have biases (indranet.config.BIAS_PARTS): "qkv" (q, k, v projections), "o"
+// (attention output), "mlp" (every MLP linear), "norm" (LayerNorm, q/k norms included; RMSNorm has
+// none). JSON: true (all), false (none) or a list of parts. Assigning a bool sets all or none.
+struct Biases {
+    static const std::set<std::string>& all_parts();
+    std::set<std::string> parts;
+    Biases& operator=(bool all);
+    bool has(const std::string& part) const;
+    std::string str() const;  // "all", "none" or the parts, comma-separated
+    static Biases from_json(const json::Value& v);
 };
 
 struct ModelConfig {
@@ -55,7 +68,7 @@ struct ModelConfig {
     std::optional<double> attn_logit_softcap;
 
     bool parallel_residual = false;
-    bool bias = false;
+    Biases bias;
     bool tie_embeddings = true;
     bool embed_scale = false;
     std::optional<double> final_logit_softcap;

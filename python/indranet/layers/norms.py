@@ -9,7 +9,7 @@ from ..registry import ACTIVATIONS, NORMS
 @NORMS.register("layernorm")
 class LayerNorm(nn.LayerNorm):
     def __init__(self, dim: int, cfg):
-        super().__init__(dim, eps=cfg.norm_eps, bias=cfg.bias)
+        super().__init__(dim, eps=cfg.norm_eps, bias=cfg.has_bias("norm"))
 
 
 @NORMS.register("rmsnorm")

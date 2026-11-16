@@ -63,11 +63,13 @@ static Model random_model(ModelConfig cfg, uint64_t seed = 0, WeightFormat forma
         Tensor g({dim});
         for (float& v : g.data) v = 1.f + 0.2f * normal(rng);
         w[prefix + ".weight"] = g;
-        if (c.norm == "layernorm" && c.bias) randn(prefix + ".bias", {dim}, 0.1f);
+        if (c.norm == "layernorm" && c.bias.has("norm")) randn(prefix + ".bias", {dim}, 0.1f);
     };
     auto lin = [&](const std::string& prefix, const ModelConfig& c, int64_t out, int64_t in, float std) {
         randn(prefix + ".weight", {out, in}, std);
-        if (c.bias) randn(prefix + ".bias", {out}, 0.1f);
+        const std::string part = prefix.find("mlp.") != std::string::npos ? "mlp"
+                                 : prefix.find("o_proj") != std::string::npos ? "o" : "qkv";
+        if (c.bias.has(part)) randn(prefix + ".bias", {out}, 0.1f);
     };
     const int64_t d = cfg.d_model;
     randn("embed.weight", {cfg.vocab_size, d}, 1.0f);
@@ -134,7 +136,9 @@ static std::vector<std::pair<std::string, ModelConfig>> configs() {
         {"layernorm + learned + gelu mlp + bias", tiny([](ModelConfig& c) {
              c.norm = "layernorm"; c.positional = "learned"; c.mlp = "mlp"; c.bias = true; c.tie_embeddings = false;
          })},
-        {"alibi + GQA + window", tiny([](ModelConfig& c) { c.positional = "alibi"; c.n_kv_heads = 2; c.sliding_window = 3; })},
+        {"alibi + GQA + window + q/k/v biases only", tiny([](ModelConfig& c) {
+             c.positional = "alibi"; c.n_kv_heads = 2; c.sliding_window = 3; c.bias = Biases::from_json(json::parse(R"(["qkv"])"));
+         })},
         {"parallel residual", tiny([](ModelConfig& c) { c.parallel_residual = true; c.norm = "layernorm"; c.bias = true; })},
         {"sandwich + softcaps", tiny([](ModelConfig& c) {
              c.norm_position = "sandwich"; c.attn_logit_softcap = 5.0; c.final_logit_softcap = 10.0;
@@ -1078,6 +1082,45 @@ static void test_fp16_load() {
 
 // Every weight must have the shape the config implies: a model with any one weight a row (or an
 // element) short, or missing, is refused when it is built, not read out of bounds later.
+// bias as parts: parsed from true / false / a list; a model has exactly the biases its config names
+// (a stray one is refused rather than used unannounced); and a qkv-only model (Qwen2's) works.
+static void test_bias_parts() {
+    Biases b;
+    b = true;
+    CHECK(b.str() == "all" && b.has("norm"));
+    CHECK(Biases::from_json(json::parse("false")).str() == "none");
+    CHECK(Biases::from_json(json::parse(R"(["mlp", "qkv"])")).str() == "qkv,mlp");
+    CHECK_THROWS(Biases::from_json(json::parse(R"(["qkv", "qkv"])")));
+    CHECK_THROWS(Biases::from_json(json::parse(R"(["attn"])")));
+    CHECK_THROWS(Biases::from_json(json::parse("1")));
+
+    const ModelConfig qkv = tiny([](ModelConfig& c) { c.bias = Biases::from_json(json::parse(R"(["qkv"])")); });
+    const Model m = random_model(qkv, 3);
+    CHECK(m.weights().count("blocks.0.attn.k_proj.bias") && !m.weights().count("blocks.0.attn.o_proj.bias") &&
+          !m.weights().count("blocks.0.mlp.up.bias"));
+    // q, k and v biases change the output (they are used), and match the computation spelled out
+    std::map<std::string, Tensor> w;
+    for (const auto& e : m.weights()) w[e.first] = e.second.to_tensor();
+    auto zeroed = w;
+    for (auto& e : zeroed)
+        if (e.first.find("_proj.bias") != std::string::npos) std::fill(e.second.data.begin(), e.second.data.end(), 0.f);
+    const Tokens t = seq(9, 4);
+    CHECK(max_abs_diff(Model(qkv, zeroed).forward(t), m.forward(t)) > 1e-3f);
+    // a bias the config doesn't name: refused, whichever part it belongs to
+    for (const char* extra : {"blocks.0.attn.o_proj.bias", "blocks.1.mlp.down.bias"}) {
+        auto more = w;
+        more[extra] = Tensor({16}, std::vector<float>(16, 0.f));
+        CHECK_THROWS(Model(qkv, more));
+    }
+    auto fewer = w;
+    fewer.erase("blocks.1.attn.v_proj.bias");
+    CHECK_THROWS(Model(qkv, fewer));
+    // a layer's own setting decides for that layer
+    const ModelConfig per_layer = tiny([](ModelConfig& c) { c.layer_overrides[1] = json::parse(R"({"bias": ["o"]})"); });
+    const Model pl = random_model(per_layer, 5);
+    CHECK(pl.weights().count("blocks.1.attn.o_proj.bias") && !pl.weights().count("blocks.0.attn.o_proj.bias"));
+}
+
 static void test_weight_shapes_checked() {
     for (const auto& kv : configs()) {
         const Model m = random_model(kv.second, 1);
@@ -2559,6 +2602,7 @@ int main(int argc, char** argv) {
         });
     }
     run("core", "weight shapes checked when a model is built", test_weight_shapes_checked);
+    run("core", "bias parts: parsed, exactly the named biases, qkv-only models", test_bias_parts);
     run("analysis", "OV copying + positional QK", test_copying_and_positional);
     run("analysis", "post-norm DLA refused", test_post_norm_dla_refused);
     run("core", "vector math", test_vector_math);

@@ -35,7 +35,7 @@ text = model.generate(prompt, max_new_tokens=50, temperature=0.8, top_p=0.9)
 | Attention | `n_kv_heads`, `d_head` | MHA (None), GQA (k), MQA (1); head size independent of `d_model` |
 | | `qk_norm`, `sliding_window`, `attn_logit_softcap`, `attn_scale` | |
 | MLP | `mlp`, `activation`, `d_mlp` | `swiglu` / `geglu` / `glu` / `mlp` / `none`; `gelu`, `gelu_tanh`, `relu`, `relu2`, `silu`, `tanh` |
-| Block | `parallel_residual`, `bias`, `dropout`, `attn_dropout` | |
+| Block | `parallel_residual`, `bias`, `dropout`, `attn_dropout` | `bias`: `False` / `True` / the parts that have biases, from `qkv`, `o`, `mlp`, `norm` (LayerNorm), e.g. `["qkv"]` as Qwen2 |
 | Model | `tie_embeddings`, `embed_scale`, `final_logit_softcap`, `init_std`, `scale_residual_init` | |
 | Per layer | `layer_overrides={i: {...}}` | any per-layer field, e.g. alternating sliding-window/global attention |
 

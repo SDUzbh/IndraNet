@@ -66,6 +66,8 @@ EXTRA = [
     dict(attn_logit_softcap=5.0, final_logit_softcap=10.0), dict(parallel_residual=True),
     dict(parallel_residual=True, mlp="none"), dict(rope_fraction=0.5), dict(d_head=16),
     *ROPE_SCALINGS,
+    dict(bias=["qkv"]), dict(bias=["qkv"], n_kv_heads=2, qk_norm=True), dict(bias=["o", "mlp"], norm="layernorm"),
+    dict(bias=["norm"], norm="layernorm", qk_norm=True, mlp="mlp"), dict(bias=["qkv", "o"], layer_overrides={1: {"bias": True}}),
     dict(bias=True, tie_embeddings=False, embed_scale=True), dict(mlp="geglu", activation="gelu_tanh"),
     dict(mlp="glu", activation="relu2"), dict(mlp="mlp", activation="tanh"), dict(norm="none"),
     dict(attn_scale=0.3), dict(n_heads=6, d_model=36),

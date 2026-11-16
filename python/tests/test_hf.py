@@ -210,6 +210,14 @@ def test_convert_refuses_unknown_tensors(tmp_path):
         convert(folder, tmp_path / "out.safetensors")
 
 
+def test_convert_refuses_part_of_a_bias_part(tmp_path):
+    folder = _tiny_llama_folder(tmp_path / "hf", {"model.layers.0.self_attn.q_proj.bias": torch.zeros(8)})
+    with pytest.raises(Unsupported, match="'qkv' biases are there but not model|IndraNet biases whole parts"):
+        convert(folder, tmp_path / "out.safetensors")
+    folder = _tiny_llama_folder(tmp_path / "hf2", {f"model.layers.0.self_attn.{x}_proj.bias": torch.zeros(8) for x in "qkv"})
+    assert convert(folder, tmp_path / "out.safetensors")["config"]["bias"] == ["qkv"]
+
+
 def test_convert_refuses_pickles(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(LLAMA2_7B))
     (tmp_path / "pytorch_model.bin").write_bytes(b"")
@@ -336,6 +344,8 @@ def _reference(model, n_layers, path: Path):
 def test_engine_matches_transformers(tools, tmp_path, kind, dtype):
     model = _hf_model(kind, tmp_path / "hf", dtype)
     s = convert(tmp_path / "hf", tmp_path / "model.safetensors")
+    expected_bias = {"qwen2": ["qkv"], "llama_tied_bias": True, "gpt2": True, "gpt_neox": True, "gpt_neox_sequential": True}
+    assert s["config"]["bias"] == expected_bias.get(kind, False)
     _reference(model, s["config"]["n_layers"], tmp_path / "ref.safetensors")
     for fmt in ["fp32", "fp16"] if dtype == torch.bfloat16 else ["fp32"]:
         r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors"),

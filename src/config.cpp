@@ -24,6 +24,42 @@ const std::set<std::string> kTrainingOnly = {"use_sdpa", "dropout", "attn_dropou
 
 }  // namespace
 
+const std::set<std::string>& Biases::all_parts() {
+    static const std::set<std::string> kParts = {"qkv", "o", "mlp", "norm"};
+    return kParts;
+}
+
+Biases& Biases::operator=(bool all) {
+    parts = all ? all_parts() : std::set<std::string>{};
+    return *this;
+}
+
+bool Biases::has(const std::string& part) const {
+    if (!all_parts().count(part)) throw std::logic_error("Biases: unknown part '" + part + "'");
+    return parts.count(part) > 0;
+}
+
+std::string Biases::str() const {
+    if (parts == all_parts()) return "all";
+    if (parts.empty()) return "none";
+    std::string out;
+    for (const char* p : {"qkv", "o", "mlp", "norm"})
+        if (parts.count(p)) out += (out.empty() ? "" : ",") + std::string(p);
+    return out;
+}
+
+Biases Biases::from_json(const json::Value& v) {
+    Biases b;
+    if (v.is_bool()) return b = v.as_bool();
+    if (!v.is_array()) throw std::runtime_error("config: bias must be true, false or a list of parts");
+    for (const json::Value& p : v.array) {
+        const std::string& name = p.as_string();
+        if (!all_parts().count(name)) throw std::runtime_error("config: bias part '" + name + "' is not one of qkv, o, mlp, norm");
+        if (!b.parts.insert(name).second) throw std::runtime_error("config: bias part '" + name + "' given twice");
+    }
+    return b;
+}
+
 RopeScaling RopeScaling::from_json(const json::Value& v) {
     if (!v.is_object()) throw std::runtime_error("config: rope_scaling must be null or an object");
     RopeScaling r;
@@ -102,7 +138,7 @@ void ModelConfig::apply(const json::Value& f) {
         else if (k == "attn_scale") attn_scale = opt_num(v);
         else if (k == "attn_logit_softcap") attn_logit_softcap = opt_num(v);
         else if (k == "parallel_residual") parallel_residual = v.as_bool();
-        else if (k == "bias") bias = v.as_bool();
+        else if (k == "bias") bias = Biases::from_json(v);
         else if (k == "tie_embeddings") tie_embeddings = v.as_bool();
         else if (k == "embed_scale") embed_scale = v.as_bool();
         else if (k == "final_logit_softcap") final_logit_softcap = opt_num(v);

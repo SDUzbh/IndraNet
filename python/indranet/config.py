@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 NORM_POSITIONS = ("pre", "post", "sandwich")
 
@@ -21,6 +21,11 @@ GLOBAL_FIELDS = frozenset({
     "layer_overrides",
 })
 
+
+# Where a model has biases, for `bias` given as a list: "qkv" (q, k, v projections), "o" (attention
+# output), "mlp" (all MLP linears) and "norm" (LayerNorm, the q/k norms included; RMSNorm has none).
+# Qwen2, for one, has ["qkv"]. bias=True means all of them, False none.
+BIAS_PARTS = ("qkv", "o", "mlp", "norm")
 
 # rope_scaling: {"type": ..., plus that type's keys}. The formulas are Hugging Face transformers'
 # (indranet.layers.positional.rope_frequencies). (required keys, optional keys) per type:
@@ -84,7 +89,7 @@ class ModelConfig:
 
     # --- block / model options ----------------------------------------------
     parallel_residual: bool = False       # x + attn(ln1(x)) + mlp(ln2(x)), GPT-J/NeoX style
-    bias: bool = False                    # biases in linear layers and LayerNorm
+    bias: Union[bool, List[str]] = False  # True: every bias; or the parts that have them (BIAS_PARTS)
     tie_embeddings: bool = True
     embed_scale: bool = False             # multiply embeddings by sqrt(d_model), Gemma style
     final_logit_softcap: Optional[float] = None
@@ -128,8 +133,17 @@ class ModelConfig:
         if self.sliding_window is not None and self.sliding_window < 1:
             raise ValueError("sliding_window must be >= 1")
         check_rope_scaling(self.rope_scaling)
+        if not isinstance(self.bias, bool):
+            parts = list(self.bias)
+            if any(p not in BIAS_PARTS for p in parts) or len(set(parts)) != len(parts):
+                raise ValueError(f"bias must be True, False or a list of distinct parts from {BIAS_PARTS}, got {self.bias!r}")
 
     # --- derived sizes --------------------------------------------------------
+    def has_bias(self, part: str) -> bool:
+        """Whether ``part`` (one of BIAS_PARTS) has biases."""
+        assert part in BIAS_PARTS, part
+        return self.bias if isinstance(self.bias, bool) else part in self.bias
+
     @property
     def head_dim(self) -> int:
         return self.d_head if self.d_head is not None else self.d_model // self.n_heads

@@ -344,18 +344,22 @@ void Model::check_shapes() {
         if (w->shape != s)
             throw std::runtime_error(name + " has shape " + shape_str(w->shape) + ", config says " + shape_str(s));
     };
-    // A bias must be there when the config has biases, and have its shape if it is there anyway.
-    auto expect_bias = [&](const std::string& name, int64_t n, bool required) {
-        if (required || weight_or_null(name)) expect(name, {n});
+    // Exactly the biases the config names (bias: all, none or its parts): a bias it doesn't name would
+    // otherwise be used unannounced, since the passes take every bias tensor present.
+    auto expect_bias = [&](const std::string& name, int64_t n, bool declared, const ModelConfig& c, const char* part) {
+        if (declared) expect(name, {n});
+        else if (weight_or_null(name))
+            throw std::runtime_error("model file has " + name + ", but the config's bias (" + c.bias.str() +
+                                     ") doesn't include '" + part + "'");
     };
     auto expect_norm = [&](const std::string& prefix, const ModelConfig& c, int64_t dim) {
         if (c.norm == "none") return;
         expect(prefix + ".weight", {dim});
-        expect_bias(prefix + ".bias", dim, c.norm == "layernorm" && c.bias);
+        expect_bias(prefix + ".bias", dim, c.norm == "layernorm" && c.bias.has("norm"), c, "norm");
     };
-    auto expect_linear = [&](const std::string& prefix, const ModelConfig& c, int64_t out, int64_t in) {
+    auto expect_linear = [&](const std::string& prefix, const ModelConfig& c, int64_t out, int64_t in, const char* part) {
         expect(prefix + ".weight", {out, in});
-        expect_bias(prefix + ".bias", out, c.bias);
+        expect_bias(prefix + ".bias", out, c.bias.has(part), c, part);
     };
     const int64_t d = cfg_.d_model;
     expect("embed.weight", {cfg_.vocab_size, d});
@@ -367,10 +371,10 @@ void Model::check_shapes() {
         const std::string p = layer_prefix(i);
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
         expect_norm(p + "ln1", c, d);
-        expect_linear(p + "attn.q_proj", c, H * D, d);
-        expect_linear(p + "attn.k_proj", c, Hkv * D, d);
-        expect_linear(p + "attn.v_proj", c, Hkv * D, d);
-        expect_linear(p + "attn.o_proj", c, d, H * D);
+        expect_linear(p + "attn.q_proj", c, H * D, d, "qkv");
+        expect_linear(p + "attn.k_proj", c, Hkv * D, d, "qkv");
+        expect_linear(p + "attn.v_proj", c, Hkv * D, d, "qkv");
+        expect_linear(p + "attn.o_proj", c, d, H * D, "o");
         if (c.qk_norm) {
             ModelConfig qc = c;
             if (qc.norm == "none") qc.norm = "rmsnorm";
@@ -385,9 +389,9 @@ void Model::check_shapes() {
                 const int64_t base = static_cast<int64_t>(8.0 * double(d) / 3.0), mult = c.mlp_multiple_of;
                 d_mlp = mult * ((base + mult - 1) / mult);
             }
-            if (gated) expect_linear(p + "mlp.gate", c, d_mlp, d);
-            expect_linear(p + "mlp.up", c, d_mlp, d);
-            expect_linear(p + "mlp.down", c, d, d_mlp);
+            if (gated) expect_linear(p + "mlp.gate", c, d_mlp, d, "mlp");
+            expect_linear(p + "mlp.up", c, d_mlp, d, "mlp");
+            expect_linear(p + "mlp.down", c, d, d_mlp, "mlp");
             expect_norm(p + "ln2", c, d);
             if (c.norm_position == "sandwich") expect_norm(p + "ln2_post", c, d);
         }

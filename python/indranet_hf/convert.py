@@ -114,7 +114,7 @@ def convert(source: Union[str, Path], out: Union[str, Path], dtype: str = "auto"
     if shards.shape(outs["embed.weight"].src)[0] != cfg["vocab_size"]:
         raise Unsupported(f"the embedding has {shards.shape(outs['embed.weight'].src)[0]} rows, "
                           f"but config.json says vocab_size={cfg['vocab_size']}")
-    cfg["bias"] = families.all_biases(cfg, outs)
+    cfg["bias"] = families.bias_setting(cfg, outs)
 
     plan, kept = _plan(cfg, outs, shards, dtype)
     if kept:

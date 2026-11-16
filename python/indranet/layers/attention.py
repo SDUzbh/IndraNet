@@ -43,10 +43,10 @@ class CausalSelfAttention(nn.Module):
         self.use_sdpa = cfg.use_sdpa
         self.attn_dropout = cfg.attn_dropout
 
-        self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.d_head, bias=cfg.bias)
-        self.k_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.d_head, bias=cfg.bias)
-        self.v_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.d_head, bias=cfg.bias)
-        self.o_proj = nn.Linear(self.n_heads * self.d_head, cfg.d_model, bias=cfg.bias)
+        self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.d_head, bias=cfg.has_bias("qkv"))
+        self.k_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.d_head, bias=cfg.has_bias("qkv"))
+        self.v_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.d_head, bias=cfg.has_bias("qkv"))
+        self.o_proj = nn.Linear(self.n_heads * self.d_head, cfg.d_model, bias=cfg.has_bias("o"))
         self.o_proj.is_residual_out = True
 
         norm = NORMS.get(cfg.norm if cfg.norm != "none" else "rmsnorm")
