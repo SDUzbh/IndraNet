@@ -85,12 +85,30 @@ python -m indranet_hf path/to/checkpoint model.safetensors    # or a Hub repo id
 | `ablate` | activations | Loss increase when each head is zero-ablated, or mean-ablated with means from reference sequences |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
+| `tokenize` | – | Token ids for text, as the model's tokenizer gives them (reads no weights) |
 
-Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice. If
-the model was exported with a vocabulary (`export_model(model, path, vocab=[...])`), you can pass
-`--text "00123+00045="` instead (`--clean-text` / `--corrupt-text` for `patch`). `--target` and
-`--other` then also accept a token's text, and all output shows tokens as text. Run
+Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice. Or
+pass `--text "..."` (`--clean-text` / `--corrupt-text` for `patch`):
+
+- **Converted Hugging Face models:** the text goes through the model's own tokenizer, which the
+  converter stores in the file. The ids are those of Hugging Face's `tokenizers`, BOS included
+  (leave it out with `--no-special-tokens`). `indra tokenize model --text "..."` shows them.
+- **indranet models exported with a vocabulary** (`export_model(model, path, vocab=[...])`): each
+  step takes the longest matching vocabulary entry.
+
+`--target` and `--other` also accept a token's text, and all output shows tokens as text. Run
 `build/indra --help` for every option.
+
+The engine's tokenizer reads `tokenizer.json`, and implements what these models use:
+- BPE with merges, byte fallback, `ignore_merges` and unknown tokens;
+- the NFC, NFD, Replace and Prepend normalizers;
+- the ByteLevel, Split (regex or string, every behavior), Metaspace and Digits pre-tokenizers;
+- added and special tokens;
+- the template, ByteLevel, Roberta and Bert post-processors.
+
+Other parts (Unigram or WordPiece models, NFKC) are refused by name. The converter then stores only
+the vocabulary, and `--text` falls back to longest match. Its Unicode data is version 13.0, so text
+with characters assigned later may split differently from Hugging Face.
 
 ## Walkthrough: the 2-layer induction circuit
 
@@ -292,6 +310,10 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
 - **Hugging Face golden tests** (`python/tests/test_hf.py`, with `transformers` installed) build a
   tiny random model of each supported family, convert it, and check the engine reproduces
   transformers' logits and every layer's residual stream, from float32 and bf16 checkpoints.
+- **Tokenizer tests** (also `test_hf.py`): tokenizers of every kind the engine implements, trained
+  by Hugging Face's `tokenizers` library, must give its ids on varied text (scripts, emoji,
+  whitespace runs, decomposed accents, special tokens), with and without special tokens. The C++
+  unit tests check UTF-8, NFC / NFD, the split-pattern regex and the BPE rules on their own.
 - **Unit tests** (`tests/unit.cpp`) check invariants on random models: DLA parts sum to the real
   logit difference, the last logit-lens stage equals the model's output, patching the only
   changed input restores the clean run exactly, the fast low-rank composition formula equals the
@@ -346,7 +368,7 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   formats with unpredictable parts (like the arithmetic prompts) the per-head numbers include that
   noise.
 - **Scope:** one sequence at a time, float32 arithmetic (weights in fp16 and fp16 GPU inputs with
-  `--fp16`), CPU plus the GPU on macOS (`--device`), no tokenizer (token ids only). Only built-in
+  `--fp16`), CPU plus the GPU on macOS (`--device`). Only built-in
   indranet components can be exported.
 
 ## Examples
@@ -425,5 +447,5 @@ hyphen, such as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action v
 ## Not included (yet)
 
 Loading Hugging Face folders directly in the engine (they go through the converter), sequences past
-`original_max_position_embeddings` with `dynamic` or `longrope` RoPE scaling, a tokenizer in the
-engine, padding masks for batched prompts of different lengths, and mixture-of-experts layers.
+`original_max_position_embeddings` with `dynamic` or `longrope` RoPE scaling, Unigram and WordPiece
+tokenizers, padding masks for batched prompts of different lengths, and mixture-of-experts layers.

@@ -35,7 +35,7 @@ def main(argv=None) -> int:
         return 1
     c = s["config"]
     print(f"{s['model_type']} -> {a.out}: {c['n_layers']} layers, d_model {c['d_model']}, {s['tensors']} tensors, "
-          f"{s['bytes'] / 1e6:.1f} MB{'' if s['vocab'] else ', no vocabulary'}")
+          f"{s['bytes'] / 1e6:.1f} MB, {'tokenizer' if s['tokenizer'] else 'no tokenizer'}{'' if s['vocab'] else ', no vocabulary'}")
     print(f"next: build/indra info {Path(a.out)}")
     return 0
 

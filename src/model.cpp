@@ -447,7 +447,34 @@ Model Model::load(const std::string& path, WeightFormat format) {
         for (const auto& s : json::parse(v->second).array) vocab.push_back(s.as_string());
         m.set_vocab(std::move(vocab));
     }
+    if (auto tk = st.metadata.find("tokenizer"); tk != st.metadata.end()) m.set_tokenizer_json(std::move(tk->second));
     return m;
+}
+
+namespace detail {
+struct TokenizerSlot {
+    std::string json;
+    std::once_flag once;
+    std::unique_ptr<Tokenizer> tokenizer;
+};
+}  // namespace detail
+
+bool Model::has_tokenizer() const { return tokenizer_ != nullptr; }
+
+void Model::set_tokenizer_json(std::string tokenizer_json) {
+    tokenizer_ = std::make_shared<detail::TokenizerSlot>();
+    tokenizer_->json = std::move(tokenizer_json);
+}
+
+const Tokenizer& Model::tokenizer() const {
+    if (!tokenizer_) throw std::runtime_error("this model file has no tokenizer");
+    detail::TokenizerSlot& slot = *tokenizer_;
+    std::call_once(slot.once, [&] {  // an exception leaves it unparsed, to throw again next time
+        slot.tokenizer = std::make_unique<Tokenizer>(Tokenizer::from_json(slot.json));
+        slot.json.clear();
+        slot.json.shrink_to_fit();
+    });
+    return *slot.tokenizer;
 }
 
 void Model::set_vocab(std::vector<std::string> vocab) {
@@ -462,15 +489,20 @@ std::string Model::token_str(int64_t id) const {
     return std::to_string(id);
 }
 
-Tokens Model::tokenize(const std::string& text) const {
+Tokens Model::tokenize(const std::string& text, bool add_special_tokens) const {
+    if (tokenizer_) return tokenizer().encode(text, add_special_tokens);
     if (vocab_.empty()) throw std::runtime_error("this model file has no vocabulary; pass token ids instead");
+    return tokenize_longest_match(vocab_, text);
+}
+
+std::vector<int64_t> tokenize_longest_match(const std::vector<std::string>& vocab, const std::string& text) {
     Tokens out;
     size_t i = 0;
     while (i < text.size()) {
         int64_t best = -1;
         size_t best_len = 0;
-        for (size_t id = 0; id < vocab_.size(); ++id) {
-            const std::string& tok = vocab_[id];
+        for (size_t id = 0; id < vocab.size(); ++id) {
+            const std::string& tok = vocab[id];
             if (tok.size() > best_len && text.compare(i, tok.size(), tok) == 0) {
                 best = static_cast<int64_t>(id);
                 best_len = tok.size();

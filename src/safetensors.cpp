@@ -22,8 +22,10 @@ float bf16_to_f32(uint16_t h) {
 
 SafeTensors load_safetensors(const std::string& path) { return load_safetensors(path, nullptr); }
 
-SafeTensors load_safetensors(const std::string& path, const TensorSink& take, const RawSink& take_raw) {
-    std::ifstream f(path, std::ios::binary);
+namespace {
+
+// The JSON header; f is left at the first data byte.
+std::string read_header(std::ifstream& f, const std::string& path) {
     if (!f) throw std::runtime_error("cannot open " + path);
     uint64_t header_len = 0;
     unsigned char len_bytes[8];
@@ -32,6 +34,24 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
     if (header_len > (uint64_t(1) << 30)) throw std::runtime_error(path + ": implausible header size");
     std::string header(header_len, '\0');
     if (!f.read(&header[0], static_cast<std::streamsize>(header_len))) throw std::runtime_error(path + ": truncated header");
+    return header;
+}
+
+}  // namespace
+
+std::map<std::string, std::string> read_safetensors_metadata(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    const json::Value root = json::parse(read_header(f, path));
+    std::map<std::string, std::string> out;
+    if (const json::Value* meta = root.find("__metadata__"))
+        for (size_t m = 0; m < meta->keys.size(); ++m) out[meta->keys[m]] = meta->values[m].as_string();
+    return out;
+}
+
+SafeTensors load_safetensors(const std::string& path, const TensorSink& take, const RawSink& take_raw) {
+    std::ifstream f(path, std::ios::binary);
+    const std::string header = read_header(f, path);
+    const uint64_t header_len = header.size();
     const json::Value root = json::parse(header);
     const std::streamoff data_start = 8 + static_cast<std::streamoff>(header_len);
 

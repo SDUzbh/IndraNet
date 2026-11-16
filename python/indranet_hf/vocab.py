@@ -89,3 +89,55 @@ def load(folder: Path, vocab_size: int) -> Optional[List[str]]:
     if dropped:
         warnings.warn(f"{dropped} tokenizer entries have ids beyond the model's {vocab_size} rows; left out")
     return out
+
+
+# What IndraNet's engine implements of tokenizer.json (include/tfi/tokenizer.h).
+_SUPPORTED = {
+    "normalizer": {"NFC", "NFD", "Replace", "Prepend", "Sequence"},
+    "pre_tokenizer": {"ByteLevel", "Split", "Metaspace", "Digits", "Sequence"},
+    "post_processor": {"TemplateProcessing", "ByteLevel", "RobertaProcessing", "BertProcessing", "Sequence"},
+}
+
+
+def _unsupported(kind: str, node) -> Optional[str]:
+    if not node:
+        return None
+    if node.get("type") not in _SUPPORTED[kind]:
+        return f"{kind} {node.get('type')!r}"
+    for child in node.get("normalizers") or node.get("pretokenizers") or node.get("processors") or []:
+        why = _unsupported(kind, child)
+        if why:
+            return why
+    return None
+
+
+def tokenizer(folder: Path) -> Optional[dict]:
+    """The parts of the folder's tokenizer the engine uses (normalizer, pre-tokenizer, BPE model,
+    added tokens, post-processor), or None when there is none, or it uses something the engine doesn't
+    implement (with a warning: --text then falls back to longest-match on the vocabulary). GPT-2's
+    older vocab.json + merges.txt become the byte-level BPE tokenizer they describe."""
+    if (folder / "tokenizer.json").exists():
+        tok = json.loads((folder / "tokenizer.json").read_text(encoding="utf-8"))
+    elif (folder / "vocab.json").exists() and (folder / "merges.txt").exists():
+        vocab = json.loads((folder / "vocab.json").read_text(encoding="utf-8"))
+        merges = [l for l in (folder / "merges.txt").read_text(encoding="utf-8").split("\n")
+                  if l and not l.startswith("#version")]
+        tok = {"model": {"type": "BPE", "vocab": vocab, "merges": merges},
+               "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False, "use_regex": True},
+               "added_tokens": [{"id": vocab["<|endoftext|>"], "content": "<|endoftext|>", "special": True}]
+               if "<|endoftext|>" in vocab else []}
+    else:
+        return None
+    model = tok.get("model") or {}
+    why = None
+    if model.get("type", "BPE") != "BPE":
+        why = f"model {model.get('type')!r} (only BPE is implemented)"
+    elif model.get("continuing_subword_prefix") or model.get("end_of_word_suffix") or model.get("dropout"):
+        why = "BPE continuing_subword_prefix / end_of_word_suffix / dropout"
+    for kind in _SUPPORTED:
+        why = why or _unsupported(kind, tok.get(kind))
+    if why:
+        warnings.warn(f"tokenizer not stored: its {why} is not implemented by the engine; --text will match the "
+                      "longest vocabulary entry instead, so pass token ids for exact inputs")
+        return None
+    return {k: tok.get(k) for k in ("normalizer", "pre_tokenizer", "model", "post_processor", "added_tokens")}

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "tfi/config.h"
+#include "tfi/tokenizer.h"
 #include "tfi/tensor.h"
 #include "tfi/weight.h"
 
@@ -18,6 +19,7 @@ namespace tfi {
 
 namespace detail {
 struct RowBatch;  // internal (src/ops.h)
+struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model.cpp)
 class Gpu;        // internal (src/gpu.h, macOS)
 
 // A model's GPU context, created on first use. Copies start empty: each model has its own context
@@ -63,6 +65,9 @@ class Hooks {
     };
     std::vector<Entry> entries_;
 };
+
+// The longest vocabulary entry at each point of text (indranet's character vocabularies).
+std::vector<int64_t> tokenize_longest_match(const std::vector<std::string>& vocab, const std::string& text);
 
 class Model {
   public:
@@ -137,7 +142,14 @@ class Model {
     const std::vector<std::string>& vocab() const { return vocab_; }
     void set_vocab(std::vector<std::string> vocab);
     std::string token_str(int64_t id) const;     // the token's text, or its id
-    Tokens tokenize(const std::string& text) const;  // greedy longest match; needs a vocabulary
+    // Optional tokenizer: a Hugging Face tokenizer.json (stored by indranet_hf), parsed on first use.
+    bool has_tokenizer() const;
+    const Tokenizer& tokenizer() const;  // throws std::runtime_error without one, or if it can't be read
+    void set_tokenizer_json(std::string tokenizer_json);
+    // Token ids for text: the model's tokenizer when it has one (add_special_tokens: its BOS and other
+    // post-processor tokens, as Hugging Face adds by default), otherwise the longest vocabulary entry
+    // at each point (indranet's character vocabularies; add_special_tokens has no effect).
+    Tokens tokenize(const std::string& text, bool add_special_tokens = true) const;
 
     // Building blocks reused by the analysis tools.
     Tensor norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const;  // over the last dim
@@ -158,6 +170,7 @@ class Model {
     WeightFormat format_ = WeightFormat::fp32;
     std::map<std::string, Weight> w_;  // declared before gpu_, which may use their memory in place
     std::vector<std::string> vocab_;
+    std::shared_ptr<detail::TokenizerSlot> tokenizer_;
     mutable detail::GpuSlot gpu_;
 
     Tensor attention(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;

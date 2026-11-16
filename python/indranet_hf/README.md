@@ -58,16 +58,13 @@ the engine computes them exactly up to that length and refuses longer sequences.
 - **Biases:** the config's `bias` names exactly the parts that have them: `true`, `false`, or a list
   such as Qwen2's `["qkv"]` (parts: `qkv`, `o`, `mlp`, `norm`). The engine requires those biases and
   refuses any other. A part that is only partly there (a q bias without k and v) is refused.
-- **Vocabulary:** the tokenizer's token strings (from `tokenizer.json`, or GPT-2's `vocab.json`),
-  decoded for display, so results print tokens as text. This is not the model's tokenizer: `indra
-  --text` matches the longest token at each point, which can split text differently from BPE. For
-  exact inputs, tokenize with the model's tokenizer and pass ids:
-
-  ```python
-  from transformers import AutoTokenizer
-  ids = AutoTokenizer.from_pretrained("path/to/checkpoint")("The capital of France is")["input_ids"]
-  print(",".join(map(str, ids)))   # then: build/indra ... --tokens <ids>
-  ```
+- **Tokenizer:** the parts of `tokenizer.json` the engine uses (normalizer, pre-tokenizer, BPE model,
+  added tokens, post-processor), so `indra --text` and `indra tokenize` give the ids Hugging Face's
+  `tokenizers` gives, BOS included. GPT-2's older `vocab.json` + `merges.txt` become the byte-level
+  BPE tokenizer they describe. A tokenizer that uses something the engine doesn't implement (a
+  Unigram or WordPiece model, NFKC) is left out, with a warning. `--text` then takes the longest
+  vocabulary entry at each step, and you can tokenize in Python and pass ids instead.
+- **Vocabulary:** the token strings, decoded for display, so results print tokens as text.
 
 ## Tests
 
@@ -77,3 +74,7 @@ keys, refusals, bf16 rounding against torch, vocabulary decoding), and golden te
 transformers, save it in float32 and in bf16, convert it, and check the engine reproduces
 transformers' logits and every layer's residual stream to 1e-4 relative, loading the bf16 files both
 as float32 and with `--fp16`.
+
+The tokenizer tests (same file) train a small tokenizer of every kind the engine implements with
+Hugging Face's `tokenizers` library, store it as `convert` does, and check `indra tokenize` gives
+`tokenizers`' ids on varied text, with and without special tokens.

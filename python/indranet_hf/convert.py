@@ -35,7 +35,7 @@ def resolve(source: Union[str, Path], revision: Optional[str] = None) -> Path:
         raise ImportError(f"{source} is not a local folder; to download it from the Hugging Face Hub, "
                           "pip install huggingface_hub (or download the folder yourself)") from e
     return Path(snapshot_download(str(source), revision=revision,
-                                  allow_patterns=["*.json", "*.safetensors", "tokenizer.model"]))
+                                  allow_patterns=["*.json", "*.safetensors", "merges.txt"]))
 
 
 def shard_files(folder: Path) -> List[Path]:
@@ -89,7 +89,8 @@ def convert(source: Union[str, Path], out: Union[str, Path], dtype: str = "auto"
     ``"auto"`` keeps the checkpoint's (bf16 stays bf16), or ``"float32"``, ``"float16"``,
     ``"bfloat16"``; a weight with a value that doesn't fit the asked type stays float32, with a
     warning. Norms and biases are always float32. With ``vocab`` the tokenizer's token strings are
-    stored for display. Returns a summary: the IndraNet config, tensor count, file size and the
+    stored for display, and the tokenizer itself (tokenizer.json) for the engine's --text, unless it
+    uses something the engine doesn't implement (a warning says what). Returns a summary: the IndraNet config, tensor count, file size and the
     weights kept float32.
     """
     if dtype != "auto" and dtype not in DTYPES:
@@ -125,6 +126,9 @@ def convert(source: Union[str, Path], out: Union[str, Path], dtype: str = "auto"
         v = vocab_mod.load(folder, cfg["vocab_size"])
         if v is not None:
             meta["vocab"] = json.dumps(v)
+        t = vocab_mod.tokenizer(folder)
+        if t is not None:
+            meta["tokenizer"] = json.dumps(t, separators=(",", ":"))
     size = tensors.write(Path(out), plan, meta)
     return {"config": cfg, "tensors": len(plan), "bytes": size, "kept_float32": kept,
-            "vocab": "vocab" in meta, "model_type": hf["model_type"]}
+            "vocab": "vocab" in meta, "tokenizer": "tokenizer" in meta, "model_type": hf["model_type"]}

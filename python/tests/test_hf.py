@@ -366,3 +366,125 @@ def test_cli(tools, tmp_path):
     assert info.returncode == 0 and "layers 3" in info.stdout, info.stdout + info.stderr
     r = run(str(tmp_path / "nowhere"), str(tmp_path / "x.safetensors"))
     assert r.returncode == 1 and "error:" in r.stderr
+
+
+
+# --- the engine's tokenizer against Hugging Face's tokenizers library -------------------------------
+
+TOKENIZER_TEXTS = [
+    "Hello world", " Hello  world ", " ", "I'm sure it's fine, we'll see. THEY'RE HERE'S", "don't 'tis o'clock",
+    "12345678901 and 3.14159 and 1,000,000", "a\tb\t\tc", "   leading and trailing   ", "naïve café résumé",
+    "naïve café (decomposed)", "日本語のテキストと中文文本", "한국어 텍스트 각", "مرحبا بالعالم", "नमस्ते दुनिया",
+    "emoji 😀👍🏽 family 👨‍👩‍👧 flags 🇫🇷", "non breaking　spaces em", "def f(x): return x**2  # square",
+    "https://example.com/path?q=1&r=2", "!!!??...---***", "<|endoftext|> after special", "before<|endoftext|>after",
+    "<s>Hello</s>", "x" * 200, "ab" * 60, " " * 40 + "x", "Ünïcödé ÀÉÎÕÜ ǅ ſ ﬁ", "Zero​width‍join",
+    "MiXeD CaSe 'S 'T 'Re", "𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𝟙𝟚𝟛 ①②③ ½ Ⅻ", "́ leading combining mark", "a <tool>call</tool> [MASK]  here",
+    "say hello, not hellooo or ohello", "the quick brown fox jumps over the lazy dog",
+]
+MULTILINE_TEXTS = ["line one\nline two\n\n\nline five\r\nend", "def f(x):\n    return x\n", "\n", "a\n b \n\n c"]
+CORPUS = ["the quick brown fox jumps over the lazy dog", "I'm sure it's fine, we'll see", "hello world hello there",
+          "numbers 123 456 7890 and 3.14", "naïve café résumé über straße", "日本語 中文 한국어", "def f(x): return x**2",
+          "  indented   text  with   spaces  ", "emoji 😀 and symbols !?.,;:"] * 3
+
+LLAMA3_SPLIT = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+QWEN_SPLIT = LLAMA3_SPLIT.replace(r"\p{N}{1,3}", r"\p{N}")
+
+
+def _tokenizer(style):
+    """A small tokenizer of the given style, trained by the tokenizers library on CORPUS."""
+    tk = pytest.importorskip("tokenizers")
+    from tokenizers import AddedToken, Regex, decoders, models, normalizers, pre_tokenizers, processors, trainers
+    byte_level = style not in ("llama2_legacy", "llama2_metaspace", "metaspace_split", "gemma")
+    model = models.BPE(byte_fallback=not byte_level, unk_token=None if byte_level else "<unk>", fuse_unk=not byte_level,
+                       ignore_merges=style == "llama3")
+    t = tk.Tokenizer(model)
+    specials = ["<|endoftext|>"] if byte_level else ["<unk>", "<s>", "</s>"]
+    if style in ("gpt2", "gpt2_prefix", "added", "roberta", "bert"):
+        t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=style == "gpt2_prefix")
+    elif style in ("llama3", "qwen"):
+        t.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.Split(Regex(LLAMA3_SPLIT if style == "llama3" else QWEN_SPLIT), "isolated"),
+                                                   pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+        if style == "qwen":
+            t.normalizer = normalizers.NFC()
+    elif style == "smollm":
+        t.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.Digits(individual_digits=True), pre_tokenizers.ByteLevel(add_prefix_space=False)])
+    elif style.startswith("split_"):
+        behavior = style[len("split_"):].replace("_invert", "")
+        t.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.Split(" ", behavior, invert=style.endswith("_invert")),
+                                                   pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+    elif style == "llama2_legacy":
+        t.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
+    elif style == "llama2_metaspace":
+        t.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="first", split=False)
+    elif style == "metaspace_split":
+        t.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always", split=True)
+    elif style == "gemma":
+        t.normalizer = normalizers.Replace(" ", "▁")
+    trainer = trainers.BpeTrainer(vocab_size=400, special_tokens=specials, show_progress=False,
+                                  initial_alphabet=pre_tokenizers.ByteLevel.alphabet() if byte_level else [])
+    t.train_from_iterator(CORPUS, trainer)
+    if style == "added":
+        t.add_tokens([AddedToken("<tool>", lstrip=True), AddedToken("</tool>"), AddedToken("[MASK]", rstrip=True),
+                      AddedToken("hello", single_word=True, normalized=True)])
+    if style in ("llama3", "llama2_legacy", "llama2_metaspace", "gemma"):
+        bos = "<|endoftext|>" if byte_level else "<s>"
+        t.post_processor = processors.TemplateProcessing(single=f"{bos} $A", special_tokens=[(bos, t.token_to_id(bos))])
+    elif style == "roberta":
+        eot = t.token_to_id("<|endoftext|>")
+        t.post_processor = processors.RobertaProcessing(("<|endoftext|>", eot), ("<|endoftext|>", eot))
+    elif style == "bert":
+        eot = t.token_to_id("<|endoftext|>")
+        t.post_processor = processors.BertProcessing(("<|endoftext|>", eot), ("<|endoftext|>", eot))
+    else:
+        t.post_processor = processors.ByteLevel(trim_offsets=False) if byte_level else None
+    d = json.loads(t.to_str())
+    if not byte_level:  # SentencePiece-style vocabularies hold all 256 byte tokens, for byte fallback
+        vocab = d["model"]["vocab"]
+        for b in range(256):
+            vocab.setdefault(f"<0x{b:02X}>", len(vocab))
+    return tk.Tokenizer.from_str(json.dumps(d)), d
+
+
+TOKENIZER_STYLES = ["gpt2", "gpt2_prefix", "llama3", "qwen", "smollm", "llama2_legacy", "llama2_metaspace", "metaspace_split",
+                    "gemma", "added", "roberta", "bert", "split_removed", "split_merged_with_previous",
+                    "split_merged_with_next", "split_contiguous", "split_removed_invert"]
+
+
+@pytest.mark.parametrize("style", TOKENIZER_STYLES)
+def test_engine_tokenizer_matches_tokenizers(tools, tmp_path, style):
+    """indra tokenize = tokenizers' encode().ids, with and without special tokens, for every kind of
+    tokenizer the engine implements, stored the way convert() stores it."""
+    from indranet_hf import vocab as vocab_mod
+    hf, d = _tokenizer(style)
+    folder = tmp_path / "hf"
+    folder.mkdir()
+    (folder / "tokenizer.json").write_text(json.dumps(d), encoding="utf-8")
+    stored = vocab_mod.tokenizer(folder)
+    assert stored is not None
+    save_safetensors({}, tmp_path / "m.safetensors", {"tokenizer": json.dumps(stored, separators=(",", ":"))})
+    (tmp_path / "texts.txt").write_text("\n".join(TOKENIZER_TEXTS) + "\n", encoding="utf-8")
+    for special in (True, False):
+        args = [str(tools / "indra"), "tokenize", str(tmp_path / "m.safetensors"), "--text-file", str(tmp_path / "texts.txt")]
+        r = subprocess.run(args + ([] if special else ["--no-special-tokens"]), capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        got = r.stdout.split("\n")
+        for i, text in enumerate(TOKENIZER_TEXTS):
+            assert got[i] == ",".join(map(str, hf.encode(text, add_special_tokens=special).ids)), f"{style} {special} {text!r}"
+    for text in MULTILINE_TEXTS:  # --text keeps newlines
+        r = subprocess.run([str(tools / "indra"), "tokenize", str(tmp_path / "m.safetensors"), "--text", text],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        last = r.stdout.rstrip("\n").split("\n")[-1]
+        assert last.rstrip() == ("--tokens " + ",".join(map(str, hf.encode(text).ids))).rstrip(), f"{style} {text!r}"
+
+
+def test_unsupported_tokenizer_is_not_stored(tmp_path):
+    d = {"model": {"type": "Unigram", "vocab": [["a", 0.0]]}, "normalizer": None, "pre_tokenizer": None}
+    (tmp_path / "tokenizer.json").write_text(json.dumps(d))
+    from indranet_hf import vocab as vocab_mod
+    with pytest.warns(UserWarning, match="Unigram"):
+        assert vocab_mod.tokenizer(tmp_path) is None
+    d = {"model": {"type": "BPE", "vocab": {}, "merges": []}, "normalizer": {"type": "Sequence", "normalizers": [{"type": "NFKC"}]}}
+    (tmp_path / "tokenizer.json").write_text(json.dumps(d))
+    with pytest.warns(UserWarning, match="NFKC"):
+        assert vocab_mod.tokenizer(tmp_path) is None

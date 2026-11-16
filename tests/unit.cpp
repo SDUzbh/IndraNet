@@ -25,6 +25,9 @@
 #include "../src/ops.h"    // internal: patching batch sizes
 #include "../src/half.h"   // internal: fp16 conversion
 #include "../src/gpu_chunks.h"  // internal: chunked GPU work (portable half)
+#include "../src/regex.h"       // internal: tokenizer split patterns
+#include "../src/unicode.h"     // internal: UTF-8, categories, NFC
+#include "tfi/tokenizer.h"
 
 using namespace tfi;
 
@@ -1119,6 +1122,86 @@ static void test_bias_parts() {
     const ModelConfig per_layer = tiny([](ModelConfig& c) { c.layer_overrides[1] = json::parse(R"({"bias": ["o"]})"); });
     const Model pl = random_model(per_layer, 5);
     CHECK(pl.weights().count("blocks.1.attn.o_proj.bias") && !pl.weights().count("blocks.0.attn.o_proj.bias"));
+}
+
+// The tokenizer's parts on their own (the whole tokenizer is checked against Hugging Face's
+// tokenizers library by python/tests/test_hf.py): UTF-8, NFC / NFD, the split-pattern regex, and BPE
+// rules on small hand-written tokenizer.json files.
+static void test_tokenizer_parts() {
+    using namespace detail;
+    // UTF-8: round trip, and invalid input refused (stray continuation, overlong, surrogate, truncated)
+    const std::string mixed = "a\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80";  // a é 中 😀
+    CHECK(utf8_decode(mixed) == U32String({U'a', 0xE9, 0x4E2D, 0x1F600}) && utf8_encode(utf8_decode(mixed)) == mixed);
+    for (const char* bad : {"\x80", "\xC0\xAF", "\xED\xA0\x80", "\xE4\xB8"}) CHECK_THROWS(utf8_decode(bad));
+    // categories and White_Space
+    CHECK(std::string(unicode_category(U'A')) == "Lu" && unicode_letter(0x4E2D) && unicode_number(0x2163) && !unicode_letter(U'1'));
+    CHECK(unicode_white_space(0x3000) && unicode_white_space(0x85) && !unicode_white_space(0x200B));
+    // NFC / NFD: composition, Hangul, mark order, an excluded composition, and blocking
+    CHECK(unicode_nfc(U"é") == U"é" && unicode_nfd(U"é") == U"é");
+    CHECK(unicode_nfc(U"각") == U"각" && unicode_nfd(U"각") == U"각");
+    CHECK(unicode_nfd(U"ạ́") == U"ạ́");            // dot below (220) before acute (230)
+    CHECK(unicode_nfc(U"ạ́") == U"ạ́");             // ạ then the acute
+    CHECK(unicode_nfc(U"क़") == U"क़");                     // excluded: stays decomposed
+    CHECK(unicode_nfc(U"plain ascii") == U"plain ascii");
+
+    // regex: the subset tokenizer patterns use
+    auto spans = [](const char* pattern, const char32_t* text) {
+        std::vector<std::u32string> out;
+        const U32String s(text);
+        for (const auto& m : Regex(pattern).find_all(s)) out.push_back(s.substr(m.first, m.second - m.first));
+        return out;
+    };
+    using V = std::vector<std::u32string>;
+    CHECK(spans(R"(\p{N}{1,3})", U"12345") == (V{U"123", U"45"}));
+    CHECK(spans(R"((?i:'s|'t)|\p{L}+)", U"IT'S it's") == (V{U"IT", U"'S", U"it", U"'s"}));
+    CHECK(spans(R"(\s+(?!\S)|\s+)", U"a   b") == (V{U"  ", U" "}));  // the lookahead leaves one space for " b"
+    CHECK(spans(R"([^\r\n\p{L}\p{N}]?\p{L}+)", U"中文 été") == (V{U"中文", U" été"}));
+    CHECK(spans(R"(a+?b|a)", U"aab") == (V{U"aab"}));
+    CHECK(spans(R"(x\x{263A}é[^a-c])", U"x☺éd") == (V{U"x☺éd"}));
+    CHECK(spans(R"(\s+)", std::u32string(100000, U' ').c_str()).size() == 1);  // long runs: no deep recursion
+    for (const char* bad : {"(a", "a{2,1}", "\\q", "(?<name>a)", "a++", "[b-a]", "^a"}) CHECK_THROWS(Regex(bad));
+
+    // BPE: merges by rank (leftmost on ties), byte fallback, unknowns, specials around the text
+    auto tokenizer = [](const std::string& extra, const std::string& model_extra = "") {
+        return Tokenizer::from_json(R"({"model": {"type": "BPE", "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "bc": 5, "abc": 6,
+            "<0xC3>": 7, "<0xA9>": 8, "▁": 9, "<s>": 10, "aa": 11}, "merges": ["a b", "ab c", "b c", "a a"])" + model_extra + "}" + extra + "}");
+    };
+    auto ids = [](const Tokenizer& t, const std::string& s, bool special = true) { return t.encode(s, special); };
+    const Tokenizer plain = tokenizer("");
+    CHECK(ids(plain, "abc") == (Tokens{6}) && ids(plain, "bca") == (Tokens{5, 1}) && ids(plain, "aaa") == (Tokens{11, 1}));
+    CHECK(ids(plain, "axz") == (Tokens{1}));  // no unk_token and no fallback: unknown characters dropped
+    const Tokenizer unk = tokenizer("", R"(, "unk_token": "<unk>", "fuse_unk": true)");
+    CHECK(ids(unk, "axza") == (Tokens{1, 0, 1}));
+    const Tokenizer fallback = tokenizer("", R"(, "unk_token": "<unk>", "byte_fallback": true)");
+    CHECK(ids(fallback, "a\xC3\xA9z") == (Tokens{1, 7, 8, 0}));  // é as its two bytes; z has no bytes in the vocabulary
+    const Tokenizer templ = tokenizer(R"(, "post_processor": {"type": "TemplateProcessing", "single": [{"SpecialToken": {"id": "<s>"}},
+        {"Sequence": {"id": "A"}}], "special_tokens": {"<s>": {"id": "<s>", "ids": [10], "tokens": ["<s>"]}}})");
+    CHECK(ids(templ, "ab") == (Tokens{10, 4}) && ids(templ, "ab", false) == (Tokens{4}));
+    // Metaspace "first": the replacement prepended only at the start of the input, not after an added token
+    const Tokenizer meta = tokenizer(R"(, "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first",
+        "split": false}, "added_tokens": [{"id": 10, "content": "<s>", "special": true}])");
+    CHECK(ids(meta, "a b") == (Tokens{9, 1, 9, 2}) && ids(meta, "<s>a") == (Tokens{10, 1}));
+    // added tokens: leftmost-longest, rstrip eats the space after, single_word needs word boundaries
+    const Tokenizer added = tokenizer(R"(, "added_tokens": [{"id": 20, "content": "XY"}, {"id": 21, "content": "XYZ", "rstrip": true},
+        {"id": 22, "content": "Q", "single_word": true}, {"id": 99, "content": "abc"}])");
+    // ids as tokenizers assigns them: past the vocabulary (12 entries) in order, whatever the file says
+    CHECK(ids(added, "aXYZ  b") == (Tokens{1, 13, 2}) && ids(added, "XYa") == (Tokens{12, 1}));
+    CHECK(ids(added, "aQ Q") == (Tokens{1, 14}));            // inside a word Q is not the token (and is dropped)
+    CHECK(ids(added, "cabc") == (Tokens{3, 6}));             // text in the vocabulary: the vocabulary's id
+    // ignore_merges: a word in the vocabulary is that token, even when the merges wouldn't reach it
+    // (Llama 3); Digits: each digit alone, or runs of them
+    auto small = [](const std::string& model_extra, const std::string& pre = "null") {
+        return Tokenizer::from_json(R"({"pre_tokenizer": )" + pre + R"(, "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "c": 2,
+            "bc": 3, "abc": 4, "1": 5, "2": 6, "12": 7}, "merges": ["b c", "1 2"])" + model_extra + "}}");
+    };
+    CHECK(ids(small(""), "abc") == (Tokens{0, 3}) && ids(small(R"(, "ignore_merges": true)"), "abc") == (Tokens{4}));
+    CHECK(ids(small("", R"({"type": "Digits", "individual_digits": true})"), "a12") == (Tokens{0, 5, 6}));
+    CHECK(ids(small("", R"({"type": "Digits", "individual_digits": false})"), "a12") == (Tokens{0, 7}));
+    // what the engine doesn't implement is refused by name
+    CHECK_THROWS(Tokenizer::from_json(R"({"model": {"type": "Unigram", "vocab": []}})"));
+    CHECK_THROWS(tokenizer(R"(, "normalizer": {"type": "NFKC"})"));
+    CHECK_THROWS(tokenizer(R"(, "pre_tokenizer": {"type": "Whitespace"})"));
+    CHECK_THROWS(Tokenizer::from_json(R"({"model": {"type": "BPE", "vocab": {"a": 0}, "merges": ["a b"]}})"));
 }
 
 static void test_weight_shapes_checked() {
@@ -2603,6 +2686,7 @@ int main(int argc, char** argv) {
     }
     run("core", "weight shapes checked when a model is built", test_weight_shapes_checked);
     run("core", "bias parts: parsed, exactly the named biases, qkv-only models", test_bias_parts);
+    run("core", "tokenizer: UTF-8, NFC, split regex, BPE rules", test_tokenizer_parts);
     run("analysis", "OV copying + positional QK", test_copying_and_positional);
     run("analysis", "post-norm DLA refused", test_post_norm_dla_refused);
     run("core", "vector math", test_vector_math);

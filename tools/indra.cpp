@@ -16,7 +16,10 @@
 #include <vector>
 
 #include "tfi/analysis.h"
+#include "tfi/json.h"
 #include "tfi/model.h"
+#include "tfi/safetensors.h"
+#include "tfi/tokenizer.h"
 
 using namespace tfi;
 
@@ -45,11 +48,14 @@ Commands
              | --reference-random N (random tokens; only for models trained on random tokens)
   circuits   weight-only: composition scores, OV copying       [--top 10] [--tokens-sampled 1024]
   attn       where each head attends, query by query           --tokens --layer L [--head H] [--top K] [--pos P]
+  tokenize   token ids for text, without loading the weights   --text T | --text-file F (one line each)
 
 Token input
   --tokens 5,17,3,...          explicit token ids
-  --text "00123+00045="        text, if the model was exported with a vocabulary
+  --text "00123+00045="        text, tokenized as the model was trained: with its Hugging Face tokenizer
+                               (converted models), or by longest match (indranet models with a vocabulary)
                                (patch: --clean / --corrupt or --clean-text / --corrupt-text)
+  --no-special-tokens          leave out the tokenizer's BOS (and other added) tokens around --text
   --target / --other           a token id, or a token's text when the model has a vocabulary
   --repeat-random L [--seed S] a random segment of length L, repeated twice (for induction)
   --pos P                      position to analyse (default: last; negative counts from the end)
@@ -126,7 +132,7 @@ Tokens repeat_random(const Model& m, int64_t len, uint64_t seed) {
 
 Tokens input_tokens(const Args& a, const Model& m, const std::string& key = "tokens") {
     const std::string text_key = key == "tokens" ? "text" : key + "-text";
-    if (a.has(text_key)) return m.tokenize(a.get(text_key));
+    if (a.has(text_key)) return m.tokenize(a.get(text_key), !a.has("no-special-tokens"));
     if (a.has(key)) return parse_tokens(a.get(key));
     if (key == "tokens" && a.has("repeat-random")) return repeat_random(m, a.get_int("repeat-random", 8), a.get_int("seed", 0));
     throw std::invalid_argument("give --" + key + " or --" + text_key + (key == "tokens" ? " or --repeat-random" : ""));
@@ -194,6 +200,44 @@ std::vector<std::string> head_labels(const Model& m) {
 }
 
 // --- commands -------------------------------------------------------------------------
+
+// Token ids for text, from the file's header alone (its tokenizer, or its vocabulary): no weights.
+int cmd_tokenize(const Args& a) {
+    const std::map<std::string, std::string> meta = read_safetensors_metadata(a.model);
+    std::vector<std::string> vocab;
+    if (auto v = meta.find("vocab"); v != meta.end())
+        for (const auto& s : json::parse(v->second).array) vocab.push_back(s.as_string());
+    std::optional<Tokenizer> tokenizer;
+    if (auto t = meta.find("tokenizer"); t != meta.end()) tokenizer.emplace(Tokenizer::from_json(t->second));
+    else if (vocab.empty()) throw std::runtime_error("this model file has no tokenizer or vocabulary");
+    const bool special = !a.has("no-special-tokens");
+    auto encode = [&](const std::string& text) {
+        return tokenizer ? tokenizer->encode(text, special) : tokenize_longest_match(vocab, text);
+    };
+    if (a.has("text-file")) {  // one line of ids per line of text, for scripts
+        std::ifstream f(a.get("text-file"));
+        if (!f) throw std::runtime_error("cannot open " + a.get("text-file"));
+        std::string line;
+        while (std::getline(f, line)) {
+            const Tokens t = encode(line);
+            for (size_t i = 0; i < t.size(); ++i) std::printf("%s%lld", i ? "," : "", static_cast<long long>(t[i]));
+            std::printf("\n");
+        }
+        return 0;
+    }
+    if (!a.has("text")) throw std::invalid_argument("give --text or --text-file");
+    const Tokens t = encode(a.get("text"));
+    std::printf("%zu tokens (%s)\n", t.size(), tokenizer ? "the model's tokenizer" : "longest vocabulary match");
+    for (size_t i = 0; i < t.size(); ++i) {
+        const int64_t id = t[i];
+        const bool shown = id >= 0 && id < static_cast<int64_t>(vocab.size());
+        std::printf("%5zu %8lld   %s\n", i, static_cast<long long>(id), shown ? ("'" + vocab[id] + "'").c_str() : "");
+    }
+    std::printf("--tokens ");
+    for (size_t i = 0; i < t.size(); ++i) std::printf("%s%lld", i ? "," : "", static_cast<long long>(t[i]));
+    std::printf("\n");
+    return 0;
+}
 
 int cmd_info(const Args&, const Model& m) {
     const ModelConfig& c = m.cfg();
@@ -471,7 +515,7 @@ std::vector<Tokens> reference_tokens(const Args& a, const Model& m, int64_t T) {
     if (a.has("reference"))
         for (const auto& s : split(a.get("reference"))) refs.push_back(parse_tokens(s));
     if (a.has("reference-text"))
-        for (const auto& s : split(a.get("reference-text"))) refs.push_back(m.tokenize(s));
+        for (const auto& s : split(a.get("reference-text"))) refs.push_back(m.tokenize(s, !a.has("no-special-tokens")));
     if (a.has("reference-file")) {
         std::ifstream f(a.get("reference-file"));
         if (!f) throw std::runtime_error("cannot open " + a.get("reference-file"));
@@ -593,6 +637,7 @@ int main(int argc, char** argv) {
         if (a.has("fp16") && a.has("fp32")) throw std::invalid_argument("give --fp16 or --fp32, not both");
         const bool fp16 = a.has("fp16");
         set_gpu_fp16(fp16);
+        if (a.command == "tokenize") return cmd_tokenize(a);
         const Model m = Model::load(a.model, fp16 ? WeightFormat::fp16 : WeightFormat::fp32);
         if (fp16) {
             const std::vector<std::string> kept = m.fp32_weights();

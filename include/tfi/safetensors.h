@@ -22,6 +22,8 @@ struct SafeTensors {
 };
 
 SafeTensors load_safetensors(const std::string& path);
+// Only the header's string metadata (no tensor is read).
+std::map<std::string, std::string> read_safetensors_metadata(const std::string& path);
 // The same, but each float tensor goes to `take` as soon as it is read, instead of into
 // SafeTensors::tensors: a caller that converts tensors (e.g. to fp16) never holds them all as float32.
 using TensorSink = std::function<void(const std::string& name, Tensor&& t)>;
