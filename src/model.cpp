@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "tfi/analysis.h"
 #include "tfi/safetensors.h"
@@ -401,13 +402,23 @@ void Model::check_shapes() {
 
 Model Model::load(const std::string& path, WeightFormat format) {
     std::map<std::string, Weight> weights;
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     // Each 2-D tensor goes from the file straight into its weight's storage: read as it is when the file
-    // holds the type kept in memory, otherwise converted a block at a time as it is read.
+    // holds the type kept in memory, otherwise converted a block at a time as it is read. A tensor of
+    // that type starting on a page boundary of the memory-mapped file (as indranet_hf writes them) is
+    // not even copied: the weight uses the mapping in place, and so does the GPU.
     const RawSink straight = [&](const std::string& name, const RawTensor& t) {
         if (t.shape.size() != 2) return false;
         const int64_t n = shape_numel(t.shape);
         const bool to_fp16 = format == WeightFormat::fp16;
         auto read_all = [&](void* dst) { t.read(0, t.bytes, dst); };
+        if (t.dtype == (to_fp16 ? "F16" : "F32") && t.mapped && t.bytes > 0 &&
+            reinterpret_cast<uintptr_t>(t.mapped) % page == 0 &&
+            (!to_fp16 || detail::all_finite_halves(static_cast<const uint16_t*>(t.mapped), n))) {
+            const size_t capacity = (static_cast<size_t>(t.bytes) + page - 1) / page * page;  // within the mapping's last page
+            weights.emplace(name, Weight::borrowed(t.shape, to_fp16, t.mapped, capacity, t.mapping));
+            return true;
+        }
         if (t.dtype == (to_fp16 ? "F16" : "F32")) {
             Weight w = Weight::filled(t.shape, to_fp16, read_all);
             if (!to_fp16 || detail::all_finite_halves(w.f16(), n)) {

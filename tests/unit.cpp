@@ -958,18 +958,27 @@ static void test_fp16_model(const Model& m16) {
 }
 
 // A safetensors file of `tensors` with `cfg_json` as its config; dtype(name) picks "F32", "F16" or
-// "BF16" (rounded to nearest even) for each tensor.
+// "BF16" (rounded to nearest even) for each tensor. aligned: as indranet_hf writes files, the data and
+// every matrix start on a 16 KiB boundary, with __padding tensors filling the gaps.
 static void write_safetensors(const std::string& path, const std::string& cfg_json,
                               const std::map<std::string, Tensor>& tensors,
-                              const std::function<std::string(const std::string&)>& dtype) {
+                              const std::function<std::string(const std::string&)>& dtype, bool aligned = false) {
+    constexpr size_t kAlign = 16384;
     std::string escaped;
     for (char ch : cfg_json) {
         if (ch == '"' || ch == '\\') escaped += '\\';
         escaped += ch;
     }
     std::string header = "{\"__metadata__\": {\"config\": \"" + escaped + "\"}", data;
+    int pads = 0;
     for (const auto& kv : tensors) {
         const std::string type = dtype(kv.first);
+        if (aligned && kv.second.dim() == 2 && data.size() % kAlign) {
+            const size_t at = data.size(), pad = kAlign - at % kAlign;
+            data.append(pad, '\0');
+            header += ", \"__padding" + std::to_string(pads++) + "\": {\"dtype\": \"U8\", \"shape\": [" + std::to_string(pad) +
+                      "], \"data_offsets\": [" + std::to_string(at) + ", " + std::to_string(data.size()) + "]}";
+        }
         const size_t begin = data.size();
         for (float v : kv.second.data) {
             if (type == "F32") {
@@ -992,6 +1001,7 @@ static void write_safetensors(const std::string& path, const std::string& cfg_js
                   std::to_string(begin) + ", " + std::to_string(data.size()) + "]}";
     }
     header += "}";
+    if (aligned) header.append((kAlign - (8 + header.size()) % kAlign) % kAlign, ' ');
     std::ofstream f(path, std::ios::binary);
     const uint64_t n = header.size();
     unsigned char len[8];
@@ -1014,9 +1024,10 @@ static float stored(float v, const std::string& dtype) {
 
 // Model::load reads each 2-D tensor straight into its weight, converting as it reads when the file's
 // type differs from the one kept in memory: the same model as building it from the file's values.
-static void check_load(const std::string& path, const std::string& cfg_json, const ModelConfig& cfg,
-                       std::map<std::string, Tensor> w, const std::function<std::string(const std::string&)>& dtype) {
-    write_safetensors(path, cfg_json, w, dtype);
+static void check_load_layout(const std::string& path, const std::string& cfg_json, const ModelConfig& cfg,
+                              std::map<std::string, Tensor> w, const std::function<std::string(const std::string&)>& dtype,
+                              bool aligned) {
+    write_safetensors(path, cfg_json, w, dtype, aligned);
     for (auto& kv : w)
         for (float& v : kv.second.data) v = stored(v, dtype(kv.first));  // what the file holds
     const Model want16(cfg, w, WeightFormat::fp16), want32(cfg, w);
@@ -1033,10 +1044,27 @@ static void check_load(const std::string& path, const std::string& cfg_json, con
     }
     CHECK(same);
     CHECK(got16.fp32_weights() == want16.fp32_weights());
-    const Tokens t = seq(10, 2, cfg.vocab_size);
+    // Aligned files: a matrix stored in the type kept in memory (and, for fp16, all finite) is used in
+    // place from the mapping; every other one is a copy. Unaligned files: always copies.
+    bool borrowed_right = true;
+    for (const auto& kv : got16.weights()) {
+        if (kv.second.dim() != 2) continue;
+        const std::string type = dtype(kv.first);
+        borrowed_right &= kv.second.is_borrowed() == (aligned && type == "F16" && kv.second.is_fp16());
+        borrowed_right &= got32.weight(kv.first).is_borrowed() == (aligned && type == "F32");
+    }
+    CHECK(borrowed_right);
+    const Tokens t = seq(10, 2, cfg.vocab_size);  // the file is gone by now: the mapping outlives it
     CHECK(got16.forward(t).data == want16.forward(t).data);
     CHECK(got32.forward(t).data == want32.forward(t).data);
 }
+
+static void check_load(const std::string& path, const std::string& cfg_json, const ModelConfig& cfg,
+                       const std::map<std::string, Tensor>& w, const std::function<std::string(const std::string&)>& dtype) {
+    check_load_layout(path, cfg_json, cfg, w, dtype, false);
+    check_load_layout(path, cfg_json, cfg, w, dtype, true);
+}
+
 
 static void test_fp16_load() {
     const std::string path = "/tmp/tfi_unit_fp16_" + std::to_string(::getpid()) + ".safetensors";
@@ -2580,6 +2608,29 @@ static void test_device_modes() {
 }
 #endif
 
+#ifdef TFI_USE_ACCELERATE
+// Memory-mapped weights on the GPU: a model loaded in place from an aligned file (float32 and fp16)
+// gives what the CPU gives on every GPU path, the GPU using the mapping as it uses its own memory.
+static void test_gpu_mapped_weights() {
+    const std::string path = "/tmp/tfi_unit_mapped_" + std::to_string(::getpid()) + ".safetensors";
+    const ModelConfig cfg = tiny([](ModelConfig& c) { c.bias = true; c.norm = "layernorm"; });
+    const std::string cfg_json = R"({"vocab_size": 50, "d_model": 16, "n_layers": 2, "n_heads": 4, "max_seq_len": 32, )"
+                                 R"("mlp_multiple_of": 8, "bias": true, "norm": "layernorm"})";
+    std::map<std::string, Tensor> w;
+    const Model source = random_model(cfg, 11);
+    for (const auto& kv : source.weights()) w[kv.first] = kv.second.to_tensor();
+    for (const char* type : {"F32", "F16"}) {
+        write_safetensors(path, cfg_json, w, [&](const std::string&) { return std::string(type); }, true);
+        const Model m = Model::load(path, std::string(type) == "F16" ? WeightFormat::fp16 : WeightFormat::fp32);
+        std::remove(path.c_str());
+        CHECK(m.weight("blocks.0.mlp.up.weight").is_borrowed() && m.weight("embed.weight").is_borrowed());
+        test_gpu_resident(m);
+        test_gpu_gradients(m);
+        test_gpu_single_pass(m, 9);
+    }
+}
+#endif
+
 // Test groups, for running part of the suite:
 //   core      json, tensors, matmul, vector math, weight shapes
 //   analysis  per model type: cache and hooks, lens, DLA, patching, ablation, circuits
@@ -2695,6 +2746,7 @@ int main(int argc, char** argv) {
     run("gpu", "which single passes go to the GPU", test_single_pass_rule);
 #ifdef TFI_USE_ACCELERATE
     run("gpu", "GPU linear layer (macOS)", test_gpu_linear);
+    run("gpu", "memory-mapped weights on the GPU = CPU (macOS)", test_gpu_mapped_weights);
     run("gpu", "GPU used only with enough work (macOS)", test_gpu_work_threshold);
     run("gpu", "device modes: cpu, both, gpu (macOS)", test_device_modes);
     run("gpu", "GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);

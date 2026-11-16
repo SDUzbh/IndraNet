@@ -58,6 +58,14 @@ float32 exactly, or with `--fp16` converted to fp16: exactly, except values unde
 weights with values beyond fp16's range, which stay float32. bf16 has fp32's range but fewer
 significant bits than fp16 (8 against 11).
 
+The engine memory-maps model files. Some matrices are used in place, with no copy, the GPU
+included: those stored in the type the engine keeps them in (F16 with `--fp16`, F32 otherwise) and
+starting on a page boundary, as files from the Hugging Face converter do. Loading then reads
+nothing ahead of time, and the weights take no memory of the process's own, since they're shared
+with the system's file cache. Other matrices (bf16, or stored in the other type) are converted as
+they're read, as before. So for a converted model, `--dtype float16` gives the fastest and leanest
+`--fp16` runs.
+
 Or train an example circuit and export it in one go:
 
 ```bash

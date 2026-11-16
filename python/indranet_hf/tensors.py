@@ -13,7 +13,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 # safetensors dtype -> numpy dtype it is held in (BF16: its bits, as uint16)
-NUMPY = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16, "F64": np.float64, "I64": np.int64}
+NUMPY = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16, "F64": np.float64, "I64": np.int64, "U8": np.uint8}
+# Matrices start on this boundary in files write() makes (16 KiB: Apple silicon's page, a multiple of
+# 4 KiB ones), so the engine can memory-map them and use them in place, the GPU included.
+ALIGN = 16384
+PADDING = "__padding"  # prefix of the filler tensors that keep the data free of holes, as safetensors requires
 FP16_MAX = 65504.0
 
 
@@ -35,7 +39,7 @@ class Shards:
                 self._where[name] = (f, info, 8 + n)
 
     def names(self) -> List[str]:
-        return list(self._where)
+        return [n for n in self._where if not n.startswith(PADDING)]
 
     def __contains__(self, name: str) -> bool:
         return name in self._where
@@ -94,22 +98,37 @@ def cast(a: np.ndarray, dtype: str, target: str) -> Optional[np.ndarray]:
 
 
 def write(path: Path, tensors: Dict[str, Tuple[str, Tuple[int, ...], "callable"]],
-          metadata: Dict[str, str]) -> int:
+          metadata: Dict[str, str], align: int = ALIGN) -> int:
     """Write a safetensors file. ``tensors`` maps each name to (dtype, shape, produce), where
     produce() returns the array; tensors are produced one at a time, in order, so only one is in
-    memory. Returns the file size."""
-    header: Dict[str, object] = {"__metadata__": metadata}
+    memory. Returns the file size.
+
+    The data starts at a multiple of ``align`` bytes from the file's start, and so does every 2-D
+    tensor (a matrix): small ``__padding<k>`` U8 tensors fill the gaps, since safetensors allows no
+    holes in the data. Readers that know the convention skip them; to others they are harmless extra
+    tensors. ``align=1`` writes the tensors back to back."""
+    entries = []  # (name, dtype, shape, produce or None for padding, offset, size)
     offset = 0
-    for name, (dtype, shape, _) in tensors.items():
+    for name, (dtype, shape, produce) in tensors.items():
         n = int(np.prod(shape, dtype=np.int64)) * np.dtype(NUMPY[dtype]).itemsize
-        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + n]}
+        if len(shape) == 2 and offset % align:
+            pad = -offset % align
+            entries.append((f"{PADDING}{len(entries)}", "U8", (pad,), None, offset, pad))
+            offset += pad
+        entries.append((name, dtype, tuple(shape), produce, offset, n))
         offset += n
+    header: Dict[str, object] = {"__metadata__": metadata}
+    for name, dtype, shape, _, at, n in entries:
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [at, at + n]}
     raw = json.dumps(header, separators=(",", ":")).encode()
-    raw += b" " * (-len(raw) % 8)
+    raw += b" " * (-(8 + len(raw)) % max(align, 8))  # spaces may pad the header; the data starts aligned
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", len(raw)))
         f.write(raw)
-        for name, (dtype, shape, produce) in tensors.items():
+        for name, dtype, shape, produce, _, n in entries:
+            if produce is None:
+                f.write(bytes(n))
+                continue
             a = np.ascontiguousarray(produce(), dtype=NUMPY[dtype])
             if a.shape != tuple(shape):
                 raise AssertionError(f"{name}: produced shape {a.shape}, planned {tuple(shape)}")

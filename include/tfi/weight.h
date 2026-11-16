@@ -17,8 +17,8 @@ namespace tfi {
 enum class WeightFormat { fp32, fp16 };
 
 // One weight. A 2-D weight (a matrix: embeddings, projections, unembedding) keeps its values, float32
-// or half precision, in a page-aligned allocation that the GPU can use in place, without a copy of
-// its own; copies of a Weight share it. Read matrices through rows(), cols(), to_tensor() and the
+// or half precision, in page-aligned memory that the GPU can use in place, without a copy of its own:
+// an allocation of its own, or a memory-mapped model file (borrowed()); copies of a Weight share it. Read matrices through rows(), cols(), to_tensor() and the
 // linear() / matmul() overloads below, which give float32 either way. Other weights (norm scales,
 // biases) are float32 Tensors, read with f32().
 class Weight {
@@ -36,6 +36,11 @@ class Weight {
     // with fp16, numel() fp16 bit patterns, taken as they are (e.g. read or converted from a file).
     static Weight filled(Shape shape, bool fp16, const std::function<void(void* dst)>& fill);
     static bool fits_fp16(const Tensor& t);  // every value finite and within +-65504
+    // A 2-D weight whose values stay in memory owned elsewhere (a memory-mapped model file): nothing is
+    // copied. data must start on a page boundary and capacity bytes from it (whole pages, at least the
+    // values' size) must be readable, so that the GPU can use it in place too; owner keeps it alive.
+    static Weight borrowed(Shape shape, bool fp16, const void* data, size_t capacity, std::shared_ptr<const void> owner);
+    bool is_borrowed() const { return borrowed_; }  // values in memory owned elsewhere (see borrowed())
 
     int64_t numel() const;
     int64_t dim() const { return static_cast<int64_t>(shape.size()); }
@@ -66,6 +71,7 @@ class Weight {
     std::shared_ptr<const void> mat_;  // a 2-D weight's values (page-aligned)
     size_t capacity_ = 0;
     bool half_ = false;
+    bool borrowed_ = false;
 };
 
 // y = x @ W^T + b (W (out, in), as linear() above) with a model weight. A half-precision W is

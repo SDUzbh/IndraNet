@@ -93,6 +93,23 @@ Weight Weight::filled(Shape shape, bool fp16, const std::function<void(void* dst
     return w;
 }
 
+Weight Weight::borrowed(Shape shape, bool fp16, const void* data, size_t capacity, std::shared_ptr<const void> owner) {
+    if (shape.size() != 2) throw std::invalid_argument("borrowed() makes 2-D weights, got " + shape_str(shape));
+    for (int64_t d : shape)
+        if (d < 0) throw std::invalid_argument("negative dimension in " + shape_str(shape));
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t bytes = static_cast<size_t>(shape_numel(shape)) * (fp16 ? sizeof(uint16_t) : sizeof(float));
+    if (reinterpret_cast<uintptr_t>(data) % page != 0 || capacity % page != 0 || capacity < std::max<size_t>(bytes, 1))
+        throw std::invalid_argument("borrowed(): the values must start on a page boundary, in whole pages");
+    Weight w;
+    w.shape = std::move(shape);
+    w.mat_ = std::shared_ptr<const void>(std::move(owner), data);  // shares the owner's lifetime
+    w.capacity_ = capacity;
+    w.half_ = fp16;
+    w.borrowed_ = true;
+    return w;
+}
+
 const Tensor& Weight::f32() const {
     if (dim() == 2)
         throw std::logic_error("f32() is for weights that are not 2-D; read a 2-D weight with rows(), cols(), "

@@ -204,6 +204,32 @@ def test_convert_writes_engine_names_and_dtypes(tmp_path):
     assert s["tensors"] == 12 and not s["config"]["bias"] and not s["vocab"]
 
 
+def test_converted_files_are_page_aligned(tmp_path):
+    """Matrices start on 16 KiB boundaries (so the engine maps them in place); padding fills the gaps,
+    hidden by our reader, and the file stays readable by Hugging Face's safetensors as it is."""
+    import struct
+    folder = _tiny_llama_folder(tmp_path / "hf")
+    convert(folder, tmp_path / "out.safetensors", dtype="float16")
+    raw = (tmp_path / "out.safetensors").read_bytes()
+    n = struct.unpack("<Q", raw[:8])[0]
+    header = json.loads(raw[8:8 + n])
+    header.pop("__metadata__")
+    start = 8 + n
+    assert start % tensors.ALIGN == 0
+    mats = {k: v for k, v in header.items() if len(v["shape"]) == 2}
+    assert mats and all((start + v["data_offsets"][0]) % tensors.ALIGN == 0 for v in mats.values())
+    pads = [k for k in header if k.startswith(tensors.PADDING)]
+    assert pads and all(header[k]["dtype"] == "U8" for k in pads)
+    ours = tensors.Shards([tmp_path / "out.safetensors"])
+    assert not any(k.startswith(tensors.PADDING) for k in ours.names())
+    st = pytest.importorskip("safetensors.numpy")
+    loaded = st.load_file(str(tmp_path / "out.safetensors"))  # validates offsets: no holes, no overlaps
+    for k in ours.names():
+        assert np.array_equal(loaded[k], ours.get(k))
+    tensors.write(tmp_path / "packed.safetensors", {"m": ("F32", (2, 3), lambda: np.ones((2, 3), np.float32))}, {}, align=1)
+    assert tensors.Shards([tmp_path / "packed.safetensors"]).names() == ["m"]
+
+
 def test_convert_refuses_unknown_tensors(tmp_path):
     folder = _tiny_llama_folder(tmp_path / "hf", {"model.layers.0.mlp.experts.0.weight": torch.zeros(2, 2)})
     with pytest.raises(Unsupported, match="no IndraNet counterpart"):

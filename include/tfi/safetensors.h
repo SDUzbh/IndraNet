@@ -1,8 +1,11 @@
-// Reader for safetensors files (F32, F16, BF16 converted to float32; I64 kept as integers).
+// Reader for safetensors files (F32, F16, BF16 converted to float32; I64 kept as integers). Tensors whose
+// name starts with "__padding" are skipped: writers (indranet_hf) use them to start each matrix on a
+// page boundary, so that a memory-mapped file's matrices can be used in place.
 #pragma once
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,12 +31,17 @@ std::map<std::string, std::string> read_safetensors_metadata(const std::string& 
 // SafeTensors::tensors: a caller that converts tensors (e.g. to fp16) never holds them all as float32.
 using TensorSink = std::function<void(const std::string& name, Tensor&& t)>;
 // A float tensor (F32, F16 or BF16) before it is read: read(offset, n, dst) copies bytes
-// [offset, offset + n) of its data, as stored (little-endian), any part, any number of times.
+// [offset, offset + n) of its data, as stored (little-endian), any part, any number of times. The file
+// is memory-mapped when it can be: then `mapped` points at the tensor's bytes in the mapping, which
+// `mapping` keeps alive (and which stays valid even if the file is deleted), so a caller can use them
+// in place; otherwise mapped is nullptr.
 struct RawTensor {
     std::string dtype;
     Shape shape;
     uint64_t bytes = 0;
     std::function<void(uint64_t offset, uint64_t n, void* dst)> read;
+    const void* mapped = nullptr;
+    std::shared_ptr<const void> mapping;
 };
 // Called first for each float tensor: returning true means it read the tensor itself (e.g. straight
 // into its own storage, converting as it goes), and the tensor goes nowhere else.

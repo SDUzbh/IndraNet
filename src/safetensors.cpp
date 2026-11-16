@@ -1,5 +1,10 @@
 #include "tfi/safetensors.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -37,6 +42,23 @@ std::string read_header(std::ifstream& f, const std::string& path) {
     return header;
 }
 
+// The whole file, read-only and shared with the page cache; nullptr when it can't be mapped (an
+// empty or special file, or mmap failing), and the reader falls back to reading.
+std::shared_ptr<const void> map_file(const std::string& path, uint64_t& size) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st {};
+    void* base = MAP_FAILED;
+    if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        size = static_cast<uint64_t>(st.st_size);
+        base = ::mmap(nullptr, static_cast<size_t>(size), PROT_READ, MAP_SHARED, fd, 0);
+    }
+    ::close(fd);  // the mapping stays valid without the descriptor
+    if (base == MAP_FAILED) return nullptr;
+    const size_t length = static_cast<size_t>(size);
+    return std::shared_ptr<const void>(base, [length](const void* p) { ::munmap(const_cast<void*>(p), length); });
+}
+
 }  // namespace
 
 std::map<std::string, std::string> read_safetensors_metadata(const std::string& path) {
@@ -56,7 +78,22 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
     const std::streamoff data_start = 8 + static_cast<std::streamoff>(header_len);
 
     f.seekg(0, std::ios::end);
-    const uint64_t data_size = static_cast<uint64_t>(f.tellg()) - static_cast<uint64_t>(data_start);
+    const uint64_t file_size = static_cast<uint64_t>(f.tellg());
+    const uint64_t data_size = file_size - static_cast<uint64_t>(data_start);
+    uint64_t mapped_size = 0;
+    const std::shared_ptr<const void> mapping = map_file(path, mapped_size);
+    const char* data = mapping && mapped_size == file_size ? static_cast<const char*>(mapping.get()) + data_start : nullptr;
+    // Bytes [at, at + n) of the data section: from the mapping, or read from the file.
+    auto copy = [&](uint64_t at, uint64_t n, void* dst, const std::string& name) {
+        if (n == 0) return;
+        if (data) {
+            std::memcpy(dst, data + at, static_cast<size_t>(n));
+            return;
+        }
+        f.clear();
+        f.seekg(data_start + static_cast<std::streamoff>(at));
+        if (!f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n))) throw std::runtime_error(path + ": cannot read " + name);
+    };
 
     SafeTensors out;
     for (size_t k = 0; k < root.keys.size(); ++k) {
@@ -66,6 +103,7 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
             for (size_t m = 0; m < info.keys.size(); ++m) out.metadata[info.keys[m]] = info.values[m].as_string();
             continue;
         }
+        if (name.rfind("__padding", 0) == 0) continue;  // alignment filler (see the header)
         const std::string& dtype = info.at("dtype").as_string();
         Shape shape;
         for (const auto& d : info.at("shape").array) shape.push_back(d.as_int());
@@ -80,11 +118,7 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
         if (static_cast<uint64_t>(n) > data_size / width || end - begin != static_cast<uint64_t>(n) * width)
             throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
         // Straight into the tensor's own storage: no intermediate byte buffer.
-        f.seekg(data_start + static_cast<std::streamoff>(begin));
-        auto read_into = [&](void* dst) {
-            if (n && !f.read(static_cast<char*>(dst), static_cast<std::streamsize>(end - begin)))
-                throw std::runtime_error(path + ": cannot read " + name);
-        };
+        auto read_into = [&](void* dst) { copy(begin, end - begin, dst, name); };
         if (dtype == "I64") {
             IntTensor t{shape, std::vector<int64_t>(static_cast<size_t>(n))};
             read_into(t.data.data());
@@ -93,15 +127,16 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
         }
         if (take_raw) {
             const uint64_t size = end - begin;
-            const RawTensor raw{dtype, shape, size, [&](uint64_t offset, uint64_t count, void* dst) {
-                                    if (offset > size || count > size - offset)
-                                        throw std::out_of_range(path + ": read past the end of " + name);
-                                    f.seekg(data_start + static_cast<std::streamoff>(begin + offset));
-                                    if (count && !f.read(static_cast<char*>(dst), static_cast<std::streamsize>(count)))
-                                        throw std::runtime_error(path + ": cannot read " + name);
-                                }};
+            RawTensor raw{dtype, shape, size, [&](uint64_t offset, uint64_t count, void* dst) {
+                              if (offset > size || count > size - offset)
+                                  throw std::out_of_range(path + ": read past the end of " + name);
+                              copy(begin + offset, count, dst, name);
+                          }, nullptr, nullptr};
+            if (data) {
+                raw.mapped = data + begin;
+                raw.mapping = mapping;
+            }
             if (take_raw(name, raw)) continue;
-            f.seekg(data_start + static_cast<std::streamoff>(begin));
         }
         std::vector<float> values;
         if (dtype == "F32") {

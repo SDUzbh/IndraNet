@@ -55,6 +55,13 @@ the engine computes them exactly up to that length and refuses longer sequences.
   `--dtype float32|float16|bfloat16`; a matrix with a value outside the asked type's range stays
   float32, with a warning. Norm scales and biases are float32 (Gemma's `1 + w` is folded in
   there). A tied output matrix is stored once. Only one tensor is in memory at a time.
+- **Layout:** the data and every matrix start on a 16 KiB boundary, with small `__padding<k>` U8
+  tensors filling the gaps (safetensors allows no holes). The engine memory-maps the file and uses
+  a matrix in place when it's stored in the type it keeps: F16 under `indra --fp16`, F32 otherwise.
+  `--dtype float16` therefore gives the fastest, leanest `--fp16` loading; bf16 matrices are
+  converted as they're read. Hugging Face's `safetensors` reads these files as they are, with the
+  padding as extra tensors. Engines from before this layout don't know the padding and refuse the
+  files.
 - **Biases:** the config's `bias` names exactly the parts that have them: `true`, `false`, or a list
   such as Qwen2's `["qkv"]` (parts: `qkv`, `o`, `mlp`, `norm`). The engine requires those biases and
   refuses any other. A part that is only partly there (a q bias without k and v) is refused.
