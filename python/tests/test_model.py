@@ -414,7 +414,44 @@ def test_export_fp16(tmp_path):
     assert big["embed.weight"]["dtype"] == "F32" and big["unembed.weight"]["dtype"] == "F16"
 
 
+def test_export_bf16(tmp_path):
+    """dtype="bfloat16" writes 2-D weights as BF16 (the bits of torch's .bfloat16()) and the rest as
+    F32; a weight with a value that rounds to infinity in bf16 stays F32, with a warning."""
+    import numpy as np
+    import warnings
+    from indranet.export import export_model
+    torch.manual_seed(0)
+    model = DecoderLM(tiny(norm="layernorm", bias=True, tie_embeddings=False))
+    export_model(model, tmp_path / "f32.safetensors")
+    export_model(model, tmp_path / "bf16.safetensors", dtype="bfloat16")
+    header = _safetensors_header(tmp_path / "bf16.safetensors")
+    state = model.state_dict()
+    data_start = 8 + len(json_bytes(tmp_path / "bf16.safetensors"))
+    raw = (tmp_path / "bf16.safetensors").read_bytes()
+    assert set(header) - {"__metadata__"} == set(state)
+    for name, t in state.items():
+        info = header[name]
+        assert info["dtype"] == ("BF16" if t.dim() == 2 else "F32"), name
+        begin, end = info["data_offsets"]
+        if t.dim() == 2:
+            bits = np.frombuffer(raw[data_start + begin:data_start + end], dtype=np.int16)
+            assert torch.equal(torch.from_numpy(bits.copy()).reshape(t.shape), t.bfloat16().view(torch.int16)), name
+        else:
+            values = np.frombuffer(raw[data_start + begin:data_start + end], dtype=np.float32)
+            assert torch.equal(torch.from_numpy(values.copy()).reshape(t.shape), t.float()), name
+    assert (tmp_path / "bf16.safetensors").stat().st_size < 0.6 * (tmp_path / "f32.safetensors").stat().st_size
+    with torch.no_grad():
+        model.embed.weight[0, 0] = 1e5  # fine in bf16 (not in fp16) ...
+        model.unembed.weight[0, 0] = torch.finfo(torch.float32).max  # ... but this rounds to infinity
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        export_model(model, tmp_path / "big.safetensors", dtype="bfloat16")
+    assert any("unembed.weight" in str(w.message) and "bf16" in str(w.message) for w in caught)
+    big = _safetensors_header(tmp_path / "big.safetensors")
+    assert big["embed.weight"]["dtype"] == "BF16" and big["unembed.weight"]["dtype"] == "F32"
+
+
 def test_export_rejects_unknown_dtype(tmp_path):
     from indranet.export import export_model
     with pytest.raises(ValueError, match="dtype"):
-        export_model(DecoderLM(tiny()), tmp_path / "m.safetensors", dtype="bfloat16")
+        export_model(DecoderLM(tiny()), tmp_path / "m.safetensors", dtype="int8")

@@ -7,6 +7,7 @@ file fully describes the model.
     from indranet.export import export_model
     export_model(model, "model.safetensors")                     # float32
     export_model(model, "model.safetensors", dtype="float16")    # 2-D weights in fp16: half the file
+    export_model(model, "model.safetensors", dtype="bfloat16")   # 2-D weights in bf16: half the file
 
 Then, from the repository root: ``build/indra info model.safetensors``.
 """
@@ -24,7 +25,7 @@ from torch import Tensor
 from .model import DecoderLM
 
 FORMAT_VERSION = "1"
-_DTYPES = {torch.float32: "F32", torch.float16: "F16", torch.int64: "I64"}
+_DTYPES = {torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16", torch.int64: "I64"}
 FP16_MAX = 65504.0  # largest finite fp16 value
 
 # Components the C++ side implements. Custom registered components cannot be exported.
@@ -45,7 +46,8 @@ def save_safetensors(tensors: Dict[str, Tensor], path: Union[str, Path],
         t = t.detach().cpu().contiguous()
         if t.dtype not in _DTYPES:
             t = t.to(torch.float32)
-        data = t.numpy().tobytes()
+        # numpy has no bfloat16: its values go out as their 16-bit patterns.
+        data = (t.view(torch.int16) if t.dtype == torch.bfloat16 else t).numpy().tobytes()
         header[name] = {"dtype": _DTYPES[t.dtype], "shape": list(t.shape),
                         "data_offsets": [offset, offset + len(data)]}
         blobs.append(data)
@@ -82,9 +84,14 @@ def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Seque
     fp16 value, as ``indra --fp16`` rounds a float32 file; norm scales and biases stay float32. A
     weight with a value outside fp16's range (|v| > 65504, or not finite) stays float32, with a
     warning. ``indra --fp16`` then loads these weights as they are, without converting them.
+
+    ``dtype="bfloat16"`` does the same in bfloat16 (rounded to nearest even, as torch's
+    ``.bfloat16()``): fp32's range, so only a value that rounds to infinity keeps a weight float32,
+    but 8 significant bits instead of fp16's 11. ``indra`` loads these weights as float32, exactly;
+    ``indra --fp16`` converts them to fp16, exactly for every value from about 7.6e-6 to 65504.
     """
-    if dtype not in ("float32", "float16"):
-        raise ValueError(f"dtype must be 'float32' or 'float16', got {dtype!r}")
+    if dtype not in ("float32", "float16", "bfloat16"):
+        raise ValueError(f"dtype must be 'float32', 'float16' or 'bfloat16', got {dtype!r}")
     _check_supported(model)
     if vocab is not None and len(vocab) != model.cfg.vocab_size:
         raise ValueError(f"vocab has {len(vocab)} entries but the model's vocab_size is {model.cfg.vocab_size}")
@@ -103,9 +110,16 @@ def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Seque
                 value = value.half()
             else:
                 kept.append(name)
+        elif dtype == "bfloat16" and value.dim() == 2:
+            rounded = value.bfloat16()
+            if torch.isfinite(rounded).all():
+                value = rounded
+            else:
+                kept.append(name)
         tensors[name] = value
     if kept:
-        warnings.warn(f"kept in float32 (values outside fp16's range): {', '.join(kept)}")
+        kind = "fp16" if dtype == "float16" else "bf16"
+        warnings.warn(f"kept in float32 (values outside {kind}'s range): {', '.join(kept)}")
     save_safetensors(tensors, path, meta)
 
 

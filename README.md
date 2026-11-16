@@ -49,10 +49,14 @@ model = DecoderLM.from_preset("attn_only_2l")   # or any config; see python/READ
 ...                                             # train it
 export_model(model, "model.safetensors")        # FP32 weights + config in one file
 export_model(model, "model.safetensors", dtype="float16")  # weight matrices in fp16: half the file
+export_model(model, "model.safetensors", dtype="bfloat16") # ... or in bf16
 ```
 
 An fp16 file holds the same values `indra --fp16` would round a float32 file to; with `--fp16` it
-loads them as they are.
+loads them as they are. A bf16 file (also the usual format of published checkpoints) loads as
+float32 exactly, or with `--fp16` converted to fp16: exactly, except values under about 7.6e-6 and
+weights with values beyond fp16's range, which stay float32. bf16 has fp32's range but fewer
+significant bits than fp16 (8 against 11).
 
 Or train an example circuit and export it in one go:
 

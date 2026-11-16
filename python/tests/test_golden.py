@@ -94,20 +94,22 @@ def test_cpp_matches_pytorch_presets(tools, tmp_path, name):
 
 @pytest.mark.parametrize("opts", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
                                   dict(tie_embeddings=False, n_kv_heads=2, qk_norm=True), MIXED_HEADS], ids=_id)
-def test_fp16_export_matches_pytorch(tools, tmp_path, opts):
-    """export_model(dtype="float16") files: the C++ side computes what PyTorch computes with the weight
-    matrices rounded to fp16, loading them as float32 and as fp16 (taken from the file as they are)."""
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_half_export_matches_pytorch(tools, tmp_path, opts, dtype):
+    """export_model(dtype="float16" / "bfloat16") files: the C++ side computes what PyTorch computes with
+    the weight matrices rounded to that type, loading them as float32 and as fp16 (fp16 files: taken as
+    they are; bf16 files: converted, which is exact for all but values under about 7.6e-6)."""
     torch.manual_seed(0)
     model = DecoderLM(tiny(**opts))
     with torch.no_grad():
         for b in model.blocks:  # sharpen attention, as _golden does
             b.attn.q_proj.weight.mul_(10)
             b.attn.k_proj.weight.mul_(10)
-    export_model(model, tmp_path / "model.safetensors", dtype="float16")
+    export_model(model, tmp_path / "model.safetensors", dtype=dtype)
     with torch.no_grad():
         for p in model.parameters():
             if p.dim() == 2:
-                p.copy_(p.half().float())
+                p.copy_(p.to(getattr(torch, dtype)).float())
     export_reference(model, torch.randint(0, V, (12,)), tmp_path / "ref.safetensors", metric=(10, 3, 5))
     for fmt in ["fp32", "fp16"]:
         r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors"),

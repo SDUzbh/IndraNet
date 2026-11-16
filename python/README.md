@@ -99,13 +99,16 @@ from indranet.export import export_model
 export_model(model, "model.safetensors")                 # FP32 weights + config in one file
 export_model(model, "model.safetensors", vocab=[...])    # optional: lets indra take --text
 export_model(model, "model.safetensors", dtype="float16")  # weight matrices in fp16: half the file
+export_model(model, "model.safetensors", dtype="bfloat16") # ... or in bf16
 ```
 
 With `dtype="float16"`, every 2-D weight (embeddings, projections, unembedding) is rounded to the
 nearest fp16 value, exactly as `indra --fp16` rounds a float32 file; norm scales and biases stay
 float32. A weight with a value outside fp16's range stays float32, with a warning. The example
 scripts take `--fp16` for the same: `induction_heads.py --export path --fp16` and
-`arithmetic.py export ... --fp16`.
+`arithmetic.py export ... --fp16`. `dtype="bfloat16"` does the same in bf16 (rounded like
+`.bfloat16()`; only a value that rounds to infinity keeps a weight float32); `indra` loads it as
+float32 exactly, and `indra --fp16` converts it to fp16.
 
 Then `build/indra info model.safetensors` from the repository root. Only built-in components can
 be exported; `indranet.export.export_reference` writes the PyTorch activations the golden tests
