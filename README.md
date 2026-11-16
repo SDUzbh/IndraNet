@@ -9,9 +9,13 @@ activation patching (exact, attribution and mixed), ablation, and weight-only ci
 
 The Python package [`indranet`](python/) supplies the models to study. It builds and trains them in
 PyTorch from a single config, with the same hook names as the engine, and exports them in one file.
+[`indranet_hf`](python/indranet_hf/) converts Hugging Face checkpoints. [`tfi`](python/tfi/) gives
+Python the engine itself (numpy in and out), and [`indranet_ui`](python/indranet_ui/) is a local web
+page on top of it for looking at a model: attention, the logit lens, attribution and patching.
 
 ```
 indranet (PyTorch)  --train-->  model  --export_model-->  model.safetensors  -->  indra (C++, tfi engine)
+Hugging Face checkpoint  --indranet_hf-->  model.safetensors  -->  tfi (Python bindings)  -->  indranet_ui (browser)
 ```
 
 | Path | What it is |
@@ -20,6 +24,9 @@ indranet (PyTorch)  --train-->  model  --export_model-->  model.safetensors  -->
 | [tools/indra.cpp](tools/indra.cpp) | The `indra` command line |
 | [tests/](tests/) | C++ unit tests and the golden-test runner |
 | [python/](python/) | The `indranet` package: model building, training helpers, export, its tests |
+| [python/indranet_hf/](python/indranet_hf/) | The Hugging Face converter |
+| [python/tfi/](python/tfi/) | Python bindings for the engine (nanobind), built with `make python` |
+| [python/indranet_ui/](python/indranet_ui/) | The browser UI: `python -m indranet_ui model.safetensors` |
 | [examples/](examples/) | Two circuits trained in Python and reverse-engineered with `indra` |
 
 ## Build
@@ -27,6 +34,7 @@ indranet (PyTorch)  --train-->  model  --export_model-->  model.safetensors  -->
 ```bash
 make            # build/indra (CLI), build/libtfi.a, build/tfi_tests, build/tfi_golden
 make test       # C++ unit tests
+make python     # the Python bindings, python/tfi/_tfi*.so (needs CMake and `pip install nanobind`)
 ```
 
 Or with CMake: `cmake -S . -B build-cmake && cmake --build build-cmake`. On macOS, matrix
@@ -307,6 +315,54 @@ are float32 tensors, read with `f32()`.
 Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accelerate -framework Metal
 -framework MetalPerformanceShaders -framework Foundation`).
 
+## Python bindings
+
+`make python` builds the module `tfi` (with CMake and [nanobind](https://github.com/wjakob/nanobind))
+into [python/tfi/](python/tfi/). It is used from the repository: `pytest` puts `python/` on the
+path; elsewhere, set `PYTHONPATH=python`.
+
+```python
+import tfi
+
+m = tfi.Model.load("model.safetensors", fp16=True)
+t = m.tokenize("When Mary and John went to the store, John gave a drink to")
+logits, cache = m.run_with_cache(t, names=["blocks.9.attn.hook_pattern"])   # numpy float32, (H, T, T)
+
+def knock_out(z, name):                    # a hook gets a copy of the activation; editing it in place,
+    z[:, 7, :] = 0                         # or returning a new array, replaces the activation
+logits = m.forward(t, hooks={"blocks.15.attn.hook_z": knock_out})
+
+mary, john = m.tokenize(" Mary", False)[0], m.tokenize(" John", False)[0]
+dla = tfi.direct_logit_attribution(m, t, pos=-1, target=mary, other=john)     # labels, values, sum, actual
+lens = tfi.lens_grid(m, t)                 # the logit lens at every position, one forward pass
+r = tfi.patch(m, clean, corrupt, "resid_pre", pos=-1, target=mary, other=john, method="mixed")
+```
+
+The functions mirror the C++ API (`logit_lens`, `head_scores`, `patch`, `metric_gradients`,
+`head_ablation`, `composition_scores`, `ov_copying_scores`, `head_weights`, `set_device`, ...).
+Activations come back as numpy arrays that take over the engine's buffers, with no copy, and
+analysis results as dicts. Every engine call releases the GIL, so threads can run it side by side.
+
+## Browser UI
+
+```bash
+make python
+PYTHONPATH=python python3 -m indranet_ui model.safetensors --fp16 --open
+```
+
+This serves a page on `http://127.0.0.1:8765/`. Type a prompt on its landing page and look at the
+model. Give it several files or a folder to choose between models on the page. The results show:
+
+- a token strip, coloured by how surprising each token was, with the top predictions on hover;
+- every head's attention pattern, layer by layer, one enlarged with values on hover;
+- the logit lens at every position;
+- direct logit attribution as a layer × head map and the largest parts;
+- activation patching (exact, attribution or mixed), by layer and position or by head;
+- head scores (induction, previous-token, sink, ...), each head a click away from its pattern.
+
+It needs nothing beyond the bindings and numpy: Python's standard library serves the page and plain
+JavaScript draws it, with no build step. See [python/indranet_ui/](python/indranet_ui/).
+
 ## Correctness
 
 - **Golden tests** (`python/tests/test_golden.py`) export ~130 model configurations and
@@ -408,7 +464,8 @@ build/indra attn arith.safetensors --text "58291+76834=+521531" --layer 0
 
 ```bash
 make test       # C++ unit tests
-pytest          # Python tests, golden tests against PyTorch, the indra CLI and the examples
+pytest          # Python tests, golden tests against PyTorch, the indra CLI, the bindings, the UI server
+                # and the examples (the bindings' and UI's tests build the module; skipped without nanobind)
 ```
 
 The C++ unit tests are in five groups, so part of the suite can run on its own:
@@ -438,7 +495,8 @@ GitHub Actions runs on every push to `main` and every pull request
   and clang on macOS.
 - **sanitizers**: the C++ unit tests, golden tests and CLI on AddressSanitizer +
   UndefinedBehaviorSanitizer builds, and the unit tests under ThreadSanitizer.
-- **python**: the full test suite on Linux and macOS × Python 3.9 and 3.12, plus an end-to-end run
+- **python**: the full test suite on Linux and macOS × Python 3.9 and 3.12 (the bindings included),
+  plus an end-to-end run
   (train the induction model, export it, analyse it with `indra`).
 
 To release, bump `version` in `python/pyproject.toml`, commit, then push a matching tag:
@@ -454,6 +512,7 @@ hyphen, such as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action v
 
 ## Not included (yet)
 
-Loading Hugging Face folders directly in the engine (they go through the converter), sequences past
+A wheel with the compiled bindings (they are built in the repository), loading Hugging Face folders
+directly in the engine (they go through the converter), sequences past
 `original_max_position_embeddings` with `dynamic` or `longrope` RoPE scaling, Unigram and WordPiece
 tokenizers, padding masks for batched prompts of different lengths, and mixture-of-experts layers.

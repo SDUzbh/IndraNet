@@ -1,6 +1,8 @@
 # Build the tfi engine (library), the indra CLI and the test tools with make (no CMake needed).
 #   make            -> build/libtfi.a build/indra build/tfi_golden build/tfi_tests
 #   make test       -> C++ unit tests (golden tests against PyTorch run from pytest)
+#   make python     -> the Python bindings, python/tfi/_tfi*.so (CMake + nanobind: pip install nanobind;
+#                      PYTHON=... picks the interpreter, python3 by default)
 #   make test GROUPS=gpu,fp16 FILTER=attention -> only those groups / tests whose name contains the text
 #                      (groups: core analysis grad fp16 gpu; build/tfi_tests --list shows them)
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
@@ -46,7 +48,12 @@ $(BUILD)/tfi_tests: tests/unit.cpp $(BUILD)/libtfi.a $(HEADERS)
 test: $(BUILD)/tfi_tests
 	$(BUILD)/tfi_tests $(if $(GROUPS),--group $(GROUPS)) $(if $(FILTER),--filter "$(FILTER)")
 
+PYTHON ?= python3
+python:
+	cmake -S . -B $(BUILD)/python -DTFI_PYTHON=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$$(command -v $(PYTHON))" >/dev/null
+	cmake --build $(BUILD)/python --target _tfi --parallel
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean
+.PHONY: all test python clean

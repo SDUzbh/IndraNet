@@ -11,8 +11,12 @@ requires-python = ">=3.9"
 dependencies = ["torch>=2.1", "numpy"]
 
 [project.optional-dependencies]
-dev = ["pytest", "transformers"]   # transformers: the Hugging Face converter's golden tests
+dev = ["pytest", "transformers", "nanobind"]   # transformers: the converter's golden tests; nanobind: the tfi bindings' build
 hf = ["huggingface_hub"]           # indranet_hf downloading from the Hub (local folders need only numpy)
 
 [tool.setuptools.packages.find]
 include = ["indranet*"]
+# The tfi bindings (python/tfi) are a compiled module built in the repository with `make python`, and
+# the UI runs on them: both are used from the repository (pytest.ini puts python/ on the path), not
+# shipped in the wheel.
+exclude = ["indranet_ui*"]

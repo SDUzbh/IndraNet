@@ -1,0 +1,232 @@
+"""The Python bindings (python/tfi): built with `make python`, checked against PyTorch and the engine's own
+invariants. Skipped when CMake or nanobind is missing."""
+import importlib.util
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from indranet import DecoderLM, ModelConfig
+from indranet.export import export_model
+
+ROOT = Path(__file__).resolve().parents[2]
+V = 61
+
+pytestmark = pytest.mark.skipif(shutil.which("cmake") is None or importlib.util.find_spec("nanobind") is None,
+                                reason="needs CMake and nanobind (pip install nanobind)")
+
+
+@pytest.fixture(scope="module")
+def tfi():
+    subprocess.run(["make", "-s", "-C", str(ROOT), "python", f"PYTHON={sys.executable}"], check=True,
+                   stdout=subprocess.DEVNULL)
+    import tfi
+    return tfi
+
+
+def tiny(**kw) -> ModelConfig:
+    base = dict(vocab_size=V, d_model=32, n_layers=2, n_heads=4, max_seq_len=64)
+    base.update(kw)
+    return ModelConfig(**base)
+
+
+def exported(tmp_path, name="m", vocab=None, **kw):
+    torch.manual_seed(0)
+    model = DecoderLM(tiny(**kw)).eval()
+    path = tmp_path / f"{name}.safetensors"
+    export_model(model, path, vocab=vocab)
+    return model, path
+
+
+TOKENS = [5, 9, 13, 2, 7, 5, 9, 13, 2]
+CORRUPT = [5, 9, 40, 2, 7, 5, 9, 13, 2]
+
+
+@pytest.mark.parametrize("kw", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
+                                dict(n_kv_heads=2, qk_norm=True, layer_overrides={1: {"n_heads": 2}})],
+                         ids=["llama", "gpt2", "mixed"])
+def test_forward_and_cache_match_pytorch(tfi, tmp_path, kw):
+    model, path = exported(tmp_path, **kw)
+    m = tfi.Model.load(str(path))
+    assert m.n_layers == 2 and m.vocab_size == V and m.d_model == 32
+    assert m.layer_heads == [4, 2 if "layer_overrides" in kw else 4]
+    assert sorted(m.hook_names()) == sorted(model.hook_names())
+    with torch.no_grad():
+        out, ref = model.run_with_cache(torch.tensor([TOKENS]))
+    logits, cache = m.run_with_cache(TOKENS)
+    assert logits.dtype == np.float32 and logits.shape == (len(TOKENS), V)
+    np.testing.assert_allclose(logits, out.logits[0].numpy(), atol=1e-4)
+    np.testing.assert_allclose(m.forward(TOKENS), logits, atol=0)
+    assert set(cache) == set(ref)
+    for name, act in ref.items():  # PyTorch's have a batch dimension (but hook_pos_embed's)
+        a = act.numpy()
+        np.testing.assert_allclose(cache[name], a[0] if a.ndim == cache[name].ndim + 1 else a, atol=1e-4, err_msg=name)
+    some = ["blocks.1.attn.hook_pattern", "hook_final"]
+    _, part = m.run_with_cache(TOKENS, names=some)
+    assert sorted(part) == sorted(some)
+    with pytest.raises(ValueError, match="no hook point named"):
+        m.run_with_cache(TOKENS, names=["blocks.9.hook_resid_pre"])
+
+
+def test_hooks(tfi, tmp_path):
+    model, path = exported(tmp_path)
+    m = tfi.Model.load(str(path))
+    _, cache = m.run_with_cache(TOKENS)
+
+    def zero_head(z, name):  # in place
+        z[:, 1, :] = 0
+
+    def zero_head_returned(z, name):  # by returning a new array (float64 is converted)
+        z = z.astype(np.float64)
+        z[:, 1, :] = 0
+        return z
+
+    def torch_zero(z, name):
+        z = z.clone()
+        z[:, :, 1, :] = 0
+        return z
+
+    with torch.no_grad(), model.hooks({"blocks.0.attn.hook_z": torch_zero}):
+        want = model(torch.tensor([TOKENS])).logits[0].numpy()
+    for fn in (zero_head, zero_head_returned):
+        got = m.forward(TOKENS, hooks={"blocks.0.attn.hook_z": fn})
+        np.testing.assert_allclose(got, want, atol=1e-4)
+    # The hook sees the activation as it is at that point, and its name.
+    seen = {}
+    m.forward(TOKENS, hooks={"blocks.1.hook_resid_pre": lambda a, n: seen.update({n: a.copy()})})
+    np.testing.assert_allclose(seen["blocks.1.hook_resid_pre"], cache["blocks.1.hook_resid_pre"], atol=0)
+    # run_with_cache stores activations after the hooks ran.
+    _, hooked = m.run_with_cache(TOKENS, names=["blocks.0.attn.hook_z"], hooks={"blocks.0.attn.hook_z": zero_head})
+    assert not hooked["blocks.0.attn.hook_z"][:, 1].any()
+    # forward_from with block 1's cached input reproduces forward.
+    np.testing.assert_allclose(m.forward_from(1, cache["blocks.1.hook_resid_pre"]), m.forward(TOKENS), atol=1e-5)
+    np.testing.assert_allclose(m.embed(TOKENS), cache["blocks.0.hook_resid_pre"], atol=0)
+    final = m.final_norm(cache["blocks.1.hook_resid_post"])
+    np.testing.assert_allclose(m.logits_from_final(final), m.forward(TOKENS), atol=1e-5)
+
+    with pytest.raises(ValueError, match="boom"):
+        m.forward(TOKENS, hooks={"hook_embed": lambda a, n: (_ for _ in ()).throw(ValueError("boom"))})
+    with pytest.raises(ValueError, match="returned shape"):
+        m.forward(TOKENS, hooks={"hook_embed": lambda a, n: a[:2]})
+    with pytest.raises(ValueError, match="no hook point named"):
+        m.forward(TOKENS, hooks={"hook_nope": zero_head})
+    with pytest.raises(ValueError, match="not callable"):
+        m.forward(TOKENS, hooks={"hook_embed": 3})
+
+
+def test_analyses(tfi, tmp_path):
+    model, path = exported(tmp_path)
+    m = tfi.Model.load(str(path))
+    logits = m.forward(TOKENS)
+    T = len(TOKENS)
+
+    # Logit lens: lens_grid at each position agrees with logit_lens; its last stage is the model's output.
+    grid = tfi.lens_grid(m, TOKENS, k=4)
+    assert grid["stages"] == ["embed", "L0.attn", "L0.mlp", "L1.attn", "L1.mlp"]
+    assert grid["top_tokens"].shape == (5, T, 4) and grid["top_tokens"].dtype == np.int64
+    for pos in (0, 4, T - 1):
+        entries = tfi.logit_lens(m, TOKENS, pos=pos, target=7, k=4)
+        for s, e in enumerate(entries):
+            assert e["stage"] == grid["stages"][s]
+            assert list(grid["top_tokens"][s, pos]) == e["top_tokens"]
+            np.testing.assert_allclose(grid["top_probs"][s, pos], e["top_probs"], atol=1e-6)
+    p = np.exp(logits - logits.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    np.testing.assert_allclose(grid["next_prob"][-1, :-1], p[np.arange(T - 1), TOKENS[1:]], atol=1e-5)
+    assert np.isnan(grid["next_prob"][:, -1]).all() and (grid["next_rank"][:, -1] == -1).all()
+    assert tfi.logit_lens(m, TOKENS, pos=-1)[-1]["top_tokens"][0] == int(logits[-1].argmax())
+
+    # DLA sums to the logit difference.
+    d = tfi.direct_logit_attribution(m, TOKENS, pos=-1, target=7, other=3)
+    assert len(d["labels"]) == len(d["values"])
+    assert d["actual"] == pytest.approx(float(logits[-1, 7] - logits[-1, 3]), abs=1e-4)
+    assert d["sum"] == pytest.approx(d["actual"], abs=1e-4)
+    assert tfi.logit_metric(logits, T - 1, 7, 3) == pytest.approx(d["actual"], abs=1e-5)
+
+    # Patching the last residual stream at the measured position restores the clean metric exactly.
+    r = tfi.patch(m, TOKENS, CORRUPT, "resid_post", pos=-1, target=7, other=3)
+    assert r["values"].shape == (2, T) and r["row_labels"] == ["L0", "L1"] and r["normalized"]
+    assert r["values"][1, -1] == pytest.approx(1.0, abs=1e-4)
+    heads = tfi.patch(m, TOKENS, CORRUPT, "heads", pos=-1, target=7, other=3, method="mixed", verify=3)
+    assert heads["values"].shape == (2, 4) and heads["exact"].sum() == 3 and heads["estimate"].shape == (2, 4)
+    atp = tfi.patch(m, TOKENS, CORRUPT, "resid_pre", pos=-1, target=7, other=3, method="attribution", steps=2)
+    assert atp["effect"].shape == (2, T)
+    with pytest.raises(ValueError, match="method must be"):
+        tfi.patch(m, TOKENS, CORRUPT, "heads", pos=-1, target=7, method="fast")
+
+    # Zero-ablating a head is the loss of the model with that head's hook_z zeroed.
+    abl = tfi.head_ablation(m, TOKENS, mode="zero")
+    assert abl.shape == (2, 4)
+    base = tfi.next_token_loss(logits, TOKENS)
+
+    def zero(z, name):
+        z[:, 2, :] = 0
+    ablated = tfi.next_token_loss(m.forward(TOKENS, hooks={"blocks.1.attn.hook_z": zero}), TOKENS)
+    assert abl[1, 2] == pytest.approx(ablated - base, abs=1e-4)
+
+    metric, grads = tfi.metric_gradients(m, TOKENS, pos=-1, target=7, other=3, names=["blocks.1.hook_resid_post"])
+    assert metric == pytest.approx(d["actual"], abs=1e-4) and grads["blocks.1.hook_resid_post"].shape == (T, 32)
+    assert not grads["blocks.1.hook_resid_post"][:-1].any()  # only the measured position matters there
+
+    scores = tfi.head_scores(m, segment_len=6, n_samples=2)
+    assert scores["induction"].shape == (2, 4) and len(scores["top_two_hop"]) > 0
+    comp = tfi.composition_scores(m)
+    assert len(comp["labels"]) == 8 and comp["q"].shape == (8, 8)
+    assert tfi.ov_copying_scores(m, max_tokens=32).shape == (2, 4)
+    w = tfi.head_weights(m, 0, 1)
+    assert w["W_Q"].shape == (8, 32) and w["W_O"].shape == (32, 8)
+    state = model.state_dict()
+    for name in ("blocks.0.attn.o_proj.weight", "blocks.1.ln1.weight"):
+        np.testing.assert_allclose(m.weight(name), state[name].numpy(), atol=0)
+    assert "embed.weight" in m.weight_names()
+    with pytest.raises(IndexError):
+        tfi.logit_lens(m, TOKENS, pos=T)
+
+
+def test_vocab_tokenizer_and_settings(tfi, tmp_path):
+    vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
+    _, path = exported(tmp_path, vocab=vocab)
+    m = tfi.Model.load(str(path), fp16=True)
+    assert m.fp16 and not m.has_tokenizer and m.vocab == vocab
+    assert m.tokenize("abc") == [0, 1, 2] and m.token_str(2) == "c"
+    meta = tfi.read_metadata(str(path))
+    assert meta["format"] == "indranet" and "config" in meta
+    tok = tfi.Tokenizer.from_json('{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"]}}')
+    assert tok.encode("abab") == [2, 2]
+    before = tfi.device()
+    try:
+        tfi.set_device("cpu")
+        assert tfi.device() == "cpu"
+        with pytest.raises(ValueError, match="device must be"):
+            tfi.set_device("tpu")
+    finally:
+        tfi.set_device(before)
+    threads = tfi.num_threads()
+    tfi.set_num_threads(2)
+    assert tfi.num_threads() == 2
+    tfi.set_num_threads(threads)
+
+
+def test_releases_the_gil(tfi, tmp_path):
+    """Two threads run the engine at once and get the same answers as one after the other."""
+    _, path = exported(tmp_path, d_model=64, n_layers=4, max_seq_len=512)
+    m = tfi.Model.load(str(path))
+    seq = list(np.random.default_rng(0).integers(0, V, 256))
+    want = m.forward(seq)
+    out = [None, None]
+
+    def work(i):
+        out[i] = m.forward(seq)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for o in out:
+        np.testing.assert_allclose(o, want, atol=0)

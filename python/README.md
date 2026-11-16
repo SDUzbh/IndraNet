@@ -139,3 +139,5 @@ The tests cover a grid of norm × position × encoding × MLP combinations plus 
 window, softcaps, parallel residual and layer overrides. Each combination is checked for causality,
 KV-cache vs full-forward equality, and fused vs explicit attention equality.
 `python/tests/test_golden.py` builds the engine and checks it against PyTorch on every hook point.
+`python/tests/test_tfi.py` builds the Python bindings (`make python`; needs `pip install nanobind`)
+and checks them against PyTorch, and `python/tests/test_ui.py` checks the UI server's API over HTTP.
