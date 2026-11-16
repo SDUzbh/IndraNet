@@ -7,6 +7,7 @@ per-head fused q/k/v). Those rules live here, one place per family.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -31,11 +32,11 @@ class Out:
 # Every field of IndraNet's ModelConfig that the engine reads (the training-only ones are left out).
 CONFIG_FIELDS = (
     "vocab_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "d_head", "d_mlp", "mlp_multiple_of",
-    "max_seq_len", "norm", "norm_eps", "norm_position", "positional", "rope_theta", "rope_fraction",
+    "max_seq_len", "norm", "norm_eps", "norm_position", "positional", "rope_theta", "rope_fraction", "rope_scaling",
     "attention", "mlp", "activation", "qk_norm", "sliding_window", "attn_scale", "attn_logit_softcap",
     "parallel_residual", "bias", "tie_embeddings", "embed_scale", "final_logit_softcap", "layer_overrides",
 )
-PER_LAYER = ("sliding_window", "rope_theta")  # what can differ between layers of a converted model
+PER_LAYER = ("sliding_window", "rope_theta", "rope_scaling")  # what can differ between layers of a converted model
 
 ACTIVATIONS = {
     "silu": "silu", "swish": "silu", "gelu": "gelu", "gelu_new": "gelu_tanh", "gelu_pytorch_tanh": "gelu_tanh",
@@ -55,7 +56,8 @@ def activation(name: Optional[str]) -> str:
 def base_config(**kw) -> dict:
     cfg = dict(vocab_size=0, d_model=0, n_layers=0, n_heads=0, n_kv_heads=None, d_head=None, d_mlp=None,
                mlp_multiple_of=64, max_seq_len=2048, norm="rmsnorm", norm_eps=1e-6, norm_position="pre",
-               positional="rope", rope_theta=10000.0, rope_fraction=1.0, attention="causal", mlp="swiglu",
+               positional="rope", rope_theta=10000.0, rope_fraction=1.0, rope_scaling=None, attention="causal",
+               mlp="swiglu",
                activation="silu", qk_norm=False, sliding_window=None, attn_scale=None, attn_logit_softcap=None,
                parallel_residual=False, bias=False, tie_embeddings=False, embed_scale=False,
                final_logit_softcap=None, layer_overrides={})
@@ -64,9 +66,9 @@ def base_config(**kw) -> dict:
     return cfg
 
 
-def rope(hf: dict, layer_type: str = "full_attention") -> Tuple[float, float]:
-    """(theta, rotated fraction) for one layer type. Reads both the older config keys (rope_theta,
-    rope_scaling, rotary_pct, rope_local_base_freq) and the newer rope_parameters."""
+def rope(hf: dict, layer_type: str = "full_attention") -> Tuple[float, float, Optional[dict]]:
+    """(theta, rotated fraction, IndraNet rope_scaling) for one layer type. Reads both the older config
+    keys (rope_theta, rope_scaling, rotary_pct, rope_local_base_freq) and the newer rope_parameters."""
     rp = hf.get("rope_parameters")
     local = None
     if isinstance(rp, dict) and isinstance(rp.get(layer_type), dict):
@@ -75,25 +77,51 @@ def rope(hf: dict, layer_type: str = "full_attention") -> Tuple[float, float]:
         rp = hf.get("rope_scaling") or {}
         if layer_type == "sliding_attention" and "rope_local_base_freq" in hf:
             local, rp = hf["rope_local_base_freq"], {}  # Gemma 3: the scaling is for global layers only
-    kind = rp.get("rope_type", rp.get("type", "default"))
-    if kind == "linear" and float(rp.get("factor", 1.0)) == 1.0:
-        kind = "default"
-    if kind != "default":
-        raise Unsupported(f"RoPE scaling {kind!r} (rope_scaling / rope_parameters) is not implemented by IndraNet's "
-                          "engine yet; only plain RoPE is")
     theta = local or rp.get("rope_theta") or hf.get("rope_theta") or hf.get("rotary_emb_base") or 10000.0
     frac = rp.get("partial_rotary_factor", hf.get("partial_rotary_factor", hf.get("rotary_pct", 1.0)))
-    return float(theta), float(frac)
+    return float(theta), float(frac), rope_scaling(hf, rp)
+
+
+def rope_scaling(hf: dict, rp: dict) -> Optional[dict]:
+    """IndraNet's rope_scaling for a Hugging Face one, with the values transformers 4.57 reads (its
+    modeling_rope_utils): the defaults it falls back on are made explicit."""
+    kind = rp.get("rope_type", rp.get("type", "default"))
+    kind = {"su": "longrope"}.get(kind, kind)  # Phi-3's older name
+    keep = lambda *keys: {k: rp[k] for k in keys if rp.get(k) is not None}
+    max_pos = hf.get("max_position_embeddings")
+    if kind == "default" or (kind == "linear" and float(rp.get("factor", 1.0)) == 1.0):
+        return None
+    if kind == "linear":
+        return {"type": "linear", "factor": float(rp["factor"])}
+    if kind == "dynamic":  # transformers: plain RoPE until a sequence passes max_position_embeddings
+        return {"type": "dynamic", "factor": float(rp["factor"]), "original_max_position_embeddings": max_pos}
+    if kind == "llama3":
+        return {"type": "llama3", **keep("factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings")}
+    if kind == "yarn":
+        return {"type": "yarn", "factor": float(rp["factor"]),
+                "original_max_position_embeddings": rp.get("original_max_position_embeddings") or max_pos,
+                **keep("beta_fast", "beta_slow", "mscale", "mscale_all_dim", "attention_factor", "truncate")}
+    if kind == "longrope":
+        out = {"type": "longrope", "short_factor": [float(f) for f in rp["short_factor"]]}
+        orig = hf.get("original_max_position_embeddings")
+        if orig:  # transformers then takes the factor from the two lengths
+            out.update(original_max_position_embeddings=orig, factor=max_pos / orig)
+        else:
+            out.update(original_max_position_embeddings=max_pos, **keep("factor"))
+        out.update(keep("attention_factor"))
+        return out
+    raise Unsupported(f"RoPE scaling {kind!r} (rope_scaling / rope_parameters) is not implemented by IndraNet's engine; "
+                      "supported: linear, dynamic, llama3, yarn, longrope")
 
 
 def with_layers(cfg: dict, layers: Sequence[dict]) -> dict:
     """Set the per-layer fields: the most common setting model-wide, the rest as layer_overrides."""
-    keys = [tuple(sorted(l.items())) for l in layers]
-    common = Counter(keys).most_common(1)[0][0]
-    cfg.update(dict(common))
+    keys = [json.dumps(l, sort_keys=True) for l in layers]  # dicts (rope_scaling) are not hashable
+    common = json.loads(Counter(keys).most_common(1)[0][0])
+    cfg.update(common)
     cfg["layer_overrides"] = {}
-    for i, k in enumerate(keys):
-        diff = {name: v for name, v in k if dict(common)[name] != v}
+    for i, l in enumerate(layers):
+        diff = {name: v for name, v in l.items() if common[name] != v}
         if diff:
             cfg["layer_overrides"][str(i)] = diff
     return cfg
@@ -177,8 +205,9 @@ class LlamaStyle:
             tie_embeddings=bool(hf.get("tie_word_embeddings", self.tie)), embed_scale=self.gemma > 0)
         window, layers = self.window(hf), []
         for t in self.layer_types(hf):
-            theta, frac = rope(hf, t)
-            layers.append({"sliding_window": window if t == "sliding_attention" else None, "rope_theta": theta})
+            theta, frac, scaling = rope(hf, t)
+            layers.append({"sliding_window": window if t == "sliding_attention" else None, "rope_theta": theta,
+                           "rope_scaling": scaling})
             cfg["rope_fraction"] = frac
         return with_layers(cfg, layers)
 
@@ -267,12 +296,13 @@ class GPT2:
 
 class NeoX:
     def config(self, hf: dict) -> dict:
-        theta, frac = rope(hf)
+        theta, frac, scaling = rope(hf)
         d, H = hf["hidden_size"], hf["num_attention_heads"]
         return base_config(
             vocab_size=hf["vocab_size"], d_model=d, n_layers=hf["num_hidden_layers"], n_heads=H, n_kv_heads=H,
             d_head=d // H, d_mlp=hf["intermediate_size"], max_seq_len=hf.get("max_position_embeddings") or 2048,
             norm="layernorm", norm_eps=float(hf.get("layer_norm_eps", 1e-5)), rope_theta=theta, rope_fraction=frac,
+            rope_scaling=scaling,
             mlp="mlp", activation=activation(hf.get("hidden_act", "gelu")),
             parallel_residual=bool(hf.get("use_parallel_residual", True)),
             tie_embeddings=bool(hf.get("tie_word_embeddings", False)))

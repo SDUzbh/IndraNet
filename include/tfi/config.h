@@ -5,10 +5,27 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "tfi/json.h"
 
 namespace tfi {
+
+// RoPE frequency scaling, as Hugging Face's rope_scaling (indranet.config.ROPE_SCALING). Unused
+// fields keep their defaults; rope_frequencies (src/ops.h) turns it into frequencies.
+struct RopeScaling {
+    std::string type;                             // linear | dynamic | llama3 | yarn | longrope
+    std::optional<double> factor;
+    int64_t original_max_position_embeddings = 0;
+    double low_freq_factor = 1.0, high_freq_factor = 4.0;    // llama3
+    double beta_fast = 32.0, beta_slow = 1.0;                 // yarn
+    std::optional<double> mscale, mscale_all_dim;             // yarn
+    std::optional<double> attention_factor;                   // yarn, longrope
+    bool truncate = true;                                     // yarn
+    std::vector<double> short_factor;                         // longrope
+
+    static RopeScaling from_json(const json::Value& v);
+};
 
 struct ModelConfig {
     int64_t vocab_size = 32000;
@@ -27,6 +44,7 @@ struct ModelConfig {
     std::string positional = "rope";
     double rope_theta = 10000.0;
     double rope_fraction = 1.0;
+    std::optional<RopeScaling> rope_scaling;
     std::string attention = "causal";
     std::string mlp = "swiglu";
     std::string activation = "gelu";

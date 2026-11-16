@@ -22,6 +22,34 @@ GLOBAL_FIELDS = frozenset({
 })
 
 
+# rope_scaling: {"type": ..., plus that type's keys}. The formulas are Hugging Face transformers'
+# (indranet.layers.positional.rope_frequencies). (required keys, optional keys) per type:
+ROPE_SCALING = {
+    "linear": ({"factor"}, set()),
+    "dynamic": ({"factor", "original_max_position_embeddings"}, set()),
+    "llama3": ({"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}, set()),
+    "yarn": ({"factor", "original_max_position_embeddings"},
+             {"beta_fast", "beta_slow", "mscale", "mscale_all_dim", "attention_factor", "truncate"}),
+    "longrope": ({"short_factor", "original_max_position_embeddings"}, {"factor", "attention_factor"}),
+}
+
+
+def check_rope_scaling(s: Optional[Dict[str, Any]]) -> None:
+    if s is None:
+        return
+    if not isinstance(s, dict) or s.get("type") not in ROPE_SCALING:
+        raise ValueError(f"rope_scaling must be None or a dict with 'type' one of {sorted(ROPE_SCALING)}, got {s!r}")
+    required, optional = ROPE_SCALING[s["type"]]
+    keys = set(s) - {"type"}
+    if required - keys or keys - required - optional:
+        raise ValueError(f"rope_scaling '{s['type']}' takes {sorted(required)} and optionally {sorted(optional)}, "
+                         f"got {sorted(keys)}")
+    if s["type"] == "llama3" and not s["low_freq_factor"] < s["high_freq_factor"]:
+        raise ValueError("rope_scaling 'llama3' needs low_freq_factor < high_freq_factor")
+    if "factor" in required and not s["factor"] > 0:
+        raise ValueError("rope_scaling factor must be positive")
+
+
 @dataclass
 class ModelConfig:
     # --- sizes -------------------------------------------------------------
@@ -42,6 +70,7 @@ class ModelConfig:
     positional: str = "rope"              # rope | alibi | learned | sinusoidal | none
     rope_theta: float = 10000.0
     rope_fraction: float = 1.0            # fraction of each head's dims that get rotated
+    rope_scaling: Optional[Dict[str, Any]] = None  # RoPE frequency scaling, as Hugging Face's (ROPE_SCALING)
     attention: str = "causal"
     mlp: str = "swiglu"                   # mlp | glu | swiglu | geglu | none
     activation: str = "gelu"              # used by "mlp" and "glu"
@@ -98,6 +127,7 @@ class ModelConfig:
             raise ValueError("rope_fraction must be in (0, 1]")
         if self.sliding_window is not None and self.sliding_window < 1:
             raise ValueError("sliding_window must be >= 1")
+        check_rope_scaling(self.rope_scaling)
 
     # --- derived sizes --------------------------------------------------------
     @property

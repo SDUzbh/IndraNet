@@ -1,5 +1,6 @@
 #include "tfi/config.h"
 
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -22,6 +23,49 @@ std::optional<double> opt_num(const json::Value& v) {
 const std::set<std::string> kTrainingOnly = {"use_sdpa", "dropout", "attn_dropout", "init_std", "scale_residual_init"};
 
 }  // namespace
+
+RopeScaling RopeScaling::from_json(const json::Value& v) {
+    if (!v.is_object()) throw std::runtime_error("config: rope_scaling must be null or an object");
+    RopeScaling r;
+    r.type = v.at("type").as_string();
+    // (required, optional) keys per type, as indranet.config.ROPE_SCALING
+    static const std::map<std::string, std::pair<std::set<std::string>, std::set<std::string>>> kKeys = {
+        {"linear", {{"factor"}, {}}},
+        {"dynamic", {{"factor", "original_max_position_embeddings"}, {}}},
+        {"llama3", {{"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}, {}}},
+        {"yarn", {{"factor", "original_max_position_embeddings"},
+                  {"beta_fast", "beta_slow", "mscale", "mscale_all_dim", "attention_factor", "truncate"}}},
+        {"longrope", {{"short_factor", "original_max_position_embeddings"}, {"factor", "attention_factor"}}},
+    };
+    auto it = kKeys.find(r.type);
+    if (it == kKeys.end()) throw std::runtime_error("config: rope_scaling type '" + r.type + "' is not supported by tfi");
+    for (const std::string& k : it->second.first)
+        if (!v.find(k)) throw std::runtime_error("config: rope_scaling '" + r.type + "' needs '" + k + "'");
+    for (size_t i = 0; i < v.keys.size(); ++i) {
+        const std::string& k = v.keys[i];
+        const json::Value& x = v.values[i];
+        if (k == "type") continue;
+        if (!it->second.first.count(k) && !it->second.second.count(k))
+            throw std::runtime_error("config: rope_scaling '" + r.type + "' has unknown key '" + k + "'");
+        if (k == "factor") r.factor = opt_num(x);
+        else if (k == "original_max_position_embeddings") r.original_max_position_embeddings = x.as_int();
+        else if (k == "low_freq_factor") r.low_freq_factor = x.as_number();
+        else if (k == "high_freq_factor") r.high_freq_factor = x.as_number();
+        else if (k == "beta_fast") { if (!x.is_null()) r.beta_fast = x.as_number(); }
+        else if (k == "beta_slow") { if (!x.is_null()) r.beta_slow = x.as_number(); }
+        else if (k == "mscale") r.mscale = opt_num(x);
+        else if (k == "mscale_all_dim") r.mscale_all_dim = opt_num(x);
+        else if (k == "attention_factor") r.attention_factor = opt_num(x);
+        else if (k == "truncate") r.truncate = x.as_bool();
+        else if (k == "short_factor") for (const auto& e : x.array) r.short_factor.push_back(e.as_number());
+    }
+    if (it->second.first.count("factor") && !(r.factor && *r.factor > 0))
+        throw std::runtime_error("config: rope_scaling factor must be positive");
+    if (r.type == "llama3" && !(r.low_freq_factor < r.high_freq_factor))
+        throw std::runtime_error("config: rope_scaling 'llama3' needs low_freq_factor < high_freq_factor");
+    if (r.original_max_position_embeddings < 0) throw std::runtime_error("config: original_max_position_embeddings < 0");
+    return r;
+}
 
 std::string ModelConfig::mlp_activation() const {
     if (mlp == "swiglu") return "silu";
@@ -49,6 +93,7 @@ void ModelConfig::apply(const json::Value& f) {
         else if (k == "positional") positional = v.as_string();
         else if (k == "rope_theta") rope_theta = v.as_number();
         else if (k == "rope_fraction") rope_fraction = v.as_number();
+        else if (k == "rope_scaling") rope_scaling = v.is_null() ? std::nullopt : std::optional<RopeScaling>(RopeScaling::from_json(v));
         else if (k == "attention") attention = v.as_string();
         else if (k == "mlp") mlp = v.as_string();
         else if (k == "activation") activation = v.as_string();

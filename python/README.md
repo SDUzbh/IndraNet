@@ -31,6 +31,7 @@ text = model.generate(prompt, max_new_tokens=50, temperature=0.8, top_p=0.9)
 |---|---|---|
 | Norm | `norm`, `norm_position` | `rmsnorm` / `layernorm` / `none`; `pre` / `post` / `sandwich` |
 | Positions | `positional` | `rope` / `alibi` / `learned` / `sinusoidal` / `none` (NoPE); `rope_theta`, `rope_fraction` (partial rotary) |
+| | `rope_scaling` | None, or Hugging Face's RoPE scaling: `{"type": "linear" / "dynamic" / "llama3" / "yarn" / "longrope", ...}` (keys in `indranet.config.ROPE_SCALING`) |
 | Attention | `n_kv_heads`, `d_head` | MHA (None), GQA (k), MQA (1); head size independent of `d_model` |
 | | `qk_norm`, `sliding_window`, `attn_logit_softcap`, `attn_scale` | |
 | MLP | `mlp`, `activation`, `d_mlp` | `swiglu` / `geglu` / `glu` / `mlp` / `none`; `gelu`, `gelu_tanh`, `relu`, `relu2`, `silu`, `tanh` |
@@ -42,6 +43,12 @@ Presets: `llama`, `gpt2`, `vanilla` (original post-LN Transformer), `gemma2`,
 `attn_only_2l`, `gelu_2l` (small interpretability models), `tiny`.
 
 Configs validate on creation and round-trip through JSON (`cfg.save(path)`, `ModelConfig.load(path)`).
+
+`rope_scaling` uses transformers' formulas, so a converted Llama 3.1, Phi-3.5 or Gemma 3 computes
+what it does there. Two types change their frequencies once a sequence is longer than
+`original_max_position_embeddings`: `dynamic` (plain RoPE up to that length) and `longrope` (its
+short factors up to there). Both the model and the engine compute those exactly up to that length
+and refuse longer sequences.
 
 ## Adding your own components
 

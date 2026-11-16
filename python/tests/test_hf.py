@@ -115,11 +115,47 @@ def test_newer_rope_parameters():
     assert translate_config(hf)["rope_theta"] == 500000.0
 
 
-@pytest.mark.parametrize("scaling", [{"rope_type": "llama3", "factor": 8.0}, {"type": "linear", "factor": 4.0},
-                                     {"rope_type": "yarn", "factor": 4.0}])
-def test_rope_scaling_is_refused(scaling):
-    with pytest.raises(Unsupported, match="RoPE scaling"):
-        translate_config(dict(LLAMA2_7B, rope_scaling=scaling))
+LLAMA31_SCALING = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                   "original_max_position_embeddings": 8192}
+
+
+def test_rope_scaling_configs():
+    c = translate_config(dict(LLAMA2_7B, rope_theta=500000.0, max_position_embeddings=131072, rope_scaling=LLAMA31_SCALING))
+    assert c["rope_scaling"] == {"type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                                 "original_max_position_embeddings": 8192}
+    ModelConfig.from_dict(c)
+    # transformers' defaults made explicit; unset optional values left out
+    yarn = translate_config(dict(LLAMA2_7B, rope_scaling={"rope_type": "yarn", "factor": 4.0, "beta_fast": None}))
+    assert yarn["rope_scaling"] == {"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 4096}
+    dyn = translate_config(dict(LLAMA2_7B, rope_scaling={"type": "dynamic", "factor": 2.0}))
+    assert dyn["rope_scaling"] == {"type": "dynamic", "factor": 2.0, "original_max_position_embeddings": 4096}
+    assert translate_config(dict(LLAMA2_7B, rope_scaling={"type": "linear", "factor": 1.0}))["rope_scaling"] is None
+    # Phi-3.5: lengths at the top level set the factor; "su" is longrope's older name
+    phi = dict(model_type="phi3", hidden_size=3072, intermediate_size=8192, num_attention_heads=32, num_hidden_layers=2,
+               vocab_size=32064, max_position_embeddings=131072, original_max_position_embeddings=4096,
+               rope_scaling={"type": "su", "short_factor": [1.0] * 48, "long_factor": [2.0] * 48})
+    r = translate_config(phi)["rope_scaling"]
+    assert (r["type"], r["factor"], r["original_max_position_embeddings"], len(r["short_factor"])) == ("longrope", 32.0, 4096, 48)
+    assert "long_factor" not in r  # past original_max_position_embeddings, which the engine refuses
+
+
+def test_gemma3_scaling_on_global_layers_only():
+    hf = dict(model_type="gemma3_text", hidden_size=64, intermediate_size=96, num_attention_heads=4, num_key_value_heads=1,
+              head_dim=16, num_hidden_layers=4, vocab_size=97, sliding_window=512, sliding_window_pattern=2,
+              rope_theta=1e6, rope_local_base_freq=1e4, query_pre_attn_scalar=16,
+              rope_scaling={"rope_type": "linear", "factor": 8.0})
+    c = translate_config(hf)
+    per = [{**c, **c["layer_overrides"].get(str(i), {})} for i in range(4)]
+    assert [p["rope_scaling"] for p in per] == [None, {"type": "linear", "factor": 8.0}] * 2
+    newer = dict(hf, rope_scaling=None, rope_theta=None, rope_local_base_freq=None,
+                 rope_parameters={"full_attention": {"rope_type": "linear", "factor": 8.0, "rope_theta": 1e6},
+                                  "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
+    assert translate_config(newer) == c
+
+
+def test_unknown_rope_scaling_is_refused():
+    with pytest.raises(Unsupported, match="RoPE scaling 'mrope'"):
+        translate_config(dict(LLAMA2_7B, rope_scaling={"type": "mrope", "mrope_section": [16, 24, 24]}))
 
 
 def test_unknown_model_type_is_refused():
@@ -208,6 +244,20 @@ def _hf_config(tf, kind):
         "gemma3": (getattr(tf, "Gemma3TextConfig", None), dict(num_key_value_heads=2, head_dim=16, query_pre_attn_scalar=20,
                                                                sliding_window_pattern=2, rope_local_base_freq=100.0,
                                                                **small_window)),
+        # RoPE scaling. original_max_position_embeddings 16 puts head size 16's frequencies on both sides of
+        # llama3's and yarn's thresholds within the 12 tokens tested.
+        "llama31": (tf.LlamaConfig, dict(num_key_value_heads=2, rope_scaling=dict(
+            rope_type="llama3", factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=16))),
+        "llama_linear": (tf.LlamaConfig, dict(rope_scaling=dict(rope_type="linear", factor=4.0))),
+        "llama_yarn": (tf.LlamaConfig, dict(rope_scaling=dict(rope_type="yarn", factor=4.0, original_max_position_embeddings=16))),
+        "llama_dynamic": (tf.LlamaConfig, dict(rope_scaling=dict(rope_type="dynamic", factor=2.0))),
+        "phi3_longrope": (tf.Phi3Config, dict(num_key_value_heads=2, pad_token_id=0, partial_rotary_factor=0.5,
+                                              original_max_position_embeddings=16, rope_scaling=dict(
+                                                  type="longrope", short_factor=[1.0, 1.4, 2.2, 3.5],
+                                                  long_factor=[2.0, 3.0, 5.0, 8.0]))),
+        "gemma3_linear": (getattr(tf, "Gemma3TextConfig", None), dict(
+            num_key_value_heads=2, head_dim=16, query_pre_attn_scalar=20, sliding_window_pattern=2,
+            rope_local_base_freq=100.0, rope_scaling=dict(rope_type="linear", factor=8.0), **small_window)),
     }
     cls, kw = table[kind]
     if cls is None:
@@ -215,8 +265,36 @@ def _hf_config(tf, kind):
     return cls(**SIZES, **kw)
 
 
+SCALED = ["llama31", "llama_linear", "llama_yarn", "llama_dynamic", "phi3_longrope", "gemma3_linear"]
 KINDS = ["llama", "llama_tied_bias", "mistral", "qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "gpt2",
-         "gpt_neox", "gpt_neox_sequential"]
+         "gpt_neox", "gpt_neox_sequential"] + SCALED
+
+
+@pytest.mark.parametrize("kind", [k for k in SCALED if k != "gemma3_linear"])
+def test_rope_frequencies_match_transformers(kind):
+    """indranet's frequencies and cos/sin factor for the converted config = transformers' own."""
+    tf = pytest.importorskip("transformers")
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from indranet.layers.positional import rope_frequencies
+    hf = _hf_config(tf, kind)
+    kind_name = hf.rope_scaling.get("rope_type", hf.rope_scaling.get("type"))
+    theirs, their_factor = ROPE_INIT_FUNCTIONS[kind_name](hf, None)
+    c = translate_config(hf.to_dict())
+    rot = int(c["d_head"] * c["rope_fraction"])
+    ours, factor, _ = rope_frequencies(c["rope_theta"], rot, c["rope_scaling"])
+    assert torch.allclose(ours, theirs, rtol=1e-6, atol=0) and factor == pytest.approx(their_factor, rel=1e-12)
+    assert not torch.allclose(ours, rope_frequencies(c["rope_theta"], rot, None)[0]) or kind == "llama_dynamic"
+
+
+def test_engine_refuses_sequences_past_the_scaling_limit(tools, tmp_path):
+    """longrope (and dynamic) change their frequencies past original_max_position_embeddings: refused."""
+    _hf_model("phi3_longrope", tmp_path / "hf", torch.float32)
+    convert(tmp_path / "hf", tmp_path / "m.safetensors")
+    run = lambda n: subprocess.run([str(tools / "indra"), "run", str(tmp_path / "m.safetensors"), "--tokens",
+                                    ",".join(["5"] * n)], capture_output=True, text=True)
+    assert run(16).returncode == 0
+    r = run(17)
+    assert r.returncode != 0 and "original_max_position_embeddings=16" in r.stderr, r.stdout + r.stderr
 
 
 @pytest.fixture(scope="module")

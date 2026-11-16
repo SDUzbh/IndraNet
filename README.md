@@ -64,8 +64,8 @@ Or train an example circuit and export it in one go:
 python examples/induction_heads.py --export induction.safetensors
 ```
 
-Or convert a pretrained Hugging Face checkpoint (Llama, Mistral, Qwen2/3, Phi-3, Gemma 1/2/3,
-GPT-2, Pythia) with the independent converter in [python/indranet_hf](python/indranet_hf/README.md),
+Or convert a pretrained Hugging Face checkpoint (Llama 1–3.x, Mistral, Qwen2/3, Phi-3/3.5/4-mini,
+Gemma 1/2/3, GPT-2, Pythia) with the independent converter in [python/indranet_hf](python/indranet_hf/README.md),
 which needs only numpy:
 
 ```bash
@@ -283,11 +283,11 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
 
 ## Correctness
 
-- **Golden tests** (`python/tests/test_golden.py`) export ~120 model configurations and
+- **Golden tests** (`python/tests/test_golden.py`) export ~130 model configurations and
   compare the C++ forward pass with PyTorch on the logits and every hook point. The configurations
   cover every norm × placement × positional encoding × MLP combination, GQA/MQA, sliding window,
-  softcaps, parallel residual, per-layer overrides and all presets. Agreement is at float32
-  rounding level, about 3e-7 relative. The same configurations check the backward pass: the
+  softcaps, parallel residual, every RoPE scaling type, per-layer overrides and all presets.
+  Agreement is at float32 rounding level, about 3e-7 relative. The same configurations check the backward pass: the
   gradient of a metric at every hook point must match PyTorch autograd's to 1e-4.
 - **Hugging Face golden tests** (`python/tests/test_hf.py`, with `transformers` installed) build a
   tiny random model of each supported family, convert it, and check the engine reproduces
@@ -424,6 +424,6 @@ hyphen, such as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action v
 
 ## Not included (yet)
 
-RoPE scaling (so Llama 3.1+ and long-context models can't be converted yet), loading Hugging Face
-folders directly in the engine (they go through the converter), a tokenizer in the engine, padding
-masks for batched prompts of different lengths, and mixture-of-experts layers.
+Loading Hugging Face folders directly in the engine (they go through the converter), sequences past
+`original_max_position_embeddings` with `dynamic` or `longrope` RoPE scaling, a tokenizer in the
+engine, padding masks for batched prompts of different lengths, and mixture-of-experts layers.

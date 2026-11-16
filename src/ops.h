@@ -22,8 +22,20 @@ void activation_grad_(Tensor& x, const std::string& act);
 Tensor split_heads(const Tensor& x, int64_t H, int64_t D);  // (T, H*D) -> (H, T, D)
 Tensor split_heads(const float* x, int64_t T, int64_t H, int64_t D);  // the same from a row-major (T, H*D) array
 Tensor merge_heads(const Tensor& x);                        // (H, T, D) -> (T, H*D)
+// A layer's RoPE: the first `rot` values of each head rotate at frequencies inv_freq (rot / 2), and
+// with rope_scaling cos and sin are multiplied by `factor`. Sequences longer than max_len (0: no
+// limit) are refused: there "dynamic" and "longrope" scaling change their frequencies.
+struct RopeTable {
+    int64_t rot = 0;
+    std::vector<float> inv_freq;
+    float factor = 1.f;
+    int64_t max_len = 0;
+};
+RopeTable rope_table(const ModelConfig& c);
+void check_rope_length(const ModelConfig& c, const RopeTable& t, int64_t n_positions);
 // Rotate (H, T, D) in place at positions 0..T-1 (indranet's "rotate half" RoPE), or at positions[t]
-// for row t when given. `inverse` rotates back, which is also the transpose: the backward pass.
+// for row t when given. `inverse` applies the transpose (the backward pass): with no cos/sin factor
+// that is also the inverse rotation.
 void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse = false, const std::vector<int64_t>* positions = nullptr);
 std::vector<float> alibi_slopes(int64_t n);
 // C(m,n) = A(m,k) @ op(B) with row strides lda/ldb/ldc; op(B) = B (k,n) or, with trans_b, B(n,k)^T.

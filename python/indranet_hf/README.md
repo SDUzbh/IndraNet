@@ -23,23 +23,26 @@ summary = convert("path/to/checkpoint", "model.safetensors", dtype="auto")
 
 | `model_type` | Models | Notes |
 |---|---|---|
-| `llama` | Llama 1/2, TinyLlama, SmolLM, ... | optional `attention_bias` / `mlp_bias` |
+| `llama` | Llama 1/2/3.x, TinyLlama, SmolLM, ... | optional `attention_bias` / `mlp_bias` |
 | `mistral` | Mistral 7B v0.x | sliding window |
 | `qwen2` | Qwen1.5, Qwen2, Qwen2.5 | q/k/v biases; sliding layers above `max_window_layers` |
 | `qwen3` | Qwen3 (dense) | per-head q/k RMSNorm |
-| `phi3` | Phi-3 mini 4K | fused qkv and gate/up split; partial RoPE |
+| `phi3` | Phi-3, Phi-3.5, Phi-4-mini | fused qkv and gate/up split; partial RoPE |
 | `gemma` | Gemma 1 | `1 + w` norms, scaled embeddings, GeGLU |
 | `gemma2` | Gemma 2 | plus sandwich norms, softcaps, alternating sliding layers |
-| `gemma3_text` | Gemma 3 1B (text-only) | plus q/k norms, local RoPE base on sliding layers |
+| `gemma3_text` | Gemma 3 text models | plus q/k norms, local RoPE base on sliding layers, scaling on global ones |
 | `gpt2` | GPT-2 | Conv1D weights transposed, fused qkv split |
 | `gpt_neox` | Pythia, GPT-NeoX | per-head fused qkv, partial RoPE, parallel residual |
 
-Refused, with a message saying why: RoPE scaling (Llama 3.1+'s `llama3`, `linear`, `yarn`,
-`longrope`, so Llama 3.1/3.2, Phi-3.5, Phi-4-mini, the 128K Phi-3 models and the larger Gemma 3
-models are out for now),
-mixture-of-experts and other model types, and any tensor the converter doesn't recognise (rather
-than silently dropping a weight). Weights must be safetensors: PyTorch pickles (`.bin`) are not read,
-because loading one can run code.
+Refused, with a message saying why: mixture-of-experts and other model types (among them Gemma 3's
+multimodal checkpoints, `model_type` `gemma3`, which the 4B and larger models ship as), and any
+tensor the converter doesn't recognise (rather than silently dropping a weight). Weights must be
+safetensors: PyTorch pickles (`.bin`) are not read, because loading one can run code.
+
+RoPE scaling (`rope_scaling` / `rope_parameters`) carries over: `linear`, `dynamic`, `llama3`
+(Llama 3.1+), `yarn` and `longrope` (Phi-3.5, Phi-4-mini, the 128K Phi-3 models). `dynamic` and
+`longrope` change their frequencies past `original_max_position_embeddings` (4096 for Phi-3.5);
+the engine computes them exactly up to that length and refuses longer sequences.
 
 ## What it writes
 

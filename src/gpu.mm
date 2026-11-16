@@ -215,15 +215,16 @@ static float tg_max(float v, threadgroup float* part, uint lane, uint sg, uint n
     return t;
 }
 
-// RoPE, rotate-half, out of place (inverse: rotated back): one thread per (row, head, i < half).
-struct RopeArgs { uint heads, D, nhalf, n, inverse; };
+// RoPE, rotate-half, out of place (inverse: the transpose, RoPE's backward pass), with cos and sin times
+// `scale` (RoPE scaling's attention factor; 1 otherwise): one thread per (row, head, i < half).
+struct RopeArgs { uint heads, D, nhalf, n, inverse; float scale; };
 kernel void rope_k(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], device const float* inv [[buffer(2)]],
                    device const uint* meta [[buffer(3)]], constant RopeArgs& a [[buffer(4)]], uint t [[thread_position_in_grid]]) {
     if (t >= a.n) return;
     const uint i = t % a.nhalf, rh = t / a.nhalf;  // rh = row * heads + head
     const uint row = rh / a.heads;
     const float ang = float(meta[4 * row]) * inv[i];
-    const float c = precise::cos(ang), s = a.inverse != 0 ? -precise::sin(ang) : precise::sin(ang);
+    const float c = precise::cos(ang) * a.scale, s = (a.inverse != 0 ? -precise::sin(ang) : precise::sin(ang)) * a.scale;
     device const float* v = x + ulong(rh) * a.D;
     device float* o = y + ulong(rh) * a.D;
     const float x1 = v[i], x2 = v[i + a.nhalf];
@@ -722,7 +723,7 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
 struct ActArgs { uint32_t n; int32_t kind; float k; };
 struct BiasArgs { uint32_t n, cols; };
 struct NormArgs { uint32_t d; float eps; uint32_t layernorm, has_b; };
-struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; };
+struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; float scale; };
 struct PassArgs { uint32_t D, rot, n; };
 struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
 
@@ -996,6 +997,7 @@ struct Gpu::Seq::Impl {
         int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
         Gpu::Seq::AttnShape attn{};      // Attention
         int64_t heads = 0, D = 0, rot = 0;  // Rope
+        float scale = 1.f;                  // Rope
         int64_t rows = 0, n = 0;
         const Tensor* W = nullptr;     // Norm, NormBwd
         const Tensor* bias = nullptr;  // Norm
@@ -1238,7 +1240,7 @@ struct Gpu::Seq::Impl {
                 need(op.e, 4 * op.rows);
                 const int64_t n_rot = rows * half, n_pass = rows * (op.D - op.rot);
                 if (n_rot) {
-                    const RopeArgs args{u32(op.heads), u32(op.D), u32(half), u32(n_rot), op.inverse ? 1u : 0u};
+                    const RopeArgs args{u32(op.heads), u32(op.D), u32(half), u32(n_rot), op.inverse ? 1u : 0u, op.scale};
                     id<MTLComputeCommandEncoder> e = compute();
                     [e setComputePipelineState:g.rope_k];
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
@@ -1563,7 +1565,7 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse) {
+void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse, float scale) {
     if (rot < 0 || rot % 2 || rot > D) throw std::invalid_argument("Gpu::Seq: RoPE rotates an even number of values, at most D");
     if (x == y) throw std::invalid_argument("Gpu::Seq: RoPE works out of place");
     Impl::Op op{Impl::Op::Rope};
@@ -1576,6 +1578,7 @@ void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_
     op.D = D;
     op.rot = rot;
     op.inverse = inverse;
+    op.scale = scale;
     impl_->ops.push_back(op);
 }
 

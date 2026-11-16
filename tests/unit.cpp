@@ -140,7 +140,48 @@ static std::vector<std::pair<std::string, ModelConfig>> configs() {
              c.norm_position = "sandwich"; c.attn_logit_softcap = 5.0; c.final_logit_softcap = 10.0;
          })},
         {"attention-only, no norm", tiny([](ModelConfig& c) { c.mlp = "none"; c.norm = "none"; })},
+        {"RoPE scaling: yarn, longrope in layer 1 (cos/sin factors)", tiny([](ModelConfig& c) {
+             c.rope_scaling = RopeScaling::from_json(json::parse(R"({"type": "yarn", "factor": 4, "original_max_position_embeddings": 8})"));
+             c.layer_overrides[1] = json::parse(R"({"rope_scaling": {"type": "longrope", "short_factor": [1.5, 3.0],
+                 "attention_factor": 1.25, "original_max_position_embeddings": 64}})");
+         })},
     };
+}
+
+// RoPE scaling: what the config accepts, and the length limit of "dynamic" and "longrope", on the CPU
+// and (macOS) the GPU. The frequencies themselves are checked against PyTorch and transformers by the
+// golden tests (python/tests/test_golden.py, test_hf.py).
+static void test_rope_scaling() {
+    auto parse = [](const char* s) { return RopeScaling::from_json(json::parse(s)); };
+    CHECK_THROWS(parse(R"({"type": "ntk", "factor": 2})"));
+    CHECK_THROWS(parse(R"({"type": "linear"})"));
+    CHECK_THROWS(parse(R"({"type": "linear", "factor": 0})"));
+    CHECK_THROWS(parse(R"({"type": "linear", "factor": 2, "beta_fast": 3})"));
+    CHECK_THROWS(parse(R"({"type": "llama3", "factor": 8, "low_freq_factor": 4, "high_freq_factor": 1, "original_max_position_embeddings": 8})"));
+    const RopeScaling y = parse(R"({"type": "yarn", "factor": 4, "original_max_position_embeddings": 8, "beta_fast": null})");
+    CHECK(y.beta_fast == 32.0 && y.truncate);
+
+    const ModelConfig c = tiny([&](ModelConfig& m) {
+        m.rope_scaling = parse(R"({"type": "dynamic", "factor": 2, "original_max_position_embeddings": 10})");
+    });
+    const detail::RopeTable plain = detail::rope_table(tiny()), dyn = detail::rope_table(c);
+    CHECK(dyn.inv_freq == plain.inv_freq && dyn.factor == 1.f && dyn.max_len == 10);  // plain RoPE up to its limit
+    const Model m = random_model(c, 7);
+    ActivationCache cache;
+    CHECK(m.run_with_cache(seq(10, 1), cache).shape == (Shape{10, 50}));
+    CHECK_THROWS(m.run_with_cache(seq(11, 1), cache));
+    CHECK_THROWS(m.forward(seq(11, 1)));
+    const ModelConfig wrong = tiny([&](ModelConfig& m) {  // short factors for 4 frequency pairs, head size 4 has 2
+        m.rope_scaling = parse(R"({"type": "longrope", "short_factor": [1, 2, 3, 4], "original_max_position_embeddings": 10})");
+    });
+    CHECK_THROWS(detail::rope_table(wrong));
+#ifdef TFI_USE_ACCELERATE
+    const Device before = device();
+    set_device(Device::Gpu);  // single passes on the GPU: the GPU path checks the length too
+    CHECK(m.run_with_cache(seq(10, 1), cache).shape == (Shape{10, 50}));
+    CHECK_THROWS(m.run_with_cache(seq(11, 1), cache));
+    set_device(before);
+#endif
 }
 
 static void test_json() {
@@ -2521,6 +2562,7 @@ int main(int argc, char** argv) {
     run("analysis", "OV copying + positional QK", test_copying_and_positional);
     run("analysis", "post-norm DLA refused", test_post_norm_dla_refused);
     run("core", "vector math", test_vector_math);
+    run("core", "RoPE scaling: config checks, length limit", test_rope_scaling);
     run("gpu", "chunked GPU work: packing, retries, failure", test_gpu_chunks);
     run("gpu", "which single passes go to the GPU", test_single_pass_rule);
 #ifdef TFI_USE_ACCELERATE

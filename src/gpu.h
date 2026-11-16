@@ -84,9 +84,11 @@ class Gpu::Seq {
     void norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& w, bool layernorm, float eps);
     void act_backward(int dpost, int pre, int dpre, int64_t n, GpuAct act);
     // RoPE ("rotate half") on the first `rot` values of each of `heads` heads of D per row, y = rope(x):
-    // row r is at position meta[4 r] (uint32), and inv_freq holds the rot / 2 frequencies. inverse:
-    // rotates back (RoPE's backward pass).
-    void rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse = false);
+    // row r is at position meta[4 r] (uint32), and inv_freq holds the rot / 2 frequencies. cos and sin
+    // are multiplied by `scale` (RoPE scaling's attention factor). inverse: the transpose (RoPE's backward
+    // pass), which with scale 1 rotates back.
+    void rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse = false,
+              float scale = 1.f);
     // Causal attention of every row's query, as Model::attend: z (rows, H D) from q (rows, H D) and
     // k, v (rows, Hkv D). meta has 4 uint32 per row: its position, its segment's start position, its
     // segment's first row and its segment's number of rows. Keys and values before the segment's start come from pk, pv (Hkv, Tp, D),

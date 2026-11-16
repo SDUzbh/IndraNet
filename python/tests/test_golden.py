@@ -37,6 +37,23 @@ def tiny(**kw) -> ModelConfig:
     return ModelConfig(**base)
 
 
+# RoPE scaling. Head size 8 (4 frequencies) and original_max_position_embeddings 16 put the
+# frequencies on both sides of llama3's and yarn's thresholds within the 12 tokens tested.
+ROPE_SCALINGS = [
+    dict(rope_scaling=dict(type="linear", factor=4.0)),
+    dict(rope_scaling=dict(type="dynamic", factor=4.0, original_max_position_embeddings=16)),
+    dict(rope_scaling=dict(type="llama3", factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
+                           original_max_position_embeddings=16)),
+    dict(rope_scaling=dict(type="yarn", factor=4.0, original_max_position_embeddings=16)),
+    dict(rope_scaling=dict(type="yarn", factor=4.0, original_max_position_embeddings=64, beta_fast=8, beta_slow=0.5,
+                           mscale=1.0, mscale_all_dim=0.5, truncate=False)),
+    dict(rope_scaling=dict(type="longrope", short_factor=[1.0, 1.5, 2.5, 4.0], factor=4.0,
+                           original_max_position_embeddings=16)),
+    dict(rope_fraction=0.5, rope_scaling=dict(type="longrope", short_factor=[1.2, 3.0], attention_factor=1.3,
+                                              original_max_position_embeddings=16)),
+    dict(rope_scaling=dict(type="linear", factor=4.0), layer_overrides={1: {"rope_scaling": None}}),
+]
+
 GRID = [
     dict(norm=n, norm_position=p, positional=pos, mlp=m)
     for n, p, pos, m in itertools.product(
@@ -48,6 +65,7 @@ EXTRA = [
     dict(sliding_window=3), dict(sliding_window=3, positional="alibi"),
     dict(attn_logit_softcap=5.0, final_logit_softcap=10.0), dict(parallel_residual=True),
     dict(parallel_residual=True, mlp="none"), dict(rope_fraction=0.5), dict(d_head=16),
+    *ROPE_SCALINGS,
     dict(bias=True, tie_embeddings=False, embed_scale=True), dict(mlp="geglu", activation="gelu_tanh"),
     dict(mlp="glu", activation="relu2"), dict(mlp="mlp", activation="tanh"), dict(norm="none"),
     dict(attn_scale=0.3), dict(n_heads=6, d_model=36),

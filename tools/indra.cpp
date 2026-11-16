@@ -204,7 +204,19 @@ int cmd_info(const Args&, const Model& m) {
                 (long long)c.vocab_size, (long long)c.d_model, (long long)c.n_layers, (long long)c.n_heads,
                 (long long)c.kv_heads(), (long long)c.head_dim(), (long long)c.max_seq_len);
     std::printf("norm          %s (%s)%s\n", c.norm.c_str(), c.norm_position.c_str(), c.qk_norm ? ", qk-norm" : "");
-    std::printf("positional    %s\n", c.positional.c_str());
+    std::printf("positional    %s", c.positional.c_str());
+    if (c.positional == "rope") {
+        std::printf(" (theta %g, fraction %g", c.rope_theta, c.rope_fraction);
+        if (c.rope_scaling) {
+            const RopeScaling& r = *c.rope_scaling;
+            std::printf(", %s scaling", r.type.c_str());
+            if (r.factor) std::printf(" factor %g", *r.factor);
+            if (r.type == "dynamic" || r.type == "longrope")
+                std::printf(", sequences up to %lld tokens", static_cast<long long>(r.original_max_position_embeddings));
+        }
+        std::printf(")");
+    }
+    std::printf("\n");
     std::printf("mlp           %s (%s)\n", c.mlp.c_str(), c.has_mlp() ? c.mlp_activation().c_str() : "attention-only");
     std::printf("attention     window %s, scale %s, softcap %s%s\n", opt_str(c.sliding_window).c_str(),
                 opt_str(c.attn_scale).c_str(), opt_str(c.attn_logit_softcap).c_str(),

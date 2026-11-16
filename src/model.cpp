@@ -143,25 +143,108 @@ Tensor merge_heads(const Tensor& x) {
     return out;
 }
 
+RopeTable rope_table(const ModelConfig& c) {
+    constexpr double kPi = 3.14159265358979323846;
+    RopeTable t;
+    t.rot = static_cast<int64_t>(c.head_dim() * c.rope_fraction);
+    t.rot -= t.rot % 2;
+    if (t.rot == 0) throw std::runtime_error("rope_fraction * head_dim leaves no dimensions to rotate");
+    const int64_t half = t.rot / 2;
+    const float rot = static_cast<float>(t.rot), theta = static_cast<float>(c.rope_theta);
+    t.inv_freq.resize(half);
+    for (int64_t i = 0; i < half; ++i) t.inv_freq[i] = 1.0f / std::pow(theta, static_cast<float>(2 * i) / rot);
+    if (!c.rope_scaling) return t;
+    // Hugging Face transformers' formulas (modeling_rope_utils), in float32 as there; the same as
+    // indranet.layers.positional.rope_frequencies.
+    const RopeScaling& s = *c.rope_scaling;
+    const double orig = static_cast<double>(s.original_max_position_embeddings);
+    const float factor = s.factor ? static_cast<float>(*s.factor) : 0.f;
+    std::vector<float>& inv = t.inv_freq;
+    if (s.type == "linear") {
+        for (float& f : inv) f /= factor;
+    } else if (s.type == "dynamic") {
+        t.max_len = s.original_max_position_embeddings;
+    } else if (s.type == "llama3") {
+        const float lo = static_cast<float>(s.low_freq_factor), hi = static_cast<float>(s.high_freq_factor);
+        const float low_wavelen = static_cast<float>(orig / s.low_freq_factor), high_wavelen = static_cast<float>(orig / s.high_freq_factor);
+        for (float& f : inv) {
+            const float wavelen = 2.f * static_cast<float>(kPi) / f;
+            const float scaled = wavelen > low_wavelen ? f / factor : f;
+            if (!(wavelen < high_wavelen) && !(wavelen > low_wavelen)) {  // medium: smoothed between the two
+                const float smooth = (static_cast<float>(orig) / wavelen - lo) / (hi - lo);
+                f = (1.f - smooth) * scaled / factor + smooth * scaled;
+            } else {
+                f = scaled;
+            }
+        }
+    } else if (s.type == "yarn") {
+        auto mscale = [](double scale, double m) { return scale <= 1 ? 1.0 : 0.1 * m * std::log(scale) + 1.0; };
+        double attn;
+        if (s.attention_factor) attn = *s.attention_factor;
+        else if (s.mscale && *s.mscale && s.mscale_all_dim && *s.mscale_all_dim)
+            attn = mscale(*s.factor, *s.mscale) / mscale(*s.factor, *s.mscale_all_dim);
+        else attn = mscale(*s.factor, 1.0);
+        t.factor = static_cast<float>(attn);
+        auto correction_dim = [&](double n_rot) {
+            return (double(t.rot) * std::log(orig / (n_rot * 2 * kPi))) / (2 * std::log(c.rope_theta));
+        };
+        double low = correction_dim(s.beta_fast), high = correction_dim(s.beta_slow);
+        if (s.truncate) {
+            low = std::floor(low);
+            high = std::ceil(high);
+        }
+        low = std::max(low, 0.0);
+        high = std::min(high, double(t.rot - 1));
+        if (low == high) high += 0.001;
+        for (int64_t i = 0; i < half; ++i) {
+            const float ramp = std::clamp((static_cast<float>(i) - static_cast<float>(low)) / static_cast<float>(high - low), 0.f, 1.f);
+            const float pos_freq = std::pow(theta, static_cast<float>(2 * i) / rot), extrapolation = 1.f - ramp;
+            inv[i] = (1.f / (factor * pos_freq)) * (1.f - extrapolation) + (1.f / pos_freq) * extrapolation;
+        }
+    } else if (s.type == "longrope") {
+        if (static_cast<int64_t>(s.short_factor.size()) != half)
+            throw std::runtime_error("rope_scaling 'longrope' has " + std::to_string(s.short_factor.size()) +
+                                     " short factors, but RoPE rotates " + std::to_string(half) + " pairs");
+        double attn = 1.0;
+        if (s.attention_factor) attn = *s.attention_factor;
+        else if (s.factor && *s.factor > 1.0) attn = std::sqrt(1 + std::log(*s.factor) / std::log(orig));
+        t.factor = static_cast<float>(attn);
+        for (int64_t i = 0; i < half; ++i)
+            inv[i] = 1.f / (static_cast<float>(s.short_factor[i]) * std::pow(theta, static_cast<float>(2 * i) / rot));
+        t.max_len = s.original_max_position_embeddings;
+    }
+    return t;
+}
+
+void check_rope_length(const ModelConfig& c, const RopeTable& t, int64_t n_positions) {
+    if (t.max_len && n_positions > t.max_len)
+        throw std::runtime_error("RoPE scaling '" + c.rope_scaling->type + "' is implemented for sequences of up to " +
+                                 "original_max_position_embeddings=" + std::to_string(t.max_len) + " tokens; this one has " +
+                                 std::to_string(n_positions) + ", where its frequencies change");
+}
+
 void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse, const std::vector<int64_t>* positions) {
     const int64_t H = x.shape[0], T = x.shape[1], D = x.shape[2];
-    int64_t rot = static_cast<int64_t>(D * c.rope_fraction);
-    rot -= rot % 2;
-    if (rot == 0) throw std::runtime_error("rope_fraction * head_dim leaves no dimensions to rotate");
-    const int64_t half = rot / 2;
-    std::vector<float> inv_freq(half);
-    for (int64_t i = 0; i < half; ++i)
-        inv_freq[i] = 1.0f / std::pow(static_cast<float>(c.rope_theta), static_cast<float>(2 * i) / static_cast<float>(rot));
+    const RopeTable table = rope_table(c);
+    const int64_t rot = table.rot, half = rot / 2;
+    if (rot > D) throw std::runtime_error("RoPE rotates more values than a head has");
+    const std::vector<float>& inv_freq = table.inv_freq;
     // cos / sin per position, computed once even when many rows share a position.
     int64_t n_pos = T;
     if (positions)
         for (int64_t p : *positions) n_pos = std::max(n_pos, p + 1);
+    check_rope_length(c, table, n_pos);
     std::vector<float> cs(n_pos * half), sn(n_pos * half);
     for (int64_t t = 0; t < n_pos; ++t)
         for (int64_t i = 0; i < half; ++i) {
             const float a = static_cast<float>(t) * inv_freq[i];
-            cs[t * half + i] = std::cos(a);
-            sn[t * half + i] = inverse ? -std::sin(a) : std::sin(a);
+            float co = std::cos(a), si = std::sin(a);
+            if (table.factor != 1.f) {
+                co *= table.factor;
+                si *= table.factor;
+            }
+            cs[t * half + i] = co;
+            sn[t * half + i] = inverse ? -si : si;
         }
     for (int64_t t = 0; t < T; ++t) {
         const int64_t pt = positions ? (*positions)[t] : t;
@@ -1037,15 +1120,18 @@ struct GpuBlocks {
         return n;
     }
 
+    int64_t n_positions = 0;  // the longest sequence write_rows wrote: positions 0 .. n_positions - 1
     // For attention on the GPU: each row's position, segment start, segment's first row and
     // segment's rows (kMeta), and blocks of rows for the tiled kernel (kBlocks, unless `tiled` is false).
     void write_rows(const detail::RowBatch& batch, bool tiled) {
         const int64_t S = static_cast<int64_t>(batch.start.size());
         uint32_t* meta = reinterpret_cast<uint32_t*>(s.reserve(kMeta, 4 * R));
         std::vector<uint32_t> blk;
+        n_positions = 0;
         for (int64_t sg = 0; sg < S; ++sg) {
             const auto off = static_cast<uint32_t>(batch.offset[sg]), start = static_cast<uint32_t>(batch.start[sg]);
             const auto len = static_cast<uint32_t>(batch.len[sg]);
+            n_positions = std::max<int64_t>(n_positions, int64_t(start) + len);
             for (uint32_t r = 0; r < len; ++r) {
                 uint32_t* row = meta + 4 * (off + r);
                 row[0] = start + r;
@@ -1063,11 +1149,10 @@ struct GpuBlocks {
     // frequencies (kInvFreq) and ALiBi slopes (kSlopes). Written between runs.
     void write_layer_inputs(int64_t layer) {
         const ModelConfig& c = m.layer_cfg(layer);
-        if (c.positional == "rope") {
-            const int64_t rot = rope_dims(c), half = rot / 2;
-            float* inv = s.reserve(kInvFreq, half);
-            for (int64_t i = 0; i < half; ++i)  // as apply_rope_
-                inv[i] = 1.0f / std::pow(static_cast<float>(c.rope_theta), static_cast<float>(2 * i) / static_cast<float>(rot));
+        if (c.positional == "rope") {  // as apply_rope_
+            const detail::RopeTable t = detail::rope_table(c);
+            detail::check_rope_length(c, t, n_positions);
+            std::copy(t.inv_freq.begin(), t.inv_freq.end(), s.reserve(kInvFreq, t.rot / 2));
         }
         if (c.positional == "alibi") {
             const std::vector<float> slopes = alibi_slopes(c.n_heads);
@@ -1165,21 +1250,15 @@ struct GpuBlocks {
             k = kn;
         }
         if (c.positional == "rope") {
-            const int64_t rot = rope_dims(c);
+            const detail::RopeTable t = detail::rope_table(c);
             s.reserve(qr, R * H * D);
             s.reserve(kr, R * Hkv * D);
-            s.rope(q, qr, R, H, D, rot, kInvFreq, kMeta);
-            s.rope(k, kr, R, Hkv, D, rot, kInvFreq, kMeta);
+            s.rope(q, qr, R, H, D, t.rot, kInvFreq, kMeta, false, t.factor);
+            s.rope(k, kr, R, Hkv, D, t.rot, kInvFreq, kMeta, false, t.factor);
             q = qr;
             k = kr;
         }
         return {q, k};
-    }
-    static int64_t rope_dims(const ModelConfig& c) {
-        int64_t rot = static_cast<int64_t>(c.head_dim() * c.rope_fraction);
-        rot -= rot % 2;
-        if (rot == 0) throw std::runtime_error("rope_fraction * head_dim leaves no dimensions to rotate");
-        return rot;
     }
     detail::Gpu::Seq::AttnShape attn_shape(int64_t layer, int64_t Tp) const {
         const ModelConfig& c = m.layer_cfg(layer);
@@ -1214,12 +1293,12 @@ struct GpuBlocks {
         s.reserve(kDV, R * Hkv * D);
         s.attention_backward({q, k, a.v, a.z, dz, a.lse, kMeta, shape.has_slopes ? kSlopes : kMeta}, kDelta, dq, dk, kDV, shape);
         if (rope) {
-            const int64_t rot = rope_dims(c);
+            const detail::RopeTable t = detail::rope_table(c);
             const int nq = c.qk_norm ? kDQ1 : kDQ, nk = c.qk_norm ? kDK1 : kDK;
             s.reserve(nq, R * H * D);
             s.reserve(nk, R * Hkv * D);
-            s.rope(dq, nq, R, H, D, rot, kInvFreq, kMeta, /*inverse=*/true);
-            s.rope(dk, nk, R, Hkv, D, rot, kInvFreq, kMeta, /*inverse=*/true);
+            s.rope(dq, nq, R, H, D, t.rot, kInvFreq, kMeta, /*inverse=*/true, t.factor);
+            s.rope(dk, nk, R, Hkv, D, t.rot, kInvFreq, kMeta, /*inverse=*/true, t.factor);
             dq = nq;
             dk = nk;
         }
