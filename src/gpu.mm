@@ -1263,7 +1263,8 @@ struct Gpu::Seq::Impl {
             }
             case Op::Attention: {
                 const Gpu::Seq::AttnShape& A = op.attn;
-                if (A.D <= 0 || A.D > 512) throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to 512");
+                if (A.D <= 0 || A.D > kMaxHeadDim)
+                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " + std::to_string(kMaxHeadDim));
                 if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 need(op.a, A.rows * A.H * A.D);
                 need(op.b, A.rows * A.Hkv * A.D);
@@ -1340,7 +1341,8 @@ struct Gpu::Seq::Impl {
             }
             case Op::AttentionBwd: {
                 const Gpu::Seq::AttnShape& A = op.attn;
-                if (A.D <= 0 || A.D > 512) throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to 512");
+                if (A.D <= 0 || A.D > kMaxHeadDim)
+                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " + std::to_string(kMaxHeadDim));
                 if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 const int64_t nq = A.rows * A.H * A.D, nkv = A.rows * A.Hkv * A.D;
                 need(op.a, nq);

@@ -20,6 +20,7 @@
 #include "tfi/analysis.h"
 #include "tfi/json.h"
 #include "tfi/model.h"
+#include "tfi/safetensors.h"
 #include "../src/vmath.h"  // internal: vectorizable exp / erf / tanh
 #include "../src/gpu.h"    // internal (macOS): GPU matrix multiplies
 #include "../src/ops.h"    // internal: patching batch sizes
@@ -1345,6 +1346,70 @@ static void test_gpu_chunks() {
     detail::set_gpu_chunk_flops(0);
 }
 
+// d_mlp 0 asks for the default width, as indranet reads it: a config saying 0 (top level or in a layer
+// override) takes weights of the default width, plain and gated MLPs alike.
+static void test_d_mlp_zero_is_default() {
+    for (const char* mlp : {"mlp", "swiglu"}) {
+        const std::string base = std::string(R"({"vocab_size": 50, "d_model": 16, "n_layers": 2, "n_heads": 4, "max_seq_len": 32, )"
+                                             R"("mlp_multiple_of": 8, "mlp": ")") + mlp + "\"";
+        const ModelConfig zero = ModelConfig::from_json(base + R"(, "d_mlp": 0})");
+        CHECK(!zero.d_mlp);
+        const ModelConfig layer = ModelConfig::from_json(base + R"(, "d_mlp": 24, "layer_overrides": {"1": {"d_mlp": 0}}})");
+        CHECK(layer.d_mlp && *layer.d_mlp == 24 && !layer.layer_config(1).d_mlp);
+        const Model source = random_model(tiny([mlp](ModelConfig& c) { c.mlp = mlp; }), 3);  // default width
+        std::map<std::string, Tensor> w;
+        for (const auto& kv : source.weights()) w[kv.first] = kv.second.to_tensor();
+        bool loads = true;
+        try {
+            const Model m(zero, w);
+            CHECK(same_values(m.forward(seq(6, 4)), source.forward(seq(6, 4))));
+        } catch (const std::exception& e) {
+            loads = false;
+            std::printf("     %s, d_mlp 0: %s\n", mlp, e.what());
+        }
+        CHECK(loads);
+    }
+}
+
+// Headers whose shapes don't fit the file are refused before anything is allocated or multiplied out:
+// a shape whose element count overflows 64 bits (or any product of its leading dimensions does), one
+// larger than the file, a negative dimension, a byte count that doesn't match. Zero-size tensors load.
+static void test_safetensors_bad_shapes() {
+    const std::string path = "/tmp/tfi_unit_shapes_" + std::to_string(::getpid()) + ".safetensors";
+    auto write = [&](const std::string& tensor_json, size_t data_bytes) {
+        const std::string header = "{" + tensor_json + "}";
+        std::ofstream f(path, std::ios::binary);
+        uint64_t n = header.size();
+        for (int i = 0; i < 8; ++i) f.put(static_cast<char>((n >> (8 * i)) & 0xff));
+        f << header << std::string(data_bytes, '\0');
+    };
+    auto refused = [&](const std::string& tensor_json, size_t data_bytes, const std::string& why) {
+        write(tensor_json, data_bytes);
+        std::string error;
+        try {
+            load_safetensors(path);
+        } catch (const std::runtime_error& e) {
+            error = e.what();
+        }
+        if (error.find(why) == std::string::npos) std::printf("     %s: got '%s'\n", tensor_json.c_str(), error.c_str());
+        CHECK(error.find(why) != std::string::npos);
+    };
+    refused(R"("x": {"dtype": "F32", "shape": [4294967296, 4294967296], "data_offsets": [0, 0]})", 0, "larger than the file");
+    refused(R"("x": {"dtype": "F16", "shape": [4611686018427387904, 4], "data_offsets": [0, 16]})", 16, "larger than the file");
+    refused(R"("x": {"dtype": "F32", "shape": [1099511627776, 1099511627776, 0], "data_offsets": [0, 0]})", 0, "larger than the file");
+    refused(R"("x": {"dtype": "I64", "shape": [3], "data_offsets": [0, 16]})", 16, "larger than the file");
+    refused(R"("x": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 20]})", 24, "byte size does not match");
+    refused(R"("x": {"dtype": "F32", "shape": [2, -3], "data_offsets": [0, 24]})", 24, "negative dimension");
+    write(R"("x": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 24]}, "e": {"dtype": "F32", "shape": [0, 1099511627776, 1099511627776], "data_offsets": [24, 24]})", 24);
+    const SafeTensors ok = load_safetensors(path);
+    CHECK(ok.tensors.at("x").shape == Shape({2, 3}) && ok.tensors.at("x").numel() == 6);
+    CHECK(ok.tensors.at("e").numel() == 0);
+    std::remove(path.c_str());
+    CHECK_THROWS(shape_numel({int64_t{1} << 40, int64_t{1} << 40}));
+    CHECK(shape_numel({0, int64_t{1} << 40, int64_t{1} << 40}) == 0);
+    CHECK(shape_numel({}) == 1 && shape_numel({3, 4}) == 12);
+}
+
 static void test_vector_math() {
     auto ulp_error = [](float got, double want) {
         const float w = static_cast<float>(std::fabs(want));
@@ -2629,6 +2694,59 @@ static void test_gpu_mapped_weights() {
         test_gpu_single_pass(m, 9);
     }
 }
+
+// Heads wider than the GPU's attention kernels take (Gpu::kMaxHeadDim): in both mode a single pass the
+// scheduler sends to the GPU keeps attention on the CPU and gives the CPU's result, hook_pattern
+// included; GPU-only mode refuses with the reason. Heads of exactly kMaxHeadDim run on the GPU.
+static void test_gpu_wide_heads() {
+    const Model probe = random_model(tiny(), 1);
+    if (!probe.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    const Tokens t = seq(9, 61);
+    for (int64_t D : {detail::Gpu::kMaxHeadDim + 8, detail::Gpu::kMaxHeadDim}) {
+        const Model m = random_model(tiny([D](ModelConfig& c) { c.n_heads = 2; c.d_head = D; }), 62);
+        set_device(Device::Cpu);
+        ActivationCache cpu;
+        const Tensor want = m.run_with_cache(t, cpu);
+        set_device(Device::Both);
+        detail::set_gpu_min_rows(1);  // the scheduler sends this single pass to the GPU
+        detail::set_gpu_min_work(1);
+        ActivationCache both;
+        Tensor got;
+        bool threw = false;
+        try {
+            got = m.run_with_cache(t, both);
+        } catch (const std::exception& e) {
+            threw = true;
+            std::printf("     both mode, head size %lld: %s\n", static_cast<long long>(D), e.what());
+        }
+        detail::set_gpu_min_rows(0);
+        detail::set_gpu_min_work(0);
+        CHECK(!threw);
+        if (!threw) {
+            CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
+            CHECK(both.count("blocks.0.attn.hook_pattern") == 1);
+            if (both.count("blocks.0.attn.hook_pattern"))
+                CHECK(max_abs_diff(both.at("blocks.0.attn.hook_pattern"), cpu.at("blocks.0.attn.hook_pattern")) <= 1e-4f);
+        }
+        set_device(Device::Gpu);
+        std::string error;
+        try {
+            got = m.forward(t);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        set_device(Device::Both);
+        if (D > detail::Gpu::kMaxHeadDim) {
+            CHECK(error.find("head size") != std::string::npos);
+        } else {
+            CHECK(error.empty());
+            if (error.empty()) CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
+        }
+    }
+}
 #endif
 
 // Test groups, for running part of the suite:
@@ -2741,12 +2859,15 @@ int main(int argc, char** argv) {
     run("analysis", "OV copying + positional QK", test_copying_and_positional);
     run("analysis", "post-norm DLA refused", test_post_norm_dla_refused);
     run("core", "vector math", test_vector_math);
+    run("core", "safetensors: shapes that don't fit the file", test_safetensors_bad_shapes);
     run("core", "RoPE scaling: config checks, length limit", test_rope_scaling);
+    run("core", "config: d_mlp 0 is the default width", test_d_mlp_zero_is_default);
     run("gpu", "chunked GPU work: packing, retries, failure", test_gpu_chunks);
     run("gpu", "which single passes go to the GPU", test_single_pass_rule);
 #ifdef TFI_USE_ACCELERATE
     run("gpu", "GPU linear layer (macOS)", test_gpu_linear);
     run("gpu", "memory-mapped weights on the GPU = CPU (macOS)", test_gpu_mapped_weights);
+    run("gpu", "heads too wide for GPU attention stay on the CPU in both mode (macOS)", test_gpu_wide_heads);
     run("gpu", "GPU used only with enough work (macOS)", test_gpu_work_threshold);
     run("gpu", "device modes: cpu, both, gpu (macOS)", test_device_modes);
     run("gpu", "GPU batches: multiplies, block sums, argmaxes (macOS)", test_gpu_batch);

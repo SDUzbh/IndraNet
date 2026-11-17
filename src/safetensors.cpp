@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -110,13 +111,22 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
         const uint64_t begin = static_cast<uint64_t>(info.at("data_offsets").array.at(0).as_int());
         const uint64_t end = static_cast<uint64_t>(info.at("data_offsets").array.at(1).as_int());
         if (end < begin || end > data_size) throw std::runtime_error(path + ": bad offsets for " + name);
-        for (int64_t dim : shape)
-            if (dim < 0) throw std::runtime_error(path + ": negative dimension for " + name);
-        const int64_t n = shape_numel(shape);
         const uint64_t width = dtype == "I64" ? 8 : dtype == "F32" ? 4 : (dtype == "F16" || dtype == "BF16") ? 2 : 0;
         if (width == 0) throw std::runtime_error(path + ": unsupported dtype " + dtype + " for " + name);
-        if (static_cast<uint64_t>(n) > data_size / width || end - begin != static_cast<uint64_t>(n) * width)
-            throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
+        // The element count, multiplied in order with a check at each step, so that a header's shape can't
+        // overflow it: no product of leading dimensions may exceed the elements the file has bytes for
+        // (once one is 0 the rest can't matter, as for shape_numel).
+        for (int64_t dim : shape)
+            if (dim < 0) throw std::runtime_error(path + ": negative dimension for " + name);
+        const uint64_t max_n = data_size / width;
+        uint64_t count = 1;
+        for (int64_t dim : shape) {
+            if (count != 0 && static_cast<uint64_t>(dim) > max_n / count)
+                throw std::runtime_error(path + ": " + name + " has a shape larger than the file");
+            count *= static_cast<uint64_t>(dim);
+        }
+        const int64_t n = static_cast<int64_t>(count);  // at most data_size / width
+        if (end - begin != count * width) throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
         // Straight into the tensor's own storage: no intermediate byte buffer.
         auto read_into = [&](void* dst) { copy(begin, end - begin, dst, name); };
         if (dtype == "I64") {

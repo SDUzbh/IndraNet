@@ -25,7 +25,10 @@ std::string shape_str(const Shape& s) {
 }
 
 int64_t shape_numel(const Shape& s) {
-    return std::accumulate(s.begin(), s.end(), int64_t{1}, std::multiplies<int64_t>());
+    int64_t n = 1;
+    for (int64_t d : s)
+        if (__builtin_mul_overflow(n, d, &n)) throw std::overflow_error("shape " + shape_str(s) + " has too many elements");
+    return n;
 }
 
 Tensor::Tensor(Shape s, float fill) : shape(std::move(s)), data(shape_numel(shape), fill) {}

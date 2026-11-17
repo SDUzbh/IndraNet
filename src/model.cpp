@@ -1492,6 +1492,11 @@ struct GpuBlocks {
     }
 };
 
+// Whether the GPU's attention kernels take every layer from `layer` on (Gpu::kMaxHeadDim).
+bool gpu_attention_fits(const std::vector<ModelConfig>& cfgs, int64_t layer) {
+    return std::all_of(cfgs.begin() + layer, cfgs.end(),
+                       [](const ModelConfig& c) { return c.head_dim() <= detail::Gpu::kMaxHeadDim; });
+}
 }  // namespace
 #endif
 
@@ -1517,8 +1522,10 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         detail::Gpu::Seq s(*batch.gpu);
         GpuBlocks gb{*this, s, R, d};
         // The CPU's attention is faster only while it overlaps the GPU's work on other batches; a
-        // single pass has none to overlap, so its attention runs on the GPU too.
-        const bool gpu_attention = detail::gpu_only() || g_gpu_attention.load() || batch.whole;
+        // single pass has none to overlap, so its attention runs on the GPU too, if the kernels take
+        // every layer's head size (GPU-only mode has no CPU to fall back on: the GPU says why it can't).
+        const bool gpu_attention =
+            detail::gpu_only() || ((g_gpu_attention.load() || batch.whole) && gpu_attention_fits(layer_cfgs_, layer));
         // q, k, v alternate between two sets of slots by layer, so that a run never overwrites the
         // slots its attention reads (Gpu::Seq::run may repeat a run).
         const int qkv[2][3] = {{kQ, kK, kV}, {kQ2, kK2, kV2}};
@@ -1629,7 +1636,7 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
 
     detail::Gpu::Seq s(*batch.gpu);
     GpuBlocks gb{*this, s, R, d};
-    const bool gpu_attention = detail::gpu_only() || g_gpu_attention.load();
+    const bool gpu_attention = detail::gpu_only() || (g_gpu_attention.load() && gpu_attention_fits(layer_cfgs_, 0));
     if (gpu_attention) gb.write_rows(batch, g_attn_tiled.load());
     std::vector<std::pair<int, int>> qk_slots(L);  // with gpu_attention: each layer's q, k after qk()
     auto use_attn_slots = [&](int64_t l) {

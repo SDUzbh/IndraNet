@@ -47,7 +47,7 @@ struct ModelConfig {
     int64_t n_heads = 8;
     std::optional<int64_t> n_kv_heads;
     std::optional<int64_t> d_head;
-    std::optional<int64_t> d_mlp;
+    std::optional<int64_t> d_mlp;  // unset (0 in the JSON, as indranet writes it too): the default width
     int64_t mlp_multiple_of = 64;
     int64_t max_seq_len = 2048;
 

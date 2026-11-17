@@ -11,7 +11,7 @@ namespace tfi {
 using Shape = std::vector<int64_t>;
 
 std::string shape_str(const Shape& s);
-int64_t shape_numel(const Shape& s);
+int64_t shape_numel(const Shape& s);  // the product, multiplied in order; std::overflow_error if it overflows int64
 
 // Row-major float32 tensor that owns its data. Copies are deep.
 struct Tensor {

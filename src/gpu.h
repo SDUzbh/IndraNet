@@ -27,6 +27,10 @@ class Gpu {
 
     // nullptr when there is no Metal device (e.g. some virtual machines): callers then use the CPU.
     static std::unique_ptr<Gpu> create();
+
+    // The largest head size the attention kernels take (their threadgroup arrays hold one head's
+    // query or key / value row). Layers with wider heads keep attention on the CPU.
+    static constexpr int64_t kMaxHeadDim = 512;
     ~Gpu();
 
     // linear(x, W, b) on the GPU: x (..., k), W (n, k). A float32 W is copied to the GPU the first

@@ -5,6 +5,7 @@ Builds the C++ engine (repository root) with make, exports models and reference 
 tfi_golden.
 Skipped when no C++ toolchain is available.
 """
+import ctypes
 import itertools
 import os
 import shutil
@@ -29,6 +30,18 @@ pytestmark = pytest.mark.skipif(shutil.which("make") is None or shutil.which("c+
 def tools():
     subprocess.run(["make", "-s", "-C", str(ROOT), "all"], check=True)
     return ROOT / "build"
+
+
+def metal_device_available() -> bool:
+    """Whether this host has a Metal device, asked of Metal itself (not of the engine under test)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+    except OSError:
+        return False
+    metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+    return bool(metal.MTLCreateSystemDefaultDevice())
 
 
 def tiny(**kw) -> ModelConfig:
@@ -71,6 +84,7 @@ EXTRA = [
     dict(bias=True, tie_embeddings=False, embed_scale=True), dict(mlp="geglu", activation="gelu_tanh"),
     dict(mlp="glu", activation="relu2"), dict(mlp="mlp", activation="tanh"), dict(norm="none"),
     dict(attn_scale=0.3), dict(n_heads=6, d_model=36),
+    dict(d_mlp=0), dict(d_mlp=0, mlp="mlp"),  # 0: the default width, as indranet reads it (`d_mlp or default`)
     dict(layer_overrides={0: {"mlp": "none"}, 1: {"positional": "none", "sliding_window": 4}}),
     dict(positional="learned", layer_overrides={1: {"positional": "rope"}}),
     dict(layer_overrides={0: {"n_heads": 2}}),
@@ -229,11 +243,12 @@ def test_cli_commands(tools, tmp_path, opts):
     for dev, want in [("cpu", no_gpu.stdout), ("both", default.stdout)]:
         r = subprocess.run(patch_args + ["--device", dev], capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout == want, r.stderr
+    # GPU-only works exactly where there is a Metal device; elsewhere it is an error that says why.
     gpu = subprocess.run(patch_args + ["--device", "gpu"], capture_output=True, text=True)
-    if sys.platform == "darwin":
+    if metal_device_available():
         assert gpu.returncode == 0, gpu.stderr
     else:
-        assert gpu.returncode == 1 and "GPU-only" in gpu.stderr
+        assert gpu.returncode == 1 and "GPU-only" in gpu.stderr, (gpu.returncode, gpu.stderr)
     bad = subprocess.run(patch_args + ["--device", "tpu"], capture_output=True, text=True)
     assert bad.returncode == 1 and "--device must be cpu, both or gpu" in bad.stderr
     clash = subprocess.run(patch_args + ["--device", "gpu", "--no-gpu"], capture_output=True, text=True)

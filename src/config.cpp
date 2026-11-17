@@ -120,7 +120,11 @@ void ModelConfig::apply(const json::Value& f) {
         else if (k == "n_heads") n_heads = v.as_int();
         else if (k == "n_kv_heads") n_kv_heads = opt_int<int64_t>(v);
         else if (k == "d_head") d_head = opt_int<int64_t>(v);
-        else if (k == "d_mlp") d_mlp = opt_int<int64_t>(v);
+        else if (k == "d_mlp") {
+            // 0 asks for the default width, as in indranet (`cfg.d_mlp or default`), whose exports store it so.
+            d_mlp = opt_int<int64_t>(v);
+            if (d_mlp && *d_mlp == 0) d_mlp.reset();
+        }
         else if (k == "mlp_multiple_of") mlp_multiple_of = v.as_int();
         else if (k == "max_seq_len") max_seq_len = v.as_int();
         else if (k == "norm") norm = v.as_string();
