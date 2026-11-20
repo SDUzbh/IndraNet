@@ -1100,6 +1100,7 @@ struct Gpu::Seq::Impl {
         int64_t heads = 0, D = 0, rot = 0;  // Rope
         float scale = 1.f;                  // Rope
         int64_t rows = 0, n = 0;
+        int64_t offset = 0;            // Copy: where in slot a it starts (floats)
         const Tensor* W = nullptr;     // Norm, NormBwd
         const Tensor* bias = nullptr;  // Norm
         const Weight* lw = nullptr;    // Linear, LinearT
@@ -1114,7 +1115,6 @@ struct Gpu::Seq::Impl {
     id<MTLBuffer> flag = nil;  // set by half_k when an input does not fit fp16
     id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
     size_t split_bytes = 0;
-    std::map<std::tuple<int64_t, int64_t, int64_t, bool>, MPSMatrixMultiplication*> mms;  // by (m, n, k, W^T)
 
     // Encoding state of one attempt.
     id<MTLCommandBuffer> cmd = nil;
@@ -1149,10 +1149,15 @@ struct Gpu::Seq::Impl {
     }
 
     // y (m, n) = x (m, k) W^T, W (n, k); or without trans_w, y = x W, W (k, n).
+    // The multiply kernel for a shape, made once per thread and device and shared by every Seq on the
+    // thread: a KV cache's Seq is new for each generation, and making kernels costs more than a token's
+    // pass. (MPS kernels are not shared across threads; each holds its device, so a device's address can't
+    // be reused while its kernels are kept.)
     MPSMatrixMultiplication* mm(int64_t m, int64_t n, int64_t k, bool trans_w = true) {
-        const auto key = std::make_tuple(m, n, k, trans_w);
-        auto it = mms.find(key);
-        if (it != mms.end()) return it->second;
+        thread_local std::map<std::tuple<const void*, int64_t, int64_t, int64_t, bool>, MPSMatrixMultiplication*> made;
+        const auto key = std::make_tuple((__bridge const void*)g.device, m, n, k, trans_w);
+        auto it = made.find(key);
+        if (it != made.end()) return it->second;
         MPSMatrixMultiplication* p = [[MPSMatrixMultiplication alloc] initWithDevice:g.device
                                                                        transposeLeft:NO
                                                                       transposeRight:trans_w ? YES : NO
@@ -1161,7 +1166,7 @@ struct Gpu::Seq::Impl {
                                                                      interiorColumns:k
                                                                                alpha:1.0
                                                                                 beta:0.0];
-        mms.emplace(key, p);
+        made.emplace(key, p);
         return p;
     }
 
@@ -1555,7 +1560,7 @@ struct Gpu::Seq::Impl {
             }
             case Op::Add:
             case Op::Copy: {
-                need(op.a, op.n);
+                need(op.a, op.n + op.offset);
                 need(op.c, op.n);
                 if (op.kind == Op::Add) need(op.b, op.n);
                 if (op.n == 0) break;
@@ -1570,7 +1575,7 @@ struct Gpu::Seq::Impl {
                     dispatch(g.add_k, op.n);
                 } else {
                     [e setComputePipelineState:g.copy_k];
-                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.a).buf offset:static_cast<NSUInteger>(op.offset) * sizeof(float) atIndex:0];
                     [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
                     [e setBytes:&cnt length:sizeof cnt atIndex:2];
                     dispatch(g.copy_k, op.n);
@@ -1692,11 +1697,13 @@ void Gpu::Seq::add(int a, int b, int out, int64_t n) {
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::copy(int x, int y, int64_t n) {
+void Gpu::Seq::copy(int x, int y, int64_t n, int64_t x_offset) {
+    if (x_offset < 0) throw std::invalid_argument("Gpu::Seq: negative copy offset");
     Impl::Op op{Impl::Op::Copy};
     op.a = x;
     op.c = y;
     op.n = n;
+    op.offset = x_offset;
     impl_->ops.push_back(op);
 }
 

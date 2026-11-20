@@ -1091,8 +1091,8 @@ void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v,
         for (size_t l = 0; l < src.size(); ++l) {
             const int64_t H = src[l].shape[0], D = src[l].shape[2];
             const int64_t cap = dst[l].empty() ? 0 : dst[l].shape[1];
-            if (len_ + n > cap) {  // grow geometrically, so that appending one position at a time stays linear
-                const int64_t grown = std::max({len_ + n, 2 * cap, int64_t(16)});
+            if (len_ + n > cap) {  // grow geometrically, with room after a prompt, so appending one position at a time stays linear
+                const int64_t grown = std::max({len_ + n + std::max<int64_t>(16, (len_ + n) / 2), 2 * cap});
                 Tensor t({H, grown, D});
                 for (int64_t h = 0; h < H; ++h)
                     std::copy(dst[l].ptr() + h * cap * D, dst[l].ptr() + (h * cap + len_) * D, t.ptr() + h * grown * D);
@@ -1128,76 +1128,85 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
                   [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
 
-    Tensor logits;
-    bool rb_kv_used = false;  // whether the pass appended the new positions to the cache's GPU copy
-    if (start == 0) {
-        logits = run_from(0, embed(tokens, &h), &h, last_only);
-    } else {
-        Tensor x = embed(tokens, &h, start);
-        detail::RowBatch rb;
-        rb.add(start, T);
-        rb.cached = true;
-        for (int64_t l = 0; l < L; ++l) {
-            rb.prefix_k.push_back(&cache.k_[l]);
-            rb.prefix_v.push_back(&cache.v_[l]);
-        }
+    detail::RowBatch rb;
+    rb.add(start, T);
+    rb.cached = true;
+    for (int64_t l = 0; l < L && start; ++l) {
+        rb.prefix_k.push_back(&cache.k_[l]);
+        rb.prefix_v.push_back(&cache.v_[l]);
+    }
 #ifdef TFI_USE_ACCELERATE
-        // The GPU, with the cache kept there (detail::GpuKV), for: chunks of tokens big enough; single
-        // tokens of models large enough that reading their weights takes the CPU longer than the GPU's
-        // pass (kDecodeWeights); and every step in GPU-only mode. Not when a hook reads
-        // the pattern, which only the CPU's cached attention hands over, or when a layer's heads are too
-        // wide for the GPU's attention.
-        bool pattern_hook = false;
-        for (int64_t l = 0; l < L && hooks; ++l) pattern_hook = pattern_hook || hooks->matches(layer_prefix(l) + "attn.hook_pattern");
-        double block_weights = 0;
-        for (const auto& kv : w_)
-            if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) block_weights += static_cast<double>(kv.second.numel());
-        const bool worth = detail::gpu_only() || T >= detail::gpu_min_rows() || block_weights >= kDecodeWeights;
-        if (use_gpu() && !pattern_hook && worth && gpu_attention_fits(layer_cfgs_, 0)) {
-            if (detail::Gpu* g = gpu()) {
-                if (!cache.gpu_ || cache.gpu_->gpu.get() != g) {  // first use, or another model's GPU
-                    auto kv = std::make_shared<detail::GpuKV>();
-                    kv->gpu = gpu_.gpu;
-                    kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
-                    cache.gpu_ = std::move(kv);
-                    cache.gpu_len_ = 0;
-                }
-                detail::GpuKV& kv = *cache.gpu_;
-                if (start + T > kv.cap) {  // grow (losing the contents: uploaded again below)
-                    kv.cap = std::max({start + T, 2 * kv.cap, int64_t(256)});
-                    for (int64_t l = 0; l < L; ++l) {
-                        const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim();
-                        kv.seq->reserve(detail::GpuKV::keys(l), n);
-                        kv.seq->reserve(detail::GpuKV::values(l), n);
-                    }
-                    cache.gpu_len_ = 0;
-                }
-                // Positions the CPU added since (the prompt's pass, CPU steps, a copy): up to the GPU.
-                for (int64_t l = 0; l < L && cache.gpu_len_ < start; ++l) {
-                    const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
-                    const int64_t c = cache.k_[l].shape[1], from = cache.gpu_len_;
-                    float* gk = kv.seq->data(detail::GpuKV::keys(l));
-                    float* gv = kv.seq->data(detail::GpuKV::values(l));
-                    for (int64_t h = 0; h < Hkv; ++h) {
-                        std::copy(cache.k_[l].ptr() + (h * c + from) * D, cache.k_[l].ptr() + (h * c + start) * D, gk + (h * kv.cap + from) * D);
-                        std::copy(cache.v_[l].ptr() + (h * c + from) * D, cache.v_[l].ptr() + (h * c + start) * D, gv + (h * kv.cap + from) * D);
-                    }
-                }
-                cache.gpu_len_ = start;
-                rb.gpu = g;
-                rb.fp16 = gpu_fp16();
-                rb.kv = &kv;
+    // The GPU, with the cache kept there (detail::GpuKV), for: the prompt when a single pass of it would
+    // go to the GPU (its keys and values then go straight into the GPU's copy); later chunks of tokens big
+    // enough; single tokens of models large enough that reading their weights takes the CPU longer than
+    // the GPU's pass (kDecodeWeights); and every step in GPU-only mode. Not when a hook reads the
+    // pattern, which only the CPU's cached attention (and a whole pass) hands over, or when a layer's heads
+    // are too wide for the GPU's attention.
+    bool pattern_hook = false;
+    for (int64_t l = 0; l < L && hooks; ++l) pattern_hook = pattern_hook || hooks->matches(layer_prefix(l) + "attn.hook_pattern");
+    detail::Gpu* g = nullptr;
+    if (use_gpu() && !pattern_hook && gpu_attention_fits(layer_cfgs_, 0)) {
+        if (start == 0) {
+            g = single_pass_gpu(*this, 0, T);
+        } else {
+            double block_weights = 0;
+            for (const auto& kv : w_)
+                if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) block_weights += static_cast<double>(kv.second.numel());
+            if (detail::gpu_only() || T >= detail::gpu_min_rows() || block_weights >= kDecodeWeights) g = gpu();
+        }
+    }
+    if (g) {
+        if (!cache.gpu_ || cache.gpu_->gpu.get() != g) {  // first use, or another model's GPU
+            auto kv = std::make_shared<detail::GpuKV>();
+            kv->gpu = gpu_.gpu;
+            kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
+            cache.gpu_ = std::move(kv);
+            cache.gpu_len_ = 0;
+        }
+        detail::GpuKV& kv = *cache.gpu_;
+        if (start + T > kv.cap) {  // grow (losing the contents: uploaded again below), with room for what follows
+            kv.cap = std::max({start + T + std::max<int64_t>(256, (start + T) / 2), 2 * kv.cap});
+            for (int64_t l = 0; l < L; ++l) {
+                const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim();
+                kv.seq->reserve(detail::GpuKV::keys(l), n);
+                kv.seq->reserve(detail::GpuKV::values(l), n);
+            }
+            cache.gpu_len_ = 0;
+        }
+        // Positions the CPU added since (a CPU step, a copy, the buffers growing): up to the GPU.
+        for (int64_t l = 0; l < L && cache.gpu_len_ < start; ++l) {
+            const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
+            const int64_t c = cache.k_[l].shape[1], from = cache.gpu_len_;
+            float* gk = kv.seq->data(detail::GpuKV::keys(l));
+            float* gv = kv.seq->data(detail::GpuKV::values(l));
+            for (int64_t h = 0; h < Hkv; ++h) {
+                std::copy(cache.k_[l].ptr() + (h * c + from) * D, cache.k_[l].ptr() + (h * c + start) * D, gk + (h * kv.cap + from) * D);
+                std::copy(cache.v_[l].ptr() + (h * c + from) * D, cache.v_[l].ptr() + (h * c + start) * D, gv + (h * kv.cap + from) * D);
             }
         }
+        cache.gpu_len_ = start;
+        rb.gpu = g;
+        rb.fp16 = gpu_fp16();
+        rb.kv = &kv;
+    }
 #endif
-        x = run_rows(0, std::move(x), rb, &h);
-        rb_kv_used = rb.kv != nullptr;
+    Tensor logits;
+    const bool rb_kv_used = rb.kv != nullptr;  // the pass appends the new positions to the cache's GPU copy
+    if (start == 0 && !rb_kv_used) {
+        logits = run_from(0, embed(tokens, &h), &h, last_only);  // the CPU, or a whole pass on the GPU
+    } else if (rb_kv_used) {
+        // Layers, final norm and unembedding in one GPU submission.
+        run_rows(0, embed(tokens, &h, start), rb, &h, false, &logits, last_only);
+        if (cfg_.final_logit_softcap) {
+            const float cap = static_cast<float>(*cfg_.final_logit_softcap);
+            for (float& v : logits.data) v = cap * vm::tanh(v / cap);
+        }
+    } else {
+        Tensor x = run_rows(0, embed(tokens, &h, start), rb, &h);
         Tensor f = final_norm(x);
         hook(&h, "hook_final", f);
         if (last_only) f = last_row(f);
-        detail::RowBatch unembed = rb;  // a pass that went to the GPU unembeds there too, whatever its rows
-        unembed.whole = rb_kv_used;
-        logits = logits_from_final(f, rb.gpu ? &unembed : nullptr);
+        logits = logits_from_final(f);
     }
     for (int64_t l = 0; l < L; ++l) {
         const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
@@ -1782,8 +1791,11 @@ bool gpu_attention_fits(const std::vector<ModelConfig>& cfgs, int64_t layer) {
 // (Gpu::Seq), the CPU doing only attention in between (or nothing, with attention on the GPU), and
 // hooks getting their activations through GpuBlocks::at. Otherwise (the CPU, or set_gpu_resident
 // false) Model::block, its linear layers still on the GPU if batch.gpu is set.
-Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows) const {
+Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows,
+                       Tensor* logits, bool logits_last_only) const {
     const int64_t L = cfg_.n_layers, d = cfg_.d_model, S = static_cast<int64_t>(batch.start.size());
+    (void)logits;  // only with a KV cache on the GPU (macOS)
+    (void)logits_last_only;
     // Each segment's last row of a (rows, d) residual stream at `src`.
     auto lasts = [&](const float* src) {
         Tensor out({S, d});
@@ -1808,9 +1820,10 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         // So does a pass reading a KV cache on the GPU (forward_cached checks the head sizes).
         const bool gpu_attention = detail::gpu_only() || batch.kv ||
                                    ((g_gpu_attention.load() || batch.whole) && gpu_attention_fits(layer_cfgs_, layer));
-        // A KV cache pass without fp16 is one submission for every layer: no run repeats (fp16's
-        // fallback to fp32 does), so later layers may overwrite slots that earlier ones read.
-        const bool single_run = batch.kv && !batch.fp16;
+        // A KV cache pass is one submission for every layer: each layer writes its own residual slot
+        // (detail::GpuKV::resid), so no run overwrites a slot it read before writing, and fp16's repeat
+        // of a run in fp32 finds its inputs intact.
+        const bool single_run = batch.kv != nullptr;
         // q, k, v alternate between two sets of slots by layer, so that a run never overwrites the
         // slots its attention reads (Gpu::Seq::run may repeat a run).
         const int qkv[2][3] = {{kQ, kK, kV}, {kQ2, kK2, kV2}};
@@ -1860,10 +1873,14 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
             }
         }
         auto other = [](int slot) { return slot == kResid0 ? static_cast<int>(kResid1) : static_cast<int>(kResid0); };
+        // Where layer l writes the residual stream: alternating slots, or (KV cache) a slot of its own.
+        auto out_slot = [&](int64_t l, int cur_slot) { return batch.kv ? detail::GpuKV::resid(l) : other(cur_slot); };
         s.reserve(kResid1, R * d);
+        if (batch.kv)
+            for (int64_t l = layer; l < L; ++l) s.reserve(detail::GpuKV::resid(l), R * d);
         std::copy(x.ptr(), x.ptr() + R * d, s.reserve(kResid0, R * d));
         int cur = kResid0;
-        LayerSlots ls = inference_slots(layer_cfgs_[layer], layer, cur, other(cur));
+        LayerSlots ls = inference_slots(layer_cfgs_[layer], layer, cur, out_slot(layer, cur));
         use_qkv(layer);
         gb.before_attention(layer, ls);
         if (!gpu_attention) gb.run();
@@ -1910,13 +1927,30 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
             }
             cur = gb.after_attention(l, ls, z);
             if (l + 1 < L) {
-                ls = inference_slots(layer_cfgs_[l + 1], l + 1, cur, other(cur));
+                ls = inference_slots(layer_cfgs_[l + 1], l + 1, cur, out_slot(l + 1, cur));
                 use_qkv(l + 1);
                 gb.before_attention(l + 1, ls);
             }
             if (!single_run) gb.run();
         }
+        int64_t logit_rows = 0;
+        if (batch.kv && logits) {  // the final norm (every row, for hook_final) and the unembedding, in the same run
+            const int fin = gb.at("hook_final", cfg_.norm_position == "post" ? cur : gb.norm("ln_final", cfg_, cur, detail::GpuKV::kFinal), d);
+            int src = fin;
+            logit_rows = logits_last_only ? 1 : R;
+            if (logits_last_only && R > 1) {
+                s.reserve(detail::GpuKV::kFinalLast, d);
+                s.copy(fin, detail::GpuKV::kFinalLast, d, (R - 1) * d);
+                src = detail::GpuKV::kFinalLast;
+            }
+            s.reserve(detail::GpuKV::kLogits, logit_rows * cfg_.vocab_size);
+            s.linear(src, detail::GpuKV::kLogits, logit_rows, unembed(), nullptr);
+        }
         if (single_run) gb.run();
+        if (logit_rows) {
+            const float* lp = s.data(detail::GpuKV::kLogits);
+            *logits = Tensor({logit_rows, cfg_.vocab_size}, std::vector<float>(lp, lp + logit_rows * cfg_.vocab_size));
+        }
         if (last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
         x = Tensor({R, d});
         std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());

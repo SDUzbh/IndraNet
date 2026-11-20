@@ -130,10 +130,12 @@ class Model {
     // only the new rows, so hooks see those: activations are (T, ...), hook_pattern is
     // (H, T, cache.size() + T), each new query over every key, and hook_pos_embed is the new positions'.
     // Whatever hook_k and hook_v leave is what later tokens attend to.
-    // macOS: these calls go to the GPU for chunks of tokens large enough, for single tokens of models of
-    // a few hundred million weights or more, and always in GPU-only mode; then the cache keeps a copy
-    // of its keys and values on the GPU, appended to there, and the pass is one GPU submission. Not when
-    // a hook reads hook_pattern, or a layer's heads are too wide for the GPU's attention: the CPU then.
+    // macOS: these calls go to the GPU for a prompt (empty cache) whose single pass would, for later
+    // chunks of tokens large enough, for single tokens of models of a few hundred million weights or more,
+    // and always in GPU-only mode; then the cache keeps a copy of its keys and values on the GPU, appended
+    // to there (a prompt's go straight in), and the pass, final norm and unembedding included, is one GPU
+    // submission, also with fp16 multiplies (set_gpu_fp16). Not when a hook reads hook_pattern, or a
+    // layer's heads are too wide for the GPU's attention: the CPU then (a prompt: forward()'s whole pass).
     Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
@@ -243,9 +245,12 @@ class Model {
     void attend_into(int64_t layer, const float* q, const float* k, const float* v, int64_t T, const Hooks* hooks,
                      const detail::RowBatch* batch, float* z_out) const;
     // Blocks layer..n_layers-1 of a batched pass; returns the residual stream after the last one:
-    // every row, or with last_rows only each segment's last row, (segments, d_model).
+    // every row, or with last_rows only each segment's last row, (segments, d_model). With a KV cache on
+    // the GPU (batch.kv) and `logits`, the final norm (hook_final, every row) and the unembedding (of the
+    // last row only with logits_last_only) run in the same GPU submission, into *logits, before any final
+    // softcap.
     Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks,
-                    bool last_rows = false) const;
+                    bool last_rows = false, Tensor* logits = nullptr, bool logits_last_only = false) const;
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
     Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
     Tensor positional_embedding(int64_t start, int64_t T) const;  // positions start..start+T-1

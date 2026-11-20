@@ -3172,6 +3172,41 @@ static void test_gpu_forward_cached(const Model& m) {
 #endif
 
 #ifdef TFI_USE_ACCELERATE
+// GPU cached passes with fp16 multiplies are one submission for every layer; when an input overflows
+// fp16 the whole run repeats in fp32, so it must find its inputs intact (each layer writes its own
+// residual slot). Embeddings scaled past fp16's range on a model without norms (the linear layers read
+// the residual stream itself) force that repeat: the result = the fp32 pass. And without overflow,
+// fp16 stays close to fp32.
+static void test_gpu_fp16_cached_repeat() {
+    const Model m = random_model(tiny([](ModelConfig& c) { c.mlp = "none"; c.norm = "none"; }), 61);
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    const Tokens t = seq(14, 62);
+    for (const float scale : {1e5f, 1.f}) {
+        Hooks big;
+        big.add("hook_embed", [scale](const std::string&, Tensor& a) { for (float& v : a.data) v *= scale; });
+        auto run = [&](bool fp16) {
+            set_device(Device::Gpu);
+            set_gpu_fp16(fp16);
+            KVCache cache;
+            std::vector<Tensor> parts{m.forward_cached(Tokens(t.begin(), t.begin() + 8), cache, &big)};
+            for (int64_t i = 8; i < 14; ++i) parts.push_back(m.forward_cached({t[i]}, cache, &big));
+            set_gpu_fp16(false);
+            set_device(Device::Both);
+            return stack_rows(parts);
+        };
+        const Tensor fp32 = run(false), fp16 = run(true);
+        if (scale > 1) {
+            check_close(fp16, fp32);  // every run overflowed and repeated in fp32
+        } else {
+            CHECK(fp16.shape == fp32.shape);
+            CHECK(max_abs_diff(fp16, fp32) <= 3e-2f * std::max(1.f, max_abs(fp32)));
+        }
+    }
+}
+
 // A long cached sequence on the GPU (macOS): steps of 1-8 tokens over ~600 earlier positions use
 // split-key attention (several chunks of keys merged), longer chunks the usual kernels; all = the CPU's
 // whole pass, with windows, softcaps, ALiBi, GQA and head sizes of every kernel.
@@ -3367,6 +3402,7 @@ int main(int argc, char** argv) {
         run("gpu", "KV cache and generate on the GPU = forward (macOS): " + kv.first,
             [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
     run("gpu", "KV cache on the GPU: long sequences, split-key attention = CPU (macOS)", test_gpu_forward_cached_long);
+    run("gpu", "KV cache on the GPU with fp16 multiplies: one run, its fp32 repeat finds the inputs intact (macOS)", test_gpu_fp16_cached_repeat);
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);
     });
