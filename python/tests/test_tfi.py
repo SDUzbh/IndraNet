@@ -389,3 +389,34 @@ def test_generate_trace_and_captures(tfi, tmp_path):
     with pytest.raises(ValueError, match="post-norm"):
         _, post = exported(tmp_path, name="post", norm_position="post", norm="layernorm")
         tfi.generate(tfi.Model.load(str(post)), TOKENS, max_new_tokens=2, trace=True)
+
+
+def test_generate_batch(tfi, tmp_path):
+    """generate_batch: sequence i = generate() with seed + i; hooks per sequence or for all; captures see each
+    sequence's own rows; traces per sequence."""
+    model, path = exported(tmp_path, n_kv_heads=2)
+    m = tfi.Model.load(str(path))
+    prompts = [TOKENS, [3, 8, 1], [7] * 6]
+    assert tfi.generate_batch(m, prompts, max_new_tokens=5) == [tfi.generate(m, p, max_new_tokens=5) for p in prompts]
+    sampled = tfi.generate_batch(m, prompts, max_new_tokens=5, temperature=1.0, seed=4)
+    assert sampled == [tfi.generate(m, p, max_new_tokens=5, temperature=1.0, seed=4 + i) for i, p in enumerate(prompts)]
+
+    def zero(a, name):
+        a[:] = 0
+    hooked = tfi.generate_batch(m, prompts, max_new_tokens=5, hooks=[None, {"blocks.1.hook_attn_out": zero}, None])
+    assert hooked[0] == tfi.generate(m, prompts[0], max_new_tokens=5)
+    assert hooked[1] == tfi.generate(m, prompts[1], max_new_tokens=5, hooks={"blocks.1.hook_attn_out": zero})
+    assert tfi.generate_batch(m, prompts, max_new_tokens=5, hooks={"blocks.1.hook_attn_out": zero}) == \
+        [tfi.generate(m, p, max_new_tokens=5, hooks={"blocks.1.hook_attn_out": zero}) for p in prompts]
+    rows = {i: [] for i in range(3)}
+    caps = [{"blocks.0.hook_resid_post": (lambda i: lambda a, n: rows[i].append(a.shape[0]))(i)} for i in range(3)]
+    tfi.generate_batch(m, prompts, max_new_tokens=3, captures=caps)
+    assert rows == {0: [len(TOKENS), 1, 1], 1: [3, 1, 1], 2: [6, 1, 1]}  # each its prompt, then one row per step
+    new, traces = tfi.generate_batch(m, prompts, max_new_tokens=4, trace=True)
+    assert len(traces) == 3 and all(len(t) == 4 for t in traces)
+    for p, toks, t in zip(prompts, new, traces):
+        _, one = tfi.generate(m, p, max_new_tokens=4, trace=True)
+        assert [s["token"] for s in t] == toks == [s["token"] for s in one]
+        assert [s["prob"] for s in t] == pytest.approx([s["prob"] for s in one], rel=1e-4)
+    with pytest.raises(ValueError, match="one per prompt"):
+        tfi.generate_batch(m, prompts, hooks=[None])

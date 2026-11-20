@@ -105,6 +105,13 @@ struct RowBatch {
     // attention runs on the GPU reading them there, the new positions' keys and values are appended to
     // it, and (without fp16) the whole pass is one GPU submission.
     GpuKV* kv = nullptr;
+    // Several sequences (Model::forward_cached on a KVBatch): segment s's earlier keys and values, per
+    // layer, instead of the shared prefix_k / prefix_v; and (with kv) where its region starts in the
+    // GPU's buffers, which hold every sequence's positions, a region each.
+    std::vector<std::vector<const Tensor*>> seg_prefix_k, seg_prefix_v;
+    std::vector<int64_t> kbase;
+    const Tensor* prefix_k_of(size_t s, int64_t layer) const { return seg_prefix_k.empty() ? prefix_k.at(layer) : seg_prefix_k.at(s).at(layer); }
+    const Tensor* prefix_v_of(size_t s, int64_t layer) const { return seg_prefix_v.empty() ? prefix_v.at(layer) : seg_prefix_v.at(s).at(layer); }
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());

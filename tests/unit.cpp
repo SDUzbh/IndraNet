@@ -2918,6 +2918,118 @@ static void test_forward_cached(const Model& m) {
     }
 }
 
+// forward_cached on a KVBatch: three sequences of different lengths, continued in uneven steps (one
+// sitting a step out), each = its own whole pass; hooks see the stacked rows; hook_pattern is refused.
+static void test_forward_cached_batch(const Model& m) {
+    const std::vector<Tokens> text = {seq(14, 81), seq(11, 82), seq(16, 83)};
+    std::vector<Tensor> full;
+    for (const Tokens& t : text) full.push_back(m.forward(t));
+    KVBatch batch(3);
+    std::vector<int64_t> at = {0, 0, 0};
+    std::vector<std::vector<Tensor>> parts(3);
+    const std::vector<std::vector<int64_t>> steps = {{5, 9, 1}, {1, 0, 1}, {1, 1, 4}, {3, 1, 1}, {4, 0, 9}};
+    for (const auto& step : steps) {
+        std::vector<Tokens> toks(3);
+        int64_t rows = 0;
+        for (int i = 0; i < 3; ++i) {
+            toks[i] = Tokens(text[i].begin() + at[i], text[i].begin() + at[i] + step[i]);
+            rows += step[i];
+        }
+        Hooks seen;
+        int64_t got_rows = -1;
+        seen.add_capture([](const std::string& n) { return n == "blocks.0.hook_resid_post"; },
+                         [&](const std::string&, Tensor& a) { got_rows = a.shape[0]; });
+        const std::vector<Tensor> lg = m.forward_cached(toks, batch, &seen);
+        CHECK(got_rows == rows);
+        for (int i = 0; i < 3; ++i) {
+            CHECK(lg[i].empty() == (step[i] == 0));
+            if (step[i]) parts[i].push_back(lg[i]);
+            at[i] += step[i];
+            CHECK(batch[i].size() == at[i]);
+        }
+    }
+    for (int i = 0; i < 3; ++i) check_close(stack_rows(parts[i]), rows(full[i], 0, at[i]));
+    // last_only: each sequence's last row
+    KVBatch b2(2);
+    const std::vector<Tensor> last = m.forward_cached({Tokens(text[0].begin(), text[0].begin() + 6), Tokens(text[1].begin(), text[1].begin() + 3)}, b2, nullptr, true);
+    check_close(last[0], rows(full[0], 5, 6));
+    check_close(last[1], rows(full[1], 2, 3));
+    Hooks pattern;
+    pattern.add_capture([](const std::string& n) { return n == "blocks.0.attn.hook_pattern"; }, [](const std::string&, Tensor&) {});
+    CHECK_THROWS(m.forward_cached({Tokens{1}, Tokens{2}}, b2, &pattern));
+    CHECK_THROWS(m.forward_cached({Tokens{1}}, b2));  // one token list per sequence
+}
+
+// generate_batch = generate() on each prompt (seed + i), hooks reaching only their sequence, early
+// stoppers sitting out, traces as generate()'s; bad arguments refused.
+static void test_generate_batch(const Model& m) {
+    const std::vector<Tokens> prompts = {seq(5, 91), seq(8, 92), seq(3, 93)};
+    GenerateOptions o;
+    o.max_new_tokens = 6;
+    // greedy: each token is the whole pass's argmax (up to a near tie)
+    const std::vector<Tokens> greedy = generate_batch(m, prompts, o);
+    for (size_t i = 0; i < prompts.size(); ++i) {
+        CHECK(greedy[i].size() == 6);
+        Tokens text = prompts[i];
+        for (int64_t tkn : greedy[i]) {
+            const Tensor lg = m.forward(text);
+            const float* last = lg.ptr() + (lg.shape[0] - 1) * lg.shape[1];
+            const int64_t want = std::max_element(last, last + lg.shape[1]) - last;
+            CHECK(tkn == want || std::fabs(last[tkn] - last[want]) < 1e-4f);
+            text.push_back(tkn);
+        }
+    }
+    // sampling: sequence i = generate() with seed + i; a hook for sequence 1 only
+    o.temperature = 1.0;
+    o.seed = 3;
+    Hooks halve;
+    halve.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { for (float& v : a.data) v *= 0.5f; });
+    const std::vector<Tokens> sampled = generate_batch(m, prompts, o, {nullptr, &halve, nullptr});
+    for (size_t i = 0; i < prompts.size(); ++i) {
+        GenerateOptions oi = o;
+        oi.seed = o.seed + i;
+        CHECK(sampled[i] == generate(m, prompts[i], oi, i == 1 ? &halve : nullptr));
+    }
+    // a sequence that stops early sits the rest out; the others go on
+    o.temperature = 0;
+    o.stop_tokens = {greedy[0][0]};
+    const std::vector<Tokens> stopped = generate_batch(m, prompts, o);
+    CHECK(stopped[0].size() == 1 && stopped[0][0] == greedy[0][0]);
+    for (size_t i = 1; i < prompts.size(); ++i) {
+        GenerateOptions oi = o;
+        CHECK(stopped[i] == generate(m, prompts[i], oi));
+    }
+    o.stop_tokens.clear();
+    // traces: as generate()'s
+    if (m.cfg().norm_position != "post") {
+        std::vector<std::vector<TraceStep>> traces;
+        const std::vector<Tokens> traced = generate_batch(m, prompts, o, {}, &traces);
+        CHECK(traced == greedy && traces.size() == prompts.size());
+        for (size_t i = 0; i < prompts.size() && i < traces.size(); ++i) {
+            std::vector<TraceStep> one;
+            generate(m, prompts[i], o, nullptr, &one);
+            CHECK(traces[i].size() == one.size());
+            for (size_t k = 0; k < one.size() && k < traces[i].size(); ++k) {
+                CHECK(traces[i][k].token == one[k].token && traces[i][k].position == one[k].position);
+                CHECK_NEAR(traces[i][k].prob, one[k].prob, 1e-4);
+                for (size_t s = 0; s < one[k].lens.size() && s < traces[i][k].lens.size(); ++s)
+                    CHECK_NEAR(traces[i][k].lens[s].target_prob, one[k].lens[s].target_prob, 1e-4);
+                for (size_t c = 0; c < one[k].dla.values.size() && c < traces[i][k].dla.values.size(); ++c)
+                    CHECK_NEAR(traces[i][k].dla.values[c], one[k].dla.values[c], 1e-3 * std::max(1.f, std::fabs(one[k].dla.values[c])));
+            }
+        }
+    }
+    CHECK_THROWS(generate_batch(m, prompts, o, {nullptr}));  // hooks: none or one per prompt
+    GenerateOptions cb = o;
+    cb.on_token = [](int64_t) { return true; };
+    CHECK_THROWS(generate_batch(m, prompts, cb));
+    GenerateOptions att = o;
+    att.trace.attention_top = 2;
+    std::vector<std::vector<TraceStep>> t;
+    CHECK_THROWS(generate_batch(m, prompts, att, {}, &t));
+    CHECK(generate_batch(m, {}, o).empty());
+}
+
 // generate(): greedy = argmax of forward() step by step; stop tokens, max_new_tokens, on_token; hooks
 // apply at every step; sampling is reproducible from its seed and follows top_k / top_p.
 static void test_generate(const Model& m) {
@@ -3162,11 +3274,14 @@ static void test_gpu_forward_cached(const Model& m) {
     }
     set_device(Device::Gpu);
     test_forward_cached(m);
+    test_forward_cached_batch(m);
     test_generate(m);
     test_generate_trace(m);
+    test_generate_batch(m);
     set_device(Device::Both);
     detail::set_gpu_min_rows(2);
     test_forward_cached(m);
+    test_forward_cached_batch(m);
     detail::set_gpu_min_rows(0);
 }
 #endif
@@ -3319,6 +3434,8 @@ int main(int argc, char** argv) {
             run("analysis", "composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
         run("analysis", "circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
         run("analysis", "KV cache: forward_cached = forward, hooks, copies: " + kv.first, [&] { test_forward_cached(m); });
+        run("analysis", "KV batch: several sequences in one pass = each alone: " + kv.first, [&] { test_forward_cached_batch(m); });
+        run("analysis", "generate_batch = generate on each, per-sequence hooks, traces: " + kv.first, [&] { test_generate_batch(m); });
         run("analysis", "generate: greedy = argmax, stops, hooks, sampling: " + kv.first, [&] { test_generate(m); });
         run("analysis", "generate's trace = full-pass analyses at each step: " + kv.first, [&] { test_generate_trace(m); });
     }

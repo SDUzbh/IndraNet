@@ -110,6 +110,24 @@ class KVCache {
     void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);
 };
 
+// Several sequences' KV caches, continued together by Model::forward_cached's batched form: each call
+// stacks the sequences given tokens into one pass, so the weights are read once for all of them. The
+// caches are read-only from outside (a sequence's history changes only through the batch, which keeps a
+// GPU copy of all of them in step).
+class KVBatch {
+  public:
+    explicit KVBatch(int64_t n = 0) : caches_(static_cast<size_t>(n)), gpu_len_(static_cast<size_t>(n), 0) {}
+    int64_t size() const { return static_cast<int64_t>(caches_.size()); }
+    const KVCache& operator[](int64_t i) const { return caches_.at(static_cast<size_t>(i)); }
+
+  private:
+    friend class Model;
+    std::vector<KVCache> caches_;
+    // macOS: every sequence's keys and values on the GPU, a region each; gpu_len_[i]: positions up to date.
+    std::shared_ptr<detail::GpuKV> gpu_;
+    std::vector<int64_t> gpu_len_;
+};
+
 class Model {
   public:
     // `format` fp16 keeps the 2-D weights in half precision (see WeightFormat).
@@ -137,6 +155,14 @@ class Model {
     // submission, also with fp16 multiplies (set_gpu_fp16). Not when a hook reads hook_pattern, or a
     // layer's heads are too wide for the GPU's attention: the CPU then (a prompt: forward()'s whole pass).
     Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
+    // Several sequences in one pass: tokens[i] continues sequence i of `batch` (empty: it sits this call
+    // out). Returns each sequence's logits as forward_cached would give them (an empty tensor for one that
+    // sat out). The sequences' rows are stacked in order, so hooks see (rows of every sequence given
+    // tokens, ...): hook_q / hook_k / hook_v (H, rows, D), the others (rows, ...). hook_pattern is not
+    // available (each sequence has its own pattern): a hook on it is refused. On the GPU under the same
+    // rules as forward_cached, the batch keeping every sequence's keys and values there.
+    std::vector<Tensor> forward_cached(const std::vector<Tokens>& tokens, KVBatch& batch, const Hooks* hooks = nullptr,
+                                       bool last_only = false) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
     // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping
@@ -254,6 +280,9 @@ class Model {
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
     Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
     Tensor positional_embedding(int64_t start, int64_t T) const;  // positions start..start+T-1
+    Tensor positional_embedding_at(const std::vector<int64_t>& positions) const;  // one row per position
+    // embed() with each token's own position (several sequences stacked, each at its own place).
+    Tensor embed_at(const Tokens& tokens, const std::vector<int64_t>& positions, const Hooks* hooks) const;
     // forward_from, with only the last row unembedded when last_only (hook_final still sees every row).
     Tensor run_from(int64_t layer, Tensor resid, const Hooks* hooks, bool last_only) const;
 };

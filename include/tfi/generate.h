@@ -76,4 +76,14 @@ class Sampler {
 Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
                 const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
 
+// Several sequences at once: sequence i continues prompts[i] as generate() would with seed options.seed
+// + i, each step's passes stacked into one (Model::forward_cached on a KVBatch), so the weights are
+// read once for all of them. A sequence that stops sits the later steps out. hooks (empty, or one per
+// sequence, each may be null) apply to their sequence only: each sees its own rows of every activation
+// (hook_pattern is not available). traces: one per sequence, as generate()'s trace (attention_top must
+// be 0). options.on_token is not used: give generate() one sequence to follow it token by token.
+std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts, const GenerateOptions& options = {},
+                                   const std::vector<const Hooks*>& hooks = {},
+                                   std::vector<std::vector<TraceStep>>* traces = nullptr);
+
 }  // namespace tfi

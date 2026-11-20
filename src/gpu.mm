@@ -252,17 +252,19 @@ kernel void rope_pass_k(device const float* x [[buffer(0)]], device float* y [[b
 
 // Causal attention, one threadgroup per (row, head): the row's allowed keys in tiles of 1024 with a
 // running softmax (max m, sum l), the weighted values accumulated per dimension (at most 4 per thread).
-struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
+struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
 kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
                    device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
                    device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                   device float* lse [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                   device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float qs[512];
     threadgroup float ss[1024];
     threadgroup float part[32];
     const uint D = a.D, r = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
     const uint pos = meta[4 * r], start = meta[4 * r + 1], off = meta[4 * r + 2];
+    const uint kb = a.has_kbase != 0 ? kbase[r] : 0;  // where the row's sequence starts in pk / pv (batched caches)
     device const float* qr = q + (ulong(r) * a.H + h) * D;
     for (uint d = tid; d < D; d += tg) qs[d] = qr[d];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -274,7 +276,7 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
         float cmax = -INFINITY;
         for (uint jj = tid; jj < n; jj += tg) {
             const uint j = c0 + jj;
-            device const float* kr = j < start ? pk + (ulong(g) * a.Tp + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
+            device const float* kr = j < start ? pk + (ulong(g) * a.Tp + kb + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
             float s = 0.f;
             for (uint d = 0; d < D; ++d) s += qs[d] * kr[d];
             s *= a.scale;
@@ -298,7 +300,7 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
             float s = acc[t] * keep;
             for (uint jj = 0; jj < n; ++jj) {
                 const uint j = c0 + jj;
-                device const float* vr = j < start ? pv + (ulong(g) * a.Tp + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
+                device const float* vr = j < start ? pv + (ulong(g) * a.Tp + kb + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
                 s += ss[jj] * vr[d];
             }
             acc[t] = s;
@@ -320,7 +322,8 @@ constant uint kSplitKeys = 256;
 kernel void attn_split_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
                          device float* part [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
                          device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                         constant uint& nsplit [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         constant uint& nsplit [[buffer(9)]], device const uint* kbase [[buffer(10)]],
+                         uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float qs[512];
@@ -328,6 +331,7 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
     threadgroup float red[32];
     const uint D = a.D, split = tgid % nsplit, rh = tgid / nsplit, r = rh / a.H, h = rh % a.H, g = h / (a.H / a.Hkv);
     const uint pos = meta[4 * r], start = meta[4 * r + 1], off = meta[4 * r + 2];
+    const uint kb = a.has_kbase != 0 ? kbase[r] : 0;  // where the row's sequence starts in pk / pv (batched caches)
     const uint lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
     const uint c0 = lo + split * kSplitKeys;
     device float* out = part + ulong(tgid) * (D + 2);
@@ -346,7 +350,7 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
     float cmax = -INFINITY;
     for (uint jj = tid; jj < n; jj += tg) {
         const uint j = c0 + jj;
-        device const float* kr = j < start ? pk + (ulong(g) * a.Tp + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
+        device const float* kr = j < start ? pk + (ulong(g) * a.Tp + kb + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
         float sc = 0.f;
         for (uint d = 0; d < D; ++d) sc += qs[d] * kr[d];
         sc *= a.scale;
@@ -367,7 +371,7 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
         float acc = 0.f;
         for (uint jj = 0; jj < n; ++jj) {
             const uint j = c0 + jj;
-            device const float* vr = j < start ? pv + (ulong(g) * a.Tp + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
+            device const float* vr = j < start ? pv + (ulong(g) * a.Tp + kb + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
             acc += ss[jj] * vr[d];
         }
         out[2 + d] = acc;
@@ -586,13 +590,14 @@ kernel void attn_bwd_dkv_k(device const float* q [[buffer(0)]], device const flo
 kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
                        device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
                        device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                       device float* lse [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+                       device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float sh[AQ * AD];          // the block's queries, then each tile's keys and values
     threadgroup float* Ks = sh;
     threadgroup float* Vs = sh + AK * AD;
     const uint D = a.D, b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
     const uint off = blk[4 * b], nq = blk[4 * b + 1], start = blk[4 * b + 2], seg = blk[4 * b + 3];
+    const uint kb = a.has_kbase != 0 ? kbase[off] : 0;  // a block's rows are one segment's
     const uint pos0 = start + (off - seg);   // position of the block's first row
     const uint last = pos0 + nq - 1;
     const uint lo = (a.window != 0 && pos0 + 1 > a.window) ? pos0 + 1 - a.window : 0;
@@ -621,7 +626,7 @@ kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* 
             const uint jj = e / D, d = e % D, j = j0 + jj;
             float kv = 0.f, vv = 0.f;
             if (j <= last) {
-                const ulong src = j < start ? (ulong(g) * a.Tp + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
+                const ulong src = j < start ? (ulong(g) * a.Tp + kb + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
                 kv = j < start ? pk[src] : k[src];
                 vv = j < start ? pv[src] : v[src];
             }
@@ -822,7 +827,7 @@ struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; float scale; };
 struct PassArgs { uint32_t D, rot, n; };
 struct KvArgs { uint32_t rows, heads, D, cap, start; };
 constexpr int64_t kSplitKeys = 256;  // as the kernel's
-struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
+struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
 
 // Write src as fp16; false if a value is outside fp16's range (or not finite).
 bool to_half(const float* src, __fp16* dst, int64_t n) {
@@ -1095,12 +1100,14 @@ struct Gpu::Seq::Impl {
     struct Op {
         enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply, KvAppend } kind;
         int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0, j = -1;
+        int kb = -1;                     // Attention: each row's start in pk / pv (uint), or none
         int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
         Gpu::Seq::AttnShape attn{};      // Attention
         int64_t heads = 0, D = 0, rot = 0;  // Rope
         float scale = 1.f;                  // Rope
         int64_t rows = 0, n = 0;
-        int64_t offset = 0;            // Copy: where in slot a it starts (floats)
+        int64_t offset = 0;            // Copy, KvAppend: where in slot a it starts (floats)
+        int64_t offset_y = 0;          // Copy: where in slot c it goes
         const Tensor* W = nullptr;     // Norm, NormBwd
         const Tensor* bias = nullptr;  // Norm
         const Weight* lw = nullptr;    // Linear, LinearT
@@ -1342,14 +1349,14 @@ struct Gpu::Seq::Impl {
             }
             case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start
                 const int64_t n = op.rows * op.heads * op.D;
-                need(op.a, n);
+                need(op.a, op.offset + n);
                 need(op.c, op.heads * op.n * op.D);
                 if (op.rot + op.rows > op.n) throw std::logic_error("Gpu::Seq: kv_append past the cache's capacity");
                 if (n == 0) break;
                 const KvArgs args{u32(op.rows), u32(op.heads), u32(op.D), u32(op.n), u32(op.rot)};
                 id<MTLComputeCommandEncoder> e = compute();
                 [e setComputePipelineState:g.kv_append_k];
-                [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                [e setBuffer:slot(op.a).buf offset:static_cast<NSUInteger>(op.offset) * sizeof(float) atIndex:0];
                 [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
                 [e setBytes:&args length:sizeof args atIndex:2];
                 dispatch(g.kv_append_k, n);
@@ -1398,8 +1405,10 @@ struct Gpu::Seq::Impl {
                 need(op.g, 4 * A.rows);
                 if (A.has_slopes) need(op.h, A.H);
                 if (op.j >= 0) need(op.j, A.rows * A.H);
+                if (op.kb >= 0) need(op.kb, A.rows);
                 if (A.rows == 0) break;
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), u32(A.Tp), u32(A.window), A.has_slopes ? 1u : 0u, op.j >= 0 ? 1u : 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), u32(A.Tp), u32(A.window), A.has_slopes ? 1u : 0u, op.j >= 0 ? 1u : 0u,
+                                    op.kb >= 0 ? 1u : 0u, A.scale, A.cap};
                 // Few rows over more keys than one chunk, without lse (only gradient passes ask for it):
                 // split the keys across threadgroups (flash-decoding), then merge.
                 const int64_t max_keys = A.Tp + A.rows;  // no row attends to more
@@ -1424,6 +1433,7 @@ struct Gpu::Seq::Impl {
                     [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
                     [e setBytes:&args length:sizeof args atIndex:8];
                     [e setBytes:&ns length:sizeof ns atIndex:9];
+                    [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
                     const NSUInteger tg = std::min<NSUInteger>(256, g.attn_split_k.maxTotalThreadsPerThreadgroup);
                     [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H * nsplit)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                     id<MTLComputeCommandEncoder> e2 = compute();
@@ -1450,6 +1460,7 @@ struct Gpu::Seq::Impl {
                 [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
                 [e setBytes:&args length:sizeof args atIndex:8];
                 [e setBuffer:slot(op.j >= 0 ? op.j : op.c).buf offset:0 atIndex:9];
+                [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
                 if (tiled) {
                     if (g.attn_mma_k.maxTotalThreadsPerThreadgroup < 128) throw std::runtime_error("GPU: the attention kernel needs 128 threads");
                     [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1464,7 +1475,7 @@ struct Gpu::Seq::Impl {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 const int64_t T = A.rows;
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, 0u, A.scale, A.cap};
                 const uint32_t t32 = u32(T);
                 id<MTLComputeCommandEncoder> e = compute();
                 if (op.kind == Op::Pattern) {  // q a, k b, lse f, slopes h, P c
@@ -1527,7 +1538,7 @@ struct Gpu::Seq::Impl {
                     [e setBytes:args length:sizeof args atIndex:3];
                     dispatch(g.attn_delta_k, A.rows * A.H);
                 }
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, 0u, A.scale, A.cap};
                 auto common = [&](id<MTLComputeCommandEncoder> e) {
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                     [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
@@ -1561,7 +1572,7 @@ struct Gpu::Seq::Impl {
             case Op::Add:
             case Op::Copy: {
                 need(op.a, op.n + op.offset);
-                need(op.c, op.n);
+                need(op.c, op.n + (op.kind == Op::Copy ? op.offset_y : 0));
                 if (op.kind == Op::Add) need(op.b, op.n);
                 if (op.n == 0) break;
                 const uint32_t cnt = u32(op.n);
@@ -1576,7 +1587,7 @@ struct Gpu::Seq::Impl {
                 } else {
                     [e setComputePipelineState:g.copy_k];
                     [e setBuffer:slot(op.a).buf offset:static_cast<NSUInteger>(op.offset) * sizeof(float) atIndex:0];
-                    [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.c).buf offset:static_cast<NSUInteger>(op.offset_y) * sizeof(float) atIndex:1];
                     [e setBytes:&cnt length:sizeof cnt atIndex:2];
                     dispatch(g.copy_k, op.n);
                 }
@@ -1697,13 +1708,14 @@ void Gpu::Seq::add(int a, int b, int out, int64_t n) {
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::copy(int x, int y, int64_t n, int64_t x_offset) {
-    if (x_offset < 0) throw std::invalid_argument("Gpu::Seq: negative copy offset");
+void Gpu::Seq::copy(int x, int y, int64_t n, int64_t x_offset, int64_t y_offset) {
+    if (x_offset < 0 || y_offset < 0) throw std::invalid_argument("Gpu::Seq: negative copy offset");
     Impl::Op op{Impl::Op::Copy};
     op.a = x;
     op.c = y;
     op.n = n;
     op.offset = x_offset;
+    op.offset_y = y_offset;
     impl_->ops.push_back(op);
 }
 
@@ -1729,9 +1741,11 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start) {
+void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row) {
     if (src == dst) throw std::invalid_argument("Gpu::Seq: kv_append into the slot it reads");
+    if (src_row < 0) throw std::invalid_argument("Gpu::Seq: negative kv_append row");
     Impl::Op op{Impl::Op::KvAppend};
+    op.offset = src_row * heads * D;
     op.a = src;
     op.c = dst;
     op.rows = rows;
@@ -1759,7 +1773,8 @@ void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk, int lse) {
+void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk, int lse,
+                         int kbase) {
     if (z == q || z == k || z == v) throw std::invalid_argument("Gpu::Seq: attention writes z to a slot of its own");
     if (lse >= 0 && (lse == q || lse == k || lse == v || lse == z)) throw std::invalid_argument("Gpu::Seq: attention writes lse to a slot of its own");
     Impl::Op op{Impl::Op::Attention};
@@ -1773,6 +1788,7 @@ void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, i
     op.h = slopes;
     op.i = blk;
     op.j = lse;
+    op.kb = kbase;
     op.attn = shape;
     impl_->ops.push_back(op);
 }

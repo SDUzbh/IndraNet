@@ -140,6 +140,11 @@ build/indra generate llama.safetensors --text "Once upon a time" --temperature 0
 logit-lens stage where it was the top prediction, and the largest parts of its logit (direct logit
 attribution), all from the pass that chose it.
 
+From C++ and Python, `generate_batch` continues several prompts at once, one stacked pass per step,
+so the weights are read once for all of them. Each sequence comes out as `generate` would give it
+(seed + i for sampling), and can have hooks of its own: for example the same prompt with and without
+an intervention, side by side.
+
 `generate` runs the prompt in one pass and then each new token alone, reading the earlier
 positions' keys and values from a KV cache. On macOS, models of a few hundred million weights or
 more generate on the GPU, with the cache kept there. It stops at the model's end-of-text tokens (stored for
@@ -333,6 +338,7 @@ opt.temperature = 0.8;                                       // 0 (default): gre
 Tokens more = generate(m, t, opt, &hooks);                   // hooks apply at every step
 std::vector<TraceStep> trace;                                // per new token: prob, logit lens, DLA, attention
 generate(m, t, opt, nullptr, &trace);                        // (opt.trace says which)
+std::vector<Tokens> both = generate_batch(m, {t, t}, opt, {nullptr, &hooks});  // baseline and intervention, one pass a step
 std::string text = m.decode(more);
 
 const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
@@ -376,6 +382,8 @@ new, steps = tfi.generate(m, t, max_new_tokens=20, trace=True)   # per token: pr
 steps[0]["lens"]["rank"], steps[0]["dla"]["labels"]                # DLA (+ trace_attention=k: where heads looked)
 keep = lambda a, name: print(name, a.shape)                        # captures only read: a GPU pass doesn't stop
 tfi.generate(m, t, max_new_tokens=5, captures={"blocks.10.hook_resid_post": keep})
+base, edited = tfi.generate_batch(m, [t, t], max_new_tokens=20,     # several at once; hooks per sequence
+                                  hooks=[None, {"blocks.15.attn.hook_z": knock_out}])
 cache = tfi.KVCache()                      # step by step: forward_cached runs only the new tokens
 logits = m.forward_cached(t, cache)
 logits = m.forward_cached([mary], cache)   # (1, vocab); hooks see the new rows

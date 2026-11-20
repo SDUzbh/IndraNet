@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <set>
@@ -173,6 +174,125 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
         if (options.on_token && !options.on_token(t)) more = false;
         if (!more) return out;
         logits = model.forward_cached({t}, cache, h, /*last_only=*/true);
+    }
+}
+
+namespace {
+
+// Hooks for a batched pass that give each sequence its own hooks: every hook point's stacked activation
+// split into each sequence's rows (dimension 1 for hook_q / hook_k / hook_v, (H, rows, D); dimension 0
+// otherwise), that sequence's hooks run on its slice, and what they leave written back. A hook point that
+// only captures stays a capture (a GPU pass doesn't stop for it).
+struct PerSequenceHooks {
+    std::vector<Hooks> of;  // per sequence
+    std::vector<std::pair<int64_t, std::pair<int64_t, int64_t>>> segs;  // this pass: (sequence, (first row, rows))
+    Hooks all;
+
+    static bool heads_first(const std::string& n) {
+        auto ends = [&](const char* e) { const size_t l = std::strlen(e); return n.size() >= l && n.compare(n.size() - l, l, e) == 0; };
+        return ends("attn.hook_q") || ends("attn.hook_k") || ends("attn.hook_v");
+    }
+    void each(const std::string& name, Tensor& act, bool write) {
+        const int dim = heads_first(name) ? 1 : 0;
+        const int64_t outer = dim ? act.shape[0] : 1, rows = act.shape[dim];
+        int64_t inner = 1;
+        for (int64_t k = dim + 1; k < act.dim(); ++k) inner *= act.shape[k];
+        for (const auto& sg : segs) {
+            const Hooks& h = of[sg.first];
+            if (!h.matches(name)) continue;
+            const int64_t r0 = sg.second.first, n = sg.second.second;
+            Shape shape = act.shape;
+            shape[dim] = n;
+            Tensor slice(shape);
+            for (int64_t o = 0; o < outer; ++o)
+                std::copy(act.ptr() + (o * rows + r0) * inner, act.ptr() + (o * rows + r0 + n) * inner, slice.ptr() + o * n * inner);
+            h.run(name, slice);
+            if (!write) continue;
+            if (slice.shape != shape) throw std::runtime_error(name + ": a hook changed the activation's shape");
+            for (int64_t o = 0; o < outer; ++o)
+                std::copy(slice.ptr() + o * n * inner, slice.ptr() + (o + 1) * n * inner, act.ptr() + (o * rows + r0) * inner);
+        }
+    }
+    explicit PerSequenceHooks(size_t n) : of(n) {
+        all.add_filter([this](const std::string& name) {
+                           for (const Hooks& h : of)
+                               if (h.changes(name)) return true;
+                           return false;
+                       },
+                       [this](const std::string& name, Tensor& act) { each(name, act, true); });
+        all.add_capture([this](const std::string& name) {
+                            bool any = false;
+                            for (const Hooks& h : of) {
+                                if (h.changes(name)) return false;  // handled above
+                                any = any || h.matches(name);
+                            }
+                            return any;
+                        },
+                        [this](const std::string& name, Tensor& act) { each(name, act, false); });
+    }
+};
+
+}  // namespace
+
+std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts, const GenerateOptions& options,
+                                   const std::vector<const Hooks*>& hooks, std::vector<std::vector<TraceStep>>* traces) {
+    const size_t n = prompts.size();
+    if (!hooks.empty() && hooks.size() != n) throw std::invalid_argument("generate_batch: hooks must be empty or one per prompt");
+    if (options.on_token) throw std::invalid_argument("generate_batch: on_token is not used here; give generate() one prompt to follow it");
+    if (traces && options.trace.attention_top > 0)
+        throw std::invalid_argument("generate_batch: a trace's attention needs each sequence's pattern; use generate() for that");
+    for (const Tokens& p : prompts)
+        if (p.empty()) throw std::invalid_argument("generate_batch needs every prompt to have at least one token");
+    std::vector<Sampler> samplers;
+    for (size_t i = 0; i < n; ++i) {
+        GenerateOptions o = options;
+        o.seed = options.seed + i;
+        samplers.emplace_back(o);
+    }
+    std::set<int64_t> stop(options.stop_tokens.begin(), options.stop_tokens.end());
+    if (options.stop_at_eos) stop.insert(model.eos_tokens().begin(), model.eos_tokens().end());
+    std::vector<Tokens> out(n);
+    if (n == 0 || options.max_new_tokens == 0) return out;
+
+    PerSequenceHooks ph(n);
+    std::vector<std::optional<TraceRecorder>> recs(n);
+    bool any_hooks = false;
+    for (size_t i = 0; i < n; ++i) {
+        if (!hooks.empty() && hooks[i]) {
+            ph.of[i].extend(*hooks[i]);
+            any_hooks = true;
+        }
+        if (traces) {
+            recs[i].emplace(model, options.trace);
+            TraceRecorder* r = &*recs[i];
+            ph.of[i].add_capture([r](const std::string& nm) { return r->points.count(nm) > 0; },
+                                 [r](const std::string& nm, Tensor& a) { r->capture(nm, a); });
+            any_hooks = true;
+        }
+    }
+    if (traces) traces->assign(n, {});
+
+    KVBatch batch(static_cast<int64_t>(n));
+    std::vector<Tokens> step = prompts;
+    for (;;) {
+        ph.segs.clear();
+        int64_t row = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (!step[i].empty()) {
+                ph.segs.push_back({static_cast<int64_t>(i), {row, static_cast<int64_t>(step[i].size())}});
+                row += static_cast<int64_t>(step[i].size());
+            }
+        if (ph.segs.empty()) return out;
+        const std::vector<Tensor> logits = model.forward_cached(step, batch, any_hooks ? &ph.all : nullptr, /*last_only=*/true);
+        for (size_t i = 0; i < n; ++i) {
+            if (step[i].empty()) continue;
+            const Tensor& lg = logits[i];
+            const int64_t t = samplers[i](lg.ptr(), lg.shape[1]);
+            if (traces) (*traces)[i].push_back(recs[i]->step(lg.ptr(), lg.shape[1], t, batch[static_cast<int64_t>(i)].size() - 1));
+            out[i].push_back(t);
+            const bool more = !stop.count(t) && static_cast<int64_t>(out[i].size()) < options.max_new_tokens;
+            step[i] = more ? Tokens{t} : Tokens{};
+        }
     }
 }
 

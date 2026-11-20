@@ -79,10 +79,10 @@ class Gpu::Seq {
     void activate(int x, int64_t n, GpuAct act);         // in place
     void glu(int gate, int up, int64_t n, GpuAct act);   // gate = act(gate) * up
     void add(int a, int b, int out, int64_t n);          // out = a + b; out may be a or b
-    void copy(int x, int y, int64_t n, int64_t x_offset = 0);  // y[0, n) = x[x_offset, x_offset + n)
-    // A KV cache's new positions: rows of `src` (rows, heads * D) into `dst` (heads, cap, D), as
+    void copy(int x, int y, int64_t n, int64_t x_offset = 0, int64_t y_offset = 0);  // y[y_offset..][0, n) = x[x_offset..][0, n)
+    // A KV cache's new positions: rows src_row.. of `src` (rows, heads * D) into `dst` (heads, cap, D), as
     // positions start .. start + rows - 1 (start + rows <= cap).
-    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start);
+    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row = 0);
     // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
     // norm()'s input gradient given its input x and output gradient dy (as grad.cpp's norm_backward);
     // dpre = dpost * act'(pre); and for a GLU, post = act(pre) * up: dpre = dpost * up * act'(pre),
@@ -113,8 +113,10 @@ class Gpu::Seq {
     };
     // lse >= 0: also each (row, head)'s log of the sum of exp(score) into that slot (rows, H), for
     // attention_backward.
+    // kbase >= 0: a slot of one uint per row, where its sequence's positions start in pk / pv (several
+    // sequences' caches in one buffer, each in a region of its own: positions j at kbase + j).
     void attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk = 0,
-                   int lse = -1);
+                   int lse = -1, int kbase = -1);
     // attention()'s backward pass with no earlier positions (shape.Tp = 0): from dz (rows, H D) and
     // the forward pass's q, k, v, z and lse, dq into `dq` (rows, H D), dk and dv into `dk`, `dv`
     // (rows, Hkv D); `delta` is scratch (rows, H).
@@ -150,10 +152,11 @@ class Gpu::Seq {
 // the logits.
 struct GpuKV {
     static constexpr int kSlot0 = 256;  // above every slot run_rows uses
-    static constexpr int kFinal = kSlot0 - 3, kFinalLast = kSlot0 - 2, kLogits = kSlot0 - 1;
+    static constexpr int kKBase = kSlot0 - 4, kFinal = kSlot0 - 3, kFinalLast = kSlot0 - 2, kLogits = kSlot0 - 1;
     std::shared_ptr<Gpu> gpu;           // kept alive with the cache
     std::unique_ptr<Gpu::Seq> seq;
-    int64_t cap = 0;                    // positions each layer's slots hold
+    int64_t cap = 0;                    // positions each sequence's region of a layer's slots holds
+    int64_t regions = 1;                // sequences (a KVBatch's), region r at positions r * cap ..
     static int keys(int64_t layer) { return kSlot0 + 5 * static_cast<int>(layer); }
     static int values(int64_t layer) { return keys(layer) + 1; }
     static int inv_freq(int64_t layer) { return keys(layer) + 2; }

@@ -151,6 +151,59 @@ Device parse_device(const std::string& s) {
 
 const char* device_name(Device d) { return d == Device::Cpu ? "cpu" : d == Device::Gpu ? "gpu" : "both"; }
 
+// A generate() trace as Python: a dict per new token (see tfi.generate).
+nb::list trace_list(std::vector<TraceStep>& steps, const TraceOptions& opt) {
+    nb::list list;
+    for (TraceStep& st : steps) {
+        nb::dict d;
+        d["token"] = st.token;
+        d["position"] = st.position;
+        d["prob"] = st.prob;
+        d["logprob"] = st.logprob;
+        d["top_tokens"] = st.top_tokens;
+        d["top_probs"] = st.top_probs;
+        if (opt.lens) {
+            const size_t S = st.lens.size();
+            std::vector<std::string> stages;
+            std::vector<float> prob;
+            std::vector<int64_t> rank, top;
+            for (const LensEntry& e : st.lens) {
+                stages.push_back(e.stage);
+                prob.push_back(e.target_prob);
+                rank.push_back(e.target_rank);
+                top.push_back(e.top_tokens.empty() ? -1 : e.top_tokens[0]);
+            }
+            nb::dict lens;
+            lens["stages"] = stages;
+            lens["prob"] = to_numpy(std::move(prob), {S});
+            lens["rank"] = to_numpy(std::move(rank), {S});
+            lens["top"] = to_numpy(std::move(top), {S});
+            d["lens"] = lens;
+        }
+        if (opt.dla) {
+            nb::dict dla;
+            const size_t n = st.dla.values.size();
+            dla["labels"] = st.dla.labels;
+            dla["values"] = to_numpy(std::move(st.dla.values), {n});
+            dla["sum"] = st.dla.sum;
+            dla["actual"] = st.dla.actual;
+            d["dla"] = dla;
+        }
+        if (opt.attention_top > 0) {
+            nb::dict att;
+            for (const TraceStep::Attention& a : st.attention) {
+                nb::dict one;
+                one["positions"] = a.positions;
+                one["weights"] = a.weights;
+                att[nb::str(a.head.c_str())] = one;
+            }
+            d["attention"] = att;
+        }
+        list.append(d);
+    }
+    return list;
+}
+
 // The logit-lens stages, as logit_lens defines them: (label, hook point of the residual stream).
 std::vector<std::pair<std::string, std::string>> lens_stages(const Model& m) {
     std::vector<std::pair<std::string, std::string>> stages = {{"embed", "blocks.0.hook_resid_pre"}};
@@ -382,54 +435,7 @@ NB_MODULE(_tfi, mod) {
             out = generate(m, tokens, o, h ? &*h : nullptr, trace ? &steps : nullptr);
         }
         if (!trace) return nb::cast(out);
-        nb::list list;
-        for (TraceStep& st : steps) {
-            nb::dict d;
-            d["token"] = st.token;
-            d["position"] = st.position;
-            d["prob"] = st.prob;
-            d["logprob"] = st.logprob;
-            d["top_tokens"] = st.top_tokens;
-            d["top_probs"] = st.top_probs;
-            if (o.trace.lens) {
-                const size_t S = st.lens.size();
-                std::vector<std::string> stages;
-                std::vector<float> prob;
-                std::vector<int64_t> rank, top;
-                for (const LensEntry& e : st.lens) {
-                    stages.push_back(e.stage);
-                    prob.push_back(e.target_prob);
-                    rank.push_back(e.target_rank);
-                    top.push_back(e.top_tokens.empty() ? -1 : e.top_tokens[0]);
-                }
-                nb::dict lens;
-                lens["stages"] = stages;
-                lens["prob"] = to_numpy(std::move(prob), {S});
-                lens["rank"] = to_numpy(std::move(rank), {S});
-                lens["top"] = to_numpy(std::move(top), {S});
-                d["lens"] = lens;
-            }
-            if (o.trace.dla) {
-                nb::dict dla;
-                const size_t n = st.dla.values.size();
-                dla["labels"] = st.dla.labels;
-                dla["values"] = to_numpy(std::move(st.dla.values), {n});
-                dla["sum"] = st.dla.sum;
-                dla["actual"] = st.dla.actual;
-                d["dla"] = dla;
-            }
-            if (o.trace.attention_top > 0) {
-                nb::dict att;
-                for (const TraceStep::Attention& a : st.attention) {
-                    nb::dict one;
-                    one["positions"] = a.positions;
-                    one["weights"] = a.weights;
-                    att[nb::str(a.head.c_str())] = one;
-                }
-                d["attention"] = att;
-            }
-            list.append(d);
-        }
+        nb::list list = trace_list(steps, o.trace);
         return nb::make_tuple(out, list);
     }, "model"_a, "prompt"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0, "top_k"_a = 0, "top_p"_a = 1.0, "seed"_a = 0,
        "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(), "on_token"_a = nb::none(),
@@ -442,6 +448,74 @@ NB_MODULE(_tfi, mod) {
        "new token's. With trace, returns (tokens, steps): per new token a dict of its probability, the top tokens, "
        "and (trace_lens) the logit lens at its position, (trace_dla) direct logit attribution of its logit, "
        "(trace_attention > 0) each head's most attended positions.");
+
+    mod.def("generate_batch", [](const Model& m, nb::list prompts, int64_t max_new_tokens, double temperature, int64_t top_k,
+                                 double top_p, uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos, nb::object hooks,
+                                 nb::object captures, bool trace, int64_t trace_top_k, bool trace_lens, bool trace_dla) -> nb::object {
+        std::vector<Tokens> ps;
+        for (nb::handle p : prompts) {
+            if (nb::isinstance<nb::str>(p)) {
+                const std::string text = nb::cast<std::string>(p);
+                nb::gil_scoped_release release;
+                ps.push_back(m.tokenize(text));
+            } else {
+                ps.push_back(nb::cast<Tokens>(p));
+            }
+        }
+        const size_t n = ps.size();
+        // hooks / captures: one dict for every sequence, or a list with a dict (or None) per sequence.
+        auto per_seq = [&](nb::object x, const char* what) {
+            std::vector<std::optional<nb::dict>> v(n);
+            if (x.is_none()) return v;
+            if (nb::isinstance<nb::dict>(x)) {
+                for (auto& d : v) d = nb::cast<nb::dict>(x);
+                return v;
+            }
+            nb::list l = nb::cast<nb::list>(x);
+            if (l.size() != n) throw std::invalid_argument(std::string(what) + ": one per prompt (or one dict for all)");
+            for (size_t i = 0; i < n; ++i)
+                if (!l[i].is_none()) v[i] = nb::cast<nb::dict>(l[i]);
+            return v;
+        };
+        const std::vector<std::optional<nb::dict>> hs = per_seq(hooks, "hooks"), cs = per_seq(captures, "captures");
+        std::vector<std::optional<Hooks>> built(n);
+        std::vector<const Hooks*> ptrs(n, nullptr);
+        bool any = false;
+        for (size_t i = 0; i < n; ++i) {
+            built[i] = python_hooks(m, hs[i], cs[i]);
+            if (built[i]) {
+                ptrs[i] = &*built[i];
+                any = true;
+            }
+        }
+        GenerateOptions o;
+        o.max_new_tokens = max_new_tokens;
+        o.temperature = temperature;
+        o.top_k = top_k;
+        o.top_p = top_p;
+        o.seed = seed;
+        if (stop_tokens) o.stop_tokens = *stop_tokens;
+        o.stop_at_eos = stop_at_eos;
+        o.trace.top_k = trace_top_k;
+        o.trace.lens = trace_lens;
+        o.trace.dla = trace_dla;
+        std::vector<std::vector<TraceStep>> traces;
+        std::vector<Tokens> out;
+        {
+            nb::gil_scoped_release release;
+            out = generate_batch(m, ps, o, any ? ptrs : std::vector<const Hooks*>{}, trace ? &traces : nullptr);
+        }
+        if (!trace) return nb::cast(out);
+        nb::list tl;
+        for (auto& t : traces) tl.append(trace_list(t, o.trace));
+        return nb::make_tuple(out, tl);
+    }, "model"_a, "prompts"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0, "top_k"_a = 0, "top_p"_a = 1.0, "seed"_a = 0,
+       "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(), "captures"_a = nb::none(), "trace"_a = false,
+       "trace_top_k"_a = 5, "trace_lens"_a = true, "trace_dla"_a = true,
+       "Several sequences at once, one stacked pass per step (the weights read once for all): sequence i continues "
+       "prompts[i] (token ids, or text) as generate() would with seed + i. hooks / captures: one dict for every "
+       "sequence, or a list with a dict (or None) per sequence, each seeing only its sequence's rows (hook_pattern is "
+       "not available). Returns a list of new token lists, with trace=True (lists, per-sequence traces).");
 
     // --- analyses ------------------------------------------------------------------------
     mod.def("logit_metric", [](const FloatIn& logits, int64_t pos, int64_t target, int64_t other) {
