@@ -351,3 +351,41 @@ def test_tokenizer_decode_matches_tokenizers(tfi):
                 ids = hf.encode(text, add_special_tokens=special).ids
                 for skip in (False, True):
                     assert tok.decode(ids, skip) == hf.decode(ids, skip_special_tokens=skip), (style, text, special, skip)
+
+
+def test_generate_trace_and_captures(tfi, tmp_path):
+    """generate(trace=True): per new token its probability (= the full pass's), top tokens, logit lens, DLA
+    adding up to its logit, and each head's most attended positions; captures read without editing."""
+    model, path = exported(tmp_path, n_kv_heads=2)
+    m = tfi.Model.load(str(path))
+    new, steps = tfi.generate(m, TOKENS, max_new_tokens=4, trace=True, trace_top_k=3, trace_attention=2)
+    assert new == tfi.generate(m, TOKENS, max_new_tokens=4) and len(steps) == 4
+    seq = list(TOKENS)
+    for tok, st in zip(new, steps):
+        assert st["token"] == tok and st["position"] == len(seq) - 1
+        logits = m.forward(seq)[-1].astype(np.float64)
+        p = np.exp(logits - logits.max())
+        p /= p.sum()
+        assert st["prob"] == pytest.approx(p[tok], rel=1e-4) and st["logprob"] == pytest.approx(np.log(p[tok]), abs=1e-3)
+        assert len(st["top_tokens"]) == 3 and st["top_tokens"][0] == int(p.argmax())
+        lens = st["lens"]
+        assert lens["stages"][0] == "embed" and lens["stages"][-1] == "L1.mlp" and len(lens["prob"]) == 5
+        assert lens["rank"][-1] == 0 and lens["top"][-1] == tok  # the last stage is the model's own (greedy) choice
+        dla = st["dla"]
+        assert dla["sum"] == pytest.approx(dla["actual"], rel=1e-3, abs=1e-3) and len(dla["labels"]) == len(dla["values"])
+        assert sorted(st["attention"]) == sorted(f"L{l}H{h}" for l in range(2) for h in range(4))
+        assert all(len(a["positions"]) == 2 and a["weights"][0] >= a["weights"][1] for a in st["attention"].values())
+        seq.append(tok)
+    # captures: called on every pass, the prompt's rows then one per new token; what they return is ignored
+    shapes = []
+    out = tfi.generate(m, TOKENS, max_new_tokens=3,
+                       captures={"blocks.1.hook_resid_post": lambda a, n: shapes.append(a.shape) or np.zeros_like(a)})
+    assert out == new[:3] and shapes == [(len(TOKENS), 32), (1, 32), (1, 32)]
+    want, acts = m.run_with_cache(TOKENS, names=["blocks.0.hook_mlp_out"])
+    got = {}
+    logits = m.forward(TOKENS, captures={"blocks.0.hook_mlp_out": lambda a, n: got.setdefault(n, a.copy())})
+    np.testing.assert_array_equal(logits, want)
+    np.testing.assert_array_equal(got["blocks.0.hook_mlp_out"], acts["blocks.0.hook_mlp_out"])
+    with pytest.raises(ValueError, match="post-norm"):
+        _, post = exported(tmp_path, name="post", norm_position="post", norm="layernorm")
+        tfi.generate(tfi.Model.load(str(post)), TOKENS, max_new_tokens=2, trace=True)

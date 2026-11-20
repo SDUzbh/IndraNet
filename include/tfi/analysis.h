@@ -61,6 +61,12 @@ struct LensEntry {
 };
 std::vector<LensEntry> logit_lens(const Model& model, const Tokens& tokens, int64_t pos, int64_t target = -1,
                                   int64_t k = 5);
+// The same from activations already taken (e.g. while generating: GenerateOptions::trace): row `row`
+// of each hook point lens_hook_points names, (rows, d_model) each. Every stage is decoded in one pass
+// over the unembedding.
+std::vector<std::string> lens_hook_points(const Model& model);
+std::vector<LensEntry> logit_lens_from(const Model& model, const ActivationCache& cache, int64_t row, int64_t target = -1,
+                                       int64_t k = 5);
 
 // --- direct logit attribution --------------------------------------------------------
 // Split the final logit difference into contributions from the embeddings, every attention
@@ -74,6 +80,11 @@ struct DLAResult {
 };
 DLAResult direct_logit_attribution(const Model& model, const Tokens& tokens, int64_t pos, int64_t target,
                                    int64_t other = -1);
+// The same from activations already taken: row `row` of each hook point dla_hook_points names (hook_z
+// as (rows, H, D)). Each layer's heads take one pass over its o_proj weight.
+std::vector<std::string> dla_hook_points(const Model& model);
+DLAResult direct_logit_attribution_from(const Model& model, const ActivationCache& cache, int64_t row, int64_t target,
+                                        int64_t other = -1);
 
 // --- attention-head pattern scores ------------------------------------------------------
 // Averaged over random sequences made of a segment repeated twice, at queries in the repeat.

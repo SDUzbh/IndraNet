@@ -52,12 +52,13 @@ Commands
   tokenize   token ids for text, without loading the weights   --text T | --text-file F (one line each)
   generate   continue the input, one token at a time           --tokens [--max-new 64] [--temperature 0]
                                                                [--top-k 0] [--top-p 1] [--seed 0]
-                                                               [--stop ID,...] [--no-eos]
+                                                               [--stop ID,...] [--no-eos] [--trace]
              greedy by default; --temperature T samples instead, from the --top-k K most likely tokens
              and the fewest whose probabilities reach --top-p P. Stops at the model's end-of-text tokens
              (converted models) unless --no-eos, at --stop tokens, or after --max-new tokens. Prints the
              text as it is generated (token ids for models without a vocabulary). A KV cache keeps each
-             step to the new token.
+             step to the new token. --trace then shows each new token's probability and alternatives, the
+             first logit-lens stage where it was the top prediction, and the largest parts of its logit
 
 Token input
   --tokens 5,17,3,...          explicit token ids
@@ -625,6 +626,14 @@ int cmd_circuits(const Args& a, const Model& m) {
     return 0;
 }
 
+// s padded with spaces to `width` characters (UTF-8 code points, not bytes), for table columns.
+std::string pad(std::string s, size_t width) {
+    size_t chars = 0;
+    for (unsigned char c : s) chars += (c & 0xC0) != 0x80;
+    if (chars < width) s.append(width - chars, ' ');
+    return s;
+}
+
 int cmd_generate(const Args& a, const Model& m) {
     const Tokens prompt = input_tokens(a, m);
     GenerateOptions o;
@@ -661,8 +670,51 @@ int cmd_generate(const Args& a, const Model& m) {
         std::fflush(stdout);
         return true;
     };
-    const Tokens out = generate(m, prompt, o);
+    // --trace: per new token, its probability and the alternatives, the first logit-lens stage where it
+    // was the top prediction, and the largest parts of its logit (direct logit attribution).
+    const bool tracing = a.has("trace");
+    bool additive = true;  // DLA needs an additive residual stream
+    for (int64_t l = 0; l < m.cfg().n_layers; ++l) additive = additive && m.layer_cfg(l).norm_position != "post";
+    o.trace.top_k = 3;
+    o.trace.dla = additive;
+    std::vector<TraceStep> steps;
+    const Tokens out = generate(m, prompt, o, nullptr, tracing ? &steps : nullptr);
     std::printf("\n");
+    if (tracing) {
+        std::printf("\n%5s  %-14s %6s  %-12s %-40s %s\n", "pos", "token", "p", "top-1 from", "alternatives (p)",
+                    additive ? "largest parts of its logit" : "");
+        for (const TraceStep& st : steps) {
+            std::string from = "-";
+            for (const LensEntry& e : st.lens)
+                if (e.target_rank == 0) {
+                    from = e.stage;
+                    break;
+                }
+            std::string alts;
+            for (size_t i = 0; i < st.top_tokens.size(); ++i) {
+                if (st.top_tokens[i] == st.token) continue;
+                char buf[64];
+                std::snprintf(buf, sizeof buf, "%.2f", st.top_probs[i]);
+                alts += (alts.empty() ? "" : ", ") + tok(m, st.top_tokens[i]) + " " + buf;
+            }
+            std::string parts;
+            if (additive) {
+                std::vector<size_t> order(st.dla.values.size());
+                for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+                std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
+                for (size_t i = 0; i < std::min<size_t>(3, order.size()); ++i) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof buf, "%s %+.1f", st.dla.labels[order[i]].c_str(), st.dla.values[order[i]]);
+                    parts += (parts.empty() ? "" : "  ") + std::string(buf);
+                }
+                char buf[48];
+                std::snprintf(buf, sizeof buf, "  (of %.1f)", st.dla.actual);
+                parts += buf;
+            }
+            std::printf("%5lld  %s %6.3f  %-12s %s %s\n", static_cast<long long>(st.position + 1), pad(tok(m, st.token), 14).c_str(),
+                        st.prob, from.c_str(), pad(alts, 40).c_str(), parts.c_str());
+        }
+    }
     std::fflush(stdout);
     std::fprintf(stderr, "%zu new token%s\n", out.size(), out.size() == 1 ? "" : "s");
     return 0;

@@ -176,6 +176,15 @@ kernel void copy_k(device const float* x [[buffer(0)]], device float* y [[buffer
     if (i < n) y[i] = x[i];
 }
 
+// rows of keys or values (rows, heads * D) into a cache (heads, cap, D) at positions start, start + 1, ...
+struct KvArgs { uint rows, heads, D, cap, start; };
+kernel void kv_append_k(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]], constant KvArgs& a [[buffer(2)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i >= a.rows * a.heads * a.D) return;
+    const uint d = i % a.D, t = i / a.D, g = t % a.heads, r = t / a.heads;
+    dst[(ulong(g) * a.cap + a.start + r) * a.D + d] = src[i];
+}
+
 struct BiasArgs { uint n, cols; };
 
 kernel void bias_k(device float* y [[buffer(0)]], device const float* b [[buffer(1)]], constant BiasArgs& a [[buffer(2)]],
@@ -301,6 +310,92 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
     uint t = 0;
     for (uint d = tid; d < D; d += tg, ++t) zr[d] = acc[t] / l;
     if (a.has_lse != 0 && tid == 0) lse[ulong(r) * a.H + h] = m + log(l);
+}
+
+// Split-key attention for few rows over many keys (a generated token's pass): the row's allowed keys
+// in chunks of kSplitKeys, one threadgroup per (row, head, chunk), each writing its chunk's max m, sum
+// l and weighted values (D) to `part`; attn_combine_k merges each (row, head)'s chunks into z. The same
+// scores, masks and softmax as attn_k, so many threadgroups share a long context instead of one.
+constant uint kSplitKeys = 256;
+kernel void attn_split_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                         device float* part [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
+                         device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
+                         constant uint& nsplit [[buffer(9)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float qs[512];
+    threadgroup float ss[kSplitKeys];
+    threadgroup float red[32];
+    const uint D = a.D, split = tgid % nsplit, rh = tgid / nsplit, r = rh / a.H, h = rh % a.H, g = h / (a.H / a.Hkv);
+    const uint pos = meta[4 * r], start = meta[4 * r + 1], off = meta[4 * r + 2];
+    const uint lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+    const uint c0 = lo + split * kSplitKeys;
+    device float* out = part + ulong(tgid) * (D + 2);
+    if (c0 > pos) {  // past this row's keys: an empty chunk
+        if (tid == 0) {
+            out[0] = -INFINITY;
+            out[1] = 0.f;
+        }
+        return;
+    }
+    device const float* qr = q + (ulong(r) * a.H + h) * D;
+    for (uint d = tid; d < D; d += tg) qs[d] = qr[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    const uint n = min(kSplitKeys, pos + 1 - c0);
+    float cmax = -INFINITY;
+    for (uint jj = tid; jj < n; jj += tg) {
+        const uint j = c0 + jj;
+        device const float* kr = j < start ? pk + (ulong(g) * a.Tp + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
+        float sc = 0.f;
+        for (uint d = 0; d < D; ++d) sc += qs[d] * kr[d];
+        sc *= a.scale;
+        if (a.cap != 0.f) sc = a.cap * vtanh(sc / a.cap);
+        if (slope != 0.f) sc += -slope * float(pos - j);
+        ss[jj] = sc;
+        cmax = max(cmax, sc);
+    }
+    cmax = tg_max(cmax, red, lane, sg, nsg);
+    float lsum = 0.f;
+    for (uint jj = tid; jj < n; jj += tg) {
+        const float p = vexp(ss[jj] - cmax);
+        ss[jj] = p;
+        lsum += p;
+    }
+    lsum = tg_sum(lsum, red, lane, sg, nsg);  // (its barriers also make every ss visible)
+    for (uint d = tid; d < D; d += tg) {
+        float acc = 0.f;
+        for (uint jj = 0; jj < n; ++jj) {
+            const uint j = c0 + jj;
+            device const float* vr = j < start ? pv + (ulong(g) * a.Tp + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
+            acc += ss[jj] * vr[d];
+        }
+        out[2 + d] = acc;
+    }
+    if (tid == 0) {
+        out[0] = cmax;
+        out[1] = lsum;
+    }
+}
+
+// attn_split_k's chunks of one (row, head) per threadgroup: rescaled to the largest max, summed, into z.
+kernel void attn_combine_k(device const float* part [[buffer(0)]], device float* z [[buffer(1)]], constant AttnArgs& a [[buffer(2)]],
+                           constant uint& nsplit [[buffer(3)]], uint rh [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]]) {
+    const uint D = a.D, stride = D + 2;
+    device const float* p = part + ulong(rh) * nsplit * stride;
+    float m = -INFINITY;
+    for (uint c = 0; c < nsplit; ++c) m = max(m, p[c * stride]);
+    float l = 0.f;
+    for (uint c = 0; c < nsplit; ++c)
+        if (p[c * stride] != -INFINITY) l += p[c * stride + 1] * vexp(p[c * stride] - m);
+    device float* zr = z + ulong(rh) * D;
+    for (uint d = tid; d < D; d += tg) {
+        float acc = 0.f;
+        for (uint c = 0; c < nsplit; ++c)
+            if (p[c * stride] != -INFINITY) acc += p[c * stride + 2 + d] * vexp(p[c * stride] - m);
+        zr[d] = acc / l;
+    }
 }
 
 // Attention's backward pass, from dz and what the forward pass kept: q, k, v, z and each (row,
@@ -725,6 +820,8 @@ struct BiasArgs { uint32_t n, cols; };
 struct NormArgs { uint32_t d; float eps; uint32_t layernorm, has_b; };
 struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; float scale; };
 struct PassArgs { uint32_t D, rot, n; };
+struct KvArgs { uint32_t rows, heads, D, cap, start; };
+constexpr int64_t kSplitKeys = 256;  // as the kernel's
 struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse; float scale, cap; };
 
 // Write src as fp16; false if a value is outside fp16's range (or not finite).
@@ -819,6 +916,7 @@ struct Gpu::Impl {
 
     // Gpu::Seq's kernels, compiled on first use.
     std::once_flag kernels_once;
+    id<MTLComputePipelineState> kv_append_k, attn_split_k, attn_combine_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
         block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
 
@@ -842,6 +940,7 @@ struct Gpu::Impl {
                 glu_k = make("glu_k");
                 add_k = make("add_k");
                 copy_k = make("copy_k");
+                kv_append_k = make("kv_append_k");
                 bias_k = make("bias_k");
                 half_k = make("half_k");
                 norm_k = make("norm_k");
@@ -854,6 +953,8 @@ struct Gpu::Impl {
                 rope_pass_k = make("rope_pass_k");
                 attn_k = make("attn_k");
                 attn_mma_k = make("attn_mma_k");
+                attn_split_k = make("attn_split_k");
+                attn_combine_k = make("attn_combine_k");
                 attn_delta_k = make("attn_delta_k");
                 attn_bwd_dq_k = make("attn_bwd_dq_k");
                 attn_bwd_dkv_k = make("attn_bwd_dkv_k");
@@ -992,7 +1093,7 @@ struct Gpu::Seq::Impl {
         int64_t floats = 0;
     };
     struct Op {
-        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply } kind;
+        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply, KvAppend } kind;
         int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0, j = -1;
         int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
         Gpu::Seq::AttnShape attn{};      // Attention
@@ -1011,6 +1112,8 @@ struct Gpu::Seq::Impl {
     std::vector<Slot> slots;
     std::vector<Op> ops;
     id<MTLBuffer> flag = nil;  // set by half_k when an input does not fit fp16
+    id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
+    size_t split_bytes = 0;
     std::map<std::tuple<int64_t, int64_t, int64_t, bool>, MPSMatrixMultiplication*> mms;  // by (m, n, k, W^T)
 
     // Encoding state of one attempt.
@@ -1232,6 +1335,21 @@ struct Gpu::Seq::Impl {
                 dispatch(op.kind == Op::Act ? g.act_k : g.glu_k, op.n);
                 break;
             }
+            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start
+                const int64_t n = op.rows * op.heads * op.D;
+                need(op.a, n);
+                need(op.c, op.heads * op.n * op.D);
+                if (op.rot + op.rows > op.n) throw std::logic_error("Gpu::Seq: kv_append past the cache's capacity");
+                if (n == 0) break;
+                const KvArgs args{u32(op.rows), u32(op.heads), u32(op.D), u32(op.n), u32(op.rot)};
+                id<MTLComputeCommandEncoder> e = compute();
+                [e setComputePipelineState:g.kv_append_k];
+                [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                [e setBytes:&args length:sizeof args atIndex:2];
+                dispatch(g.kv_append_k, n);
+                break;
+            }
             case Op::Rope: {
                 const int64_t half = op.rot / 2, rows = op.rows * op.heads;
                 need(op.a, rows * op.D);
@@ -1277,6 +1395,42 @@ struct Gpu::Seq::Impl {
                 if (op.j >= 0) need(op.j, A.rows * A.H);
                 if (A.rows == 0) break;
                 const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), u32(A.Tp), u32(A.window), A.has_slopes ? 1u : 0u, op.j >= 0 ? 1u : 0u, A.scale, A.cap};
+                // Few rows over more keys than one chunk, without lse (only gradient passes ask for it):
+                // split the keys across threadgroups (flash-decoding), then merge.
+                const int64_t max_keys = A.Tp + A.rows;  // no row attends to more
+                const int64_t nsplit = (max_keys + kSplitKeys - 1) / kSplitKeys;
+                if (op.j < 0 && A.rows <= 8 && nsplit > 1) {
+                    const size_t bytes = static_cast<size_t>(A.rows * A.H * nsplit * (A.D + 2)) * sizeof(float);
+                    if (split_bytes < bytes) {
+                        if (split) g.release(split);
+                        split = g.acquire(bytes);
+                        split_bytes = bytes;
+                    }
+                    const uint32_t ns = u32(nsplit);
+                    id<MTLComputeCommandEncoder> e = compute();
+                    [e setComputePipelineState:g.attn_split_k];
+                    [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                    [e setBuffer:split offset:0 atIndex:3];
+                    [e setBuffer:slot(op.e).buf offset:0 atIndex:4];
+                    [e setBuffer:slot(op.f).buf offset:0 atIndex:5];
+                    [e setBuffer:slot(op.g).buf offset:0 atIndex:6];
+                    [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
+                    [e setBytes:&args length:sizeof args atIndex:8];
+                    [e setBytes:&ns length:sizeof ns atIndex:9];
+                    const NSUInteger tg = std::min<NSUInteger>(256, g.attn_split_k.maxTotalThreadsPerThreadgroup);
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H * nsplit)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    id<MTLComputeCommandEncoder> e2 = compute();
+                    [e2 setComputePipelineState:g.attn_combine_k];
+                    [e2 setBuffer:split offset:0 atIndex:0];
+                    [e2 setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e2 setBytes:&args length:sizeof args atIndex:2];
+                    [e2 setBytes:&ns length:sizeof ns atIndex:3];
+                    const NSUInteger tg2 = std::min<NSUInteger>(128, g.attn_combine_k.maxTotalThreadsPerThreadgroup);
+                    [e2 dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+                    break;
+                }
                 const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
                 if (tiled) need(op.i, 4 * A.blocks);
                 id<MTLComputeCommandEncoder> e = compute();
@@ -1469,6 +1623,7 @@ Gpu::Seq::~Seq() {
         if (slot.half) s.g.release(slot.half);
     }
     if (s.flag) s.g.release(s.flag);
+    if (s.split) s.g.release(s.split);
 }
 
 float* Gpu::Seq::reserve(int slot, int64_t floats) {
@@ -1564,6 +1719,19 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     op.W = &w;
     op.layernorm = layernorm;
     op.eps = eps;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start) {
+    if (src == dst) throw std::invalid_argument("Gpu::Seq: kv_append into the slot it reads");
+    Impl::Op op{Impl::Op::KvAppend};
+    op.a = src;
+    op.c = dst;
+    op.rows = rows;
+    op.heads = heads;
+    op.D = D;
+    op.n = cap;
+    op.rot = start;
     impl_->ops.push_back(op);
 }
 

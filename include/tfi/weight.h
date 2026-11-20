@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "tfi/tensor.h"
 
@@ -76,7 +77,14 @@ class Weight {
 
 // y = x @ W^T + b (W (out, in), as linear() above) with a model weight. A half-precision W is
 // converted to float32 in blocks of rows as the multiply goes, so the full float32 copy never exists.
+// With 1-4 rows of x (a generated token), it multiplies straight from the weights instead, split
+// across threads; float32 and fp16 weights take the same steps, so fp16 gives what float32 weights
+// holding the same rounded values give, bit for bit.
 Tensor linear(const Tensor& x, const Weight& W, const Weight* b = nullptr);
+// linear(x, Ws[i], bs[i]) for every i (bs may be empty, or hold nulls), the same values as separate
+// calls. With 1-4 rows of x the weights' rows are split across the threads together, so that one wake
+// of the threads covers them all (e.g. q, k and v).
+std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws, const std::vector<const Weight*>& bs = {});
 // A(m, n) @ W(n, k) for a 2-D weight W: e.g. linear()'s input gradient dy @ W.
 Tensor matmul(const Tensor& A, const Weight& W);
 

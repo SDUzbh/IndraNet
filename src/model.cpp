@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -690,19 +691,18 @@ Tensor project(const Model& m, const Tensor& x, const std::string& prefix, const
 // project() for several weights that read the same x; on the GPU they share one submission.
 std::vector<Tensor> project_many(const Model& m, const Tensor& x, const std::vector<std::string>& prefixes,
                                  const detail::RowBatch* batch) {
-#ifdef TFI_USE_ACCELERATE
-    if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows()) {
-        std::vector<const Weight*> Ws, bs;
-        for (const std::string& p : prefixes) {
-            Ws.push_back(&m.weight(p + ".weight"));
-            bs.push_back(m.weight_or_null(p + ".bias"));
-        }
-        return batch->gpu->linear_many(x, Ws, bs, batch->fp16);
+    std::vector<const Weight*> Ws, bs;
+    for (const std::string& p : prefixes) {
+        Ws.push_back(&m.weight(p + ".weight"));
+        bs.push_back(m.weight_or_null(p + ".bias"));
     }
+#ifdef TFI_USE_ACCELERATE
+    if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows())
+        return batch->gpu->linear_many(x, Ws, bs, batch->fp16);
+#else
+    (void)batch;
 #endif
-    std::vector<Tensor> out;
-    for (const std::string& p : prefixes) out.push_back(project(m, x, p, batch));
-    return out;
+    return linear_many(x, Ws, bs);  // few rows: one threaded pass over all the weights
 }
 
 // Attention of n queries at positions first, first+1, ... over keys 0..first+n-1 for one head.
@@ -718,30 +718,46 @@ struct HeadAttention {
 
     void pattern(const float* q, int64_t n, int64_t first, const float* kp, const float* kn, float* probs,
                  int64_t ld) const {
-        if (first) detail::gemm(/*trans_b=*/true, n, first, D, q, D, kp, D, probs, ld);
-        detail::gemm(/*trans_b=*/true, n, n, D, q, D, kn, D, probs + first, ld);
-        for (int64_t r = 0; r < n; ++r) {
-            const int64_t i = first + r;  // query position
-            float* rowp = probs + r * ld;
-            const int64_t j0 = window ? std::max<int64_t>(0, i - window + 1) : 0;
-            float* seg = rowp + j0;
-            const int64_t m = i + 1 - j0;
-            for (int64_t j = 0; j < m; ++j) seg[j] *= scale;
-            if (cap)
-                for (int64_t j = 0; j < m; ++j) seg[j] = cap * vm::tanh(seg[j] / cap);
-            if (slope != 0.f)
-                for (int64_t j = 0; j < m; ++j) seg[j] += -slope * static_cast<float>(i - j0 - j);
-            vm::softmax(seg, m);
-            std::fill(rowp, seg, 0.f);
-            std::fill(rowp + i + 1, rowp + first + n, 0.f);
-        }
+        scores(q, n, first, n, kp, kn, probs, ld);
+        for (int64_t r = 0; r < n; ++r) finish(probs + r * ld, first + r, first + n);
+    }
+
+    // Raw scores q . k of `rows` query rows (stride D) against keys 0..first-1 (kp) and the n_new keys
+    // after them (kn) into probs (stride ld). Rows may be several heads' queries sharing these keys.
+    void scores(const float* q, int64_t rows, int64_t first, int64_t n_new, const float* kp, const float* kn, float* probs,
+                int64_t ld) const {
+        if (first) detail::gemm(/*trans_b=*/true, rows, first, D, q, D, kp, D, probs, ld);
+        detail::gemm(/*trans_b=*/true, rows, n_new, D, q, D, kn, D, probs + first, ld);
+    }
+
+    // One row of scores into attention weights for the query at position i, over keys 0..end-1: scaled,
+    // softcapped, ALiBi'd (this->slope), masked to j <= i (and the window) and softmaxed; disallowed
+    // entries exactly 0.
+    void finish(float* rowp, int64_t i, int64_t end) const {
+        const int64_t j0 = window ? std::max<int64_t>(0, i - window + 1) : 0;
+        float* seg = rowp + j0;
+        const int64_t m = i + 1 - j0;
+        for (int64_t j = 0; j < m; ++j) seg[j] *= scale;
+        if (cap)
+            for (int64_t j = 0; j < m; ++j) seg[j] = cap * vm::tanh(seg[j] / cap);
+        if (slope != 0.f)
+            for (int64_t j = 0; j < m; ++j) seg[j] += -slope * static_cast<float>(i - j0 - j);
+        vm::softmax(seg, m);
+        std::fill(rowp, seg, 0.f);
+        std::fill(rowp + i + 1, rowp + end, 0.f);
     }
 
     // out (n rows, stride ldo) = probs @ values.
     void apply(const float* probs, int64_t n, int64_t first, int64_t ld, const float* vp, const float* vn, float* out,
                int64_t ldo) const {
-        if (first) detail::gemm(/*trans_b=*/false, n, D, first, probs, ld, vp, D, out, ldo);
-        detail::gemm(/*trans_b=*/false, n, D, n, probs + first, ld, vn, D, out, ldo, /*accumulate=*/first > 0);
+        apply_rows(probs, n, first, n, ld, vp, vn, out, ldo);
+    }
+
+    // apply for `rows` rows of weights over keys 0..first-1 (vp) and the n_new after them (vn).
+    void apply_rows(const float* probs, int64_t rows, int64_t first, int64_t n_new, int64_t ld, const float* vp, const float* vn,
+                    float* out, int64_t ldo) const {
+        if (first) detail::gemm(/*trans_b=*/false, rows, D, first, probs, ld, vp, D, out, ldo);
+        detail::gemm(/*trans_b=*/false, rows, D, n_new, probs + first, ld, vn, D, out, ldo, /*accumulate=*/first > 0);
     }
 };
 
@@ -816,23 +832,44 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
             const float* vh = v.ptr() + (h / rep) * T * D;
             ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z + h * D, H * D);
         }
-    } else if (batch->cached && hooks && hooks->matches(p + "hook_pattern")) {
-        // One segment continuing a cached sequence: its queries' pattern over every key, for the hook.
-        const int64_t first = batch->start.at(0), nk = first + T;
+    } else if (batch->cached) {
+        // One segment continuing a cached sequence (forward_cached). The rep query heads sharing a key /
+        // value head are next to each other in q ((H, T, D): rep * T rows), so they are scored and
+        // applied as one matrix: each key / value head's cached positions are read once, not rep times.
+        // A hook on hook_pattern gets the new queries' pattern over every key, (H, T, first + T).
+        const int64_t first = batch->start.at(0), nk = first + T, GR = rep * T;
         const Tensor* pk = first ? batch->prefix_k.at(layer) : nullptr;
         const Tensor* pv = first ? batch->prefix_v.at(layer) : nullptr;
         const int64_t Tp = pk ? pk->shape[1] : 0;
-        Tensor pattern({H, T, nk});
-        for (int64_t h = 0; h < H; ++h) {
-            ha.slope = slopes.empty() ? 0.f : slopes[h];
-            ha.pattern(q.ptr() + h * T * D, T, first, pk ? pk->ptr() + (h / rep) * Tp * D : nullptr,
-                       k.ptr() + (h / rep) * T * D, pattern.ptr() + h * T * nk, nk);
+        const bool want = hooks && hooks->matches(p + "hook_pattern");
+        Tensor pattern = want ? Tensor({H, T, nk}) : Tensor();
+        std::vector<float> group_probs(want ? 0 : static_cast<size_t>(GR * nk)), out(static_cast<size_t>(GR * D));
+        auto probs_of = [&](int64_t g) { return want ? pattern.ptr() + g * GR * nk : group_probs.data(); };
+        auto score = [&](int64_t g) {
+            float* P = probs_of(g);
+            ha.scores(q.ptr() + g * GR * D, GR, first, T, pk ? pk->ptr() + g * Tp * D : nullptr, k.ptr() + g * T * D, P, nk);
+            for (int64_t j = 0; j < rep; ++j) {
+                ha.slope = slopes.empty() ? 0.f : slopes[g * rep + j];
+                for (int64_t r = 0; r < T; ++r) ha.finish(P + (j * T + r) * nk, first + r, nk);
+            }
+        };
+        auto apply = [&](int64_t g) {  // into `out` (head j, row r) = row j T + r, then to z (T, H, D)
+            ha.apply_rows(probs_of(g), GR, first, T, nk, pv ? pv->ptr() + g * Tp * D : nullptr, v.ptr() + g * T * D, out.data(), D);
+            for (int64_t j = 0; j < rep; ++j)
+                for (int64_t r = 0; r < T; ++r)
+                    std::copy(out.data() + (j * T + r) * D, out.data() + (j * T + r + 1) * D, z + (r * H + g * rep + j) * D);
+        };
+        if (want) {
+            for (int64_t g = 0; g < Hkv; ++g) score(g);
+            hook(hooks, p + "hook_pattern", pattern);
+            if (pattern.numel() != H * T * nk) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
+            for (int64_t g = 0; g < Hkv; ++g) apply(g);
+        } else {
+            for (int64_t g = 0; g < Hkv; ++g) {
+                score(g);
+                apply(g);
+            }
         }
-        hook(hooks, p + "hook_pattern", pattern);
-        if (pattern.numel() != H * T * nk) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
-        for (int64_t h = 0; h < H; ++h)
-            ha.apply(pattern.ptr() + h * T * nk, T, first, nk, pv ? pv->ptr() + (h / rep) * Tp * D : nullptr,
-                     v.ptr() + (h / rep) * T * D, z + h * D, H * D);
     } else {  // stacked segments: no hook_pattern (each segment has its own pattern)
         std::vector<float> probs;
         for (size_t s = 0; s < batch->start.size(); ++s) {
@@ -971,6 +1008,12 @@ Tensor Model::embed(const Tokens& tokens, const Hooks* hooks, int64_t start) con
 #ifdef TFI_USE_ACCELERATE
 namespace {
 detail::Gpu* single_pass_gpu(const Model& m, int64_t layer, int64_t T);
+bool gpu_attention_fits(const std::vector<ModelConfig>& cfgs, int64_t layer);
+// A generated token's pass (forward_cached) goes to the GPU in both mode when the blocks hold at least
+// this many weights: then reading them takes the CPU longer than the GPU's whole pass, fixed costs
+// included (M5 Pro, fp16: Llama 3.2 1B's 1.0e9 is 1.5x faster on the GPU, Qwen2.5 0.5B's 3.6e8 about
+// even, faster with long contexts; smaller models are faster on the CPU).
+constexpr double kDecodeWeights = 3e8;
 }  // namespace
 #endif
 
@@ -1011,12 +1054,14 @@ void KVCache::clear() {
     k_.clear();
     v_.clear();
     len_ = 0;
+    gpu_len_ = 0;  // the GPU's buffers stay, for the next sequence
 }
 
 void KVCache::truncate(int64_t n) {
     if (n < 0 || n > len_) throw std::out_of_range("KVCache::truncate: " + std::to_string(n) + " is not in 0.." + std::to_string(len_));
     if (n == 0) clear();
     else len_ = n;  // later positions are overwritten as the sequence continues
+    gpu_len_ = std::min(gpu_len_, len_);
 }
 
 namespace {
@@ -1084,6 +1129,7 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
                   [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
 
     Tensor logits;
+    bool rb_kv_used = false;  // whether the pass appended the new positions to the cache's GPU copy
     if (start == 0) {
         logits = run_from(0, embed(tokens, &h), &h, last_only);
     } else {
@@ -1096,20 +1142,62 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
             rb.prefix_v.push_back(&cache.v_[l]);
         }
 #ifdef TFI_USE_ACCELERATE
-        // The GPU for chunks of tokens big enough (every chunk in GPU-only mode), unless a hook reads the
-        // pattern, which only the CPU's cached attention hands over.
+        // The GPU, with the cache kept there (detail::GpuKV), for: chunks of tokens big enough; single
+        // tokens of models large enough that reading their weights takes the CPU longer than the GPU's
+        // pass (kDecodeWeights); and every step in GPU-only mode. Not when a hook reads
+        // the pattern, which only the CPU's cached attention hands over, or when a layer's heads are too
+        // wide for the GPU's attention.
         bool pattern_hook = false;
         for (int64_t l = 0; l < L && hooks; ++l) pattern_hook = pattern_hook || hooks->matches(layer_prefix(l) + "attn.hook_pattern");
-        if (use_gpu() && !pattern_hook && T >= detail::gpu_min_rows()) {
-            rb.gpu = gpu();
-            rb.fp16 = gpu_fp16();
+        double block_weights = 0;
+        for (const auto& kv : w_)
+            if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) block_weights += static_cast<double>(kv.second.numel());
+        const bool worth = detail::gpu_only() || T >= detail::gpu_min_rows() || block_weights >= kDecodeWeights;
+        if (use_gpu() && !pattern_hook && worth && gpu_attention_fits(layer_cfgs_, 0)) {
+            if (detail::Gpu* g = gpu()) {
+                if (!cache.gpu_ || cache.gpu_->gpu.get() != g) {  // first use, or another model's GPU
+                    auto kv = std::make_shared<detail::GpuKV>();
+                    kv->gpu = gpu_.gpu;
+                    kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
+                    cache.gpu_ = std::move(kv);
+                    cache.gpu_len_ = 0;
+                }
+                detail::GpuKV& kv = *cache.gpu_;
+                if (start + T > kv.cap) {  // grow (losing the contents: uploaded again below)
+                    kv.cap = std::max({start + T, 2 * kv.cap, int64_t(256)});
+                    for (int64_t l = 0; l < L; ++l) {
+                        const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim();
+                        kv.seq->reserve(detail::GpuKV::keys(l), n);
+                        kv.seq->reserve(detail::GpuKV::values(l), n);
+                    }
+                    cache.gpu_len_ = 0;
+                }
+                // Positions the CPU added since (the prompt's pass, CPU steps, a copy): up to the GPU.
+                for (int64_t l = 0; l < L && cache.gpu_len_ < start; ++l) {
+                    const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
+                    const int64_t c = cache.k_[l].shape[1], from = cache.gpu_len_;
+                    float* gk = kv.seq->data(detail::GpuKV::keys(l));
+                    float* gv = kv.seq->data(detail::GpuKV::values(l));
+                    for (int64_t h = 0; h < Hkv; ++h) {
+                        std::copy(cache.k_[l].ptr() + (h * c + from) * D, cache.k_[l].ptr() + (h * c + start) * D, gk + (h * kv.cap + from) * D);
+                        std::copy(cache.v_[l].ptr() + (h * c + from) * D, cache.v_[l].ptr() + (h * c + start) * D, gv + (h * kv.cap + from) * D);
+                    }
+                }
+                cache.gpu_len_ = start;
+                rb.gpu = g;
+                rb.fp16 = gpu_fp16();
+                rb.kv = &kv;
+            }
         }
 #endif
         x = run_rows(0, std::move(x), rb, &h);
+        rb_kv_used = rb.kv != nullptr;
         Tensor f = final_norm(x);
         hook(&h, "hook_final", f);
         if (last_only) f = last_row(f);
-        logits = logits_from_final(f, rb.gpu ? &rb : nullptr);
+        detail::RowBatch unembed = rb;  // a pass that went to the GPU unembeds there too, whatever its rows
+        unembed.whole = rb_kv_used;
+        logits = logits_from_final(f, rb.gpu ? &unembed : nullptr);
     }
     for (int64_t l = 0; l < L; ++l) {
         const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
@@ -1117,6 +1205,7 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
             throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
     }
     cache.append(new_k, new_v, T);
+    if (rb_kv_used) cache.gpu_len_ = start + T;  // the pass appended them on the GPU too
     return logits;
 }
 
@@ -1277,6 +1366,9 @@ struct GpuBlocks {
     int zs = kZ, lse = -1;                  // where attention() puts z (and lse, if >= 0)
     int dzs = kDZ;                          // where backward_before puts dL/dz
     int64_t blocks = 0;                     // attention blocks in kBlocks (0: the per-row kernel)
+    // Where attention reads earlier positions' keys and values, RoPE frequencies and ALiBi slopes
+    // (a KV cache kept on the GPU gives each layer slots of its own: detail::GpuKV).
+    int pk = kPK, pv = kPV, inv_freq = kInvFreq, slopes = kSlopes;
     const Hooks* hooks = nullptr;           // inference: the pass's hooks (GpuBlocks::at)
     bool fp16 = false;                      // ... and how its runs multiply
     int par_out = -1;                       // a parallel-residual MLP's output (set by mlp())
@@ -1486,8 +1578,8 @@ struct GpuBlocks {
             const detail::RopeTable t = detail::rope_table(c);
             s.reserve(qr, R * H * D);
             s.reserve(kr, R * Hkv * D);
-            s.rope(q, qr, R, H, D, t.rot, kInvFreq, kMeta, false, t.factor);
-            s.rope(k, kr, R, Hkv, D, t.rot, kInvFreq, kMeta, false, t.factor);
+            s.rope(q, qr, R, H, D, t.rot, inv_freq, kMeta, false, t.factor);
+            s.rope(k, kr, R, Hkv, D, t.rot, inv_freq, kMeta, false, t.factor);
             q = qr;
             k = kr;
         }
@@ -1506,7 +1598,7 @@ struct GpuBlocks {
         const detail::Gpu::Seq::AttnShape shape = attn_shape(layer, Tp);
         s.reserve(zs, R * shape.H * shape.D);
         if (lse >= 0) s.reserve(lse, R * shape.H);
-        s.attention(q, k, v, zs, Tp ? kPK : k, Tp ? kPV : v, kMeta, shape.has_slopes ? kSlopes : kMeta, shape, kBlocks, lse);
+        s.attention(q, k, v, zs, Tp ? pk : k, Tp ? pv : v, kMeta, shape.has_slopes ? slopes : kMeta, shape, kBlocks, lse);
     }
     // Block `layer`'s attention backward pass on the GPU, from dL/dz in slot `dz` to the q, k, v
     // projections' gradients (kDQ, kDK, kDV): attention, then RoPE and qk_norm backward. `a` holds
@@ -1704,14 +1796,21 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
 #ifdef TFI_USE_ACCELERATE
     const int64_t R = batch.rows();
     // A single pass (batch.whole) comes here only if single_pass_on_gpu chose the GPU for it.
-    if (g_gpu_resident.load() && batch.gpu && (batch.whole || R >= detail::gpu_min_rows())) {
-        detail::Gpu::Seq s(*batch.gpu);
+    if (g_gpu_resident.load() && batch.gpu && (batch.whole || batch.kv || R >= detail::gpu_min_rows())) {
+        // A KV cache on the GPU brings its own Gpu::Seq, whose slots hold it; otherwise one for this pass.
+        std::optional<detail::Gpu::Seq> own;
+        if (!batch.kv) own.emplace(*batch.gpu);
+        detail::Gpu::Seq& s = batch.kv ? *batch.kv->seq : *own;
         GpuBlocks gb{*this, s, R, d};
         // The CPU's attention is faster only while it overlaps the GPU's work on other batches; a
         // single pass has none to overlap, so its attention runs on the GPU too, if the kernels take
         // every layer's head size (GPU-only mode has no CPU to fall back on: the GPU says why it can't).
-        const bool gpu_attention =
-            detail::gpu_only() || ((g_gpu_attention.load() || batch.whole) && gpu_attention_fits(layer_cfgs_, layer));
+        // So does a pass reading a KV cache on the GPU (forward_cached checks the head sizes).
+        const bool gpu_attention = detail::gpu_only() || batch.kv ||
+                                   ((g_gpu_attention.load() || batch.whole) && gpu_attention_fits(layer_cfgs_, layer));
+        // A KV cache pass without fp16 is one submission for every layer: no run repeats (fp16's
+        // fallback to fp32 does), so later layers may overwrite slots that earlier ones read.
+        const bool single_run = batch.kv && !batch.fp16;
         // q, k, v alternate between two sets of slots by layer, so that a run never overwrites the
         // slots its attention reads (Gpu::Seq::run may repeat a run).
         const int qkv[2][3] = {{kQ, kK, kV}, {kQ2, kK2, kV2}};
@@ -1727,6 +1826,13 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         auto attention_inputs = [&](int64_t l) {
             const ModelConfig& c = layer_cfgs_[l];
             const int64_t Hkv = c.kv_heads(), D = c.head_dim();
+            if (batch.kv) {  // the layer's own slots, written before the pass (below): nothing to copy
+                gb.inv_freq = detail::GpuKV::inv_freq(l);
+                gb.slopes = detail::GpuKV::slopes(l);
+                gb.pk = detail::GpuKV::keys(l);
+                gb.pv = detail::GpuKV::values(l);
+                return prefixed ? batch.kv->cap : int64_t(0);
+            }
             gb.write_layer_inputs(l);
             if (!prefixed) return int64_t(0);
             const Tensor* pk = batch.prefix_k.at(l);
@@ -1739,6 +1845,20 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         };
         gb.hooks = hooks;
         gb.fp16 = batch.fp16;
+        if (batch.kv) {  // every layer's RoPE frequencies and ALiBi slopes, into its own slots
+            for (int64_t l = layer; l < L; ++l) {
+                const ModelConfig& c = layer_cfgs_[l];
+                if (c.positional == "rope") {
+                    const detail::RopeTable t = detail::rope_table(c);
+                    detail::check_rope_length(c, t, gb.n_positions);
+                    std::copy(t.inv_freq.begin(), t.inv_freq.end(), s.reserve(detail::GpuKV::inv_freq(l), t.rot / 2));
+                }
+                if (c.positional == "alibi") {
+                    const std::vector<float> sl = alibi_slopes(c.n_heads);
+                    std::copy(sl.begin(), sl.end(), s.reserve(detail::GpuKV::slopes(l), c.n_heads));
+                }
+            }
+        }
         auto other = [](int slot) { return slot == kResid0 ? static_cast<int>(kResid1) : static_cast<int>(kResid0); };
         s.reserve(kResid1, R * d);
         std::copy(x.ptr(), x.ptr() + R * d, s.reserve(kResid0, R * d));
@@ -1764,6 +1884,10 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                 gb.lse = pattern ? static_cast<int>(kLse) : -1;
                 gb.attention(l, q, k, v, Tp);
                 gb.lse = -1;
+                if (batch.kv) {  // the new positions' keys and values (as the hooks left them) join the cache
+                    s.kv_append(k, gb.pk, R, Hkv, D, batch.kv->cap, batch.start.at(0));
+                    s.kv_append(v, gb.pv, R, Hkv, D, batch.kv->cap, batch.start.at(0));
+                }
                 const detail::Gpu::Seq::AttnShape shape = gb.attn_shape(l, 0);
                 if (pattern && !hooks->changes(p + "hook_pattern")) {  // only captured: computed and handed over after the run
                     const int dst = gb.capture_slot(H * R * R);
@@ -1790,8 +1914,9 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                 use_qkv(l + 1);
                 gb.before_attention(l + 1, ls);
             }
-            gb.run();
+            if (!single_run) gb.run();
         }
+        if (single_run) gb.run();
         if (last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
         x = Tensor({R, d});
         std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());

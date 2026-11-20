@@ -14,7 +14,8 @@ class Model;
 
 namespace detail {
 
-class Gpu;  // gpu.h (macOS)
+class Gpu;    // gpu.h (macOS)
+struct GpuKV;  // gpu.h (macOS): a KVCache's copy on the GPU
 
 void activate_(Tensor& t, const std::string& act);
 // d act(x) / dx, elementwise, for the pre-activation x.
@@ -100,6 +101,10 @@ struct RowBatch {
     // One segment continuing a cached sequence (Model::forward_cached): hook_pattern runs on its
     // (H, len, start + len) pattern, on the CPU.
     bool cached = false;
+    // macOS, with `cached` and gpu: the cache's copy on the GPU, positions [0, start) in place. Then
+    // attention runs on the GPU reading them there, the new positions' keys and values are appended to
+    // it, and (without fp16) the whole pass is one GPU submission.
+    GpuKV* kv = nullptr;
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());

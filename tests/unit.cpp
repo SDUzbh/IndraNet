@@ -2986,6 +2986,73 @@ static void test_generate(const Model& m) {
     CHECK_THROWS(generate(m, {}, o));
 }
 
+// generate()'s trace: each step = the full-pass analyses at that position on the text so far (the
+// chosen token's probability and top tokens, logit lens, DLA, where each head attended), hooks included.
+static void test_generate_trace(const Model& m) {
+    const Tokens prompt = seq(6, 73);
+    GenerateOptions o;
+    o.max_new_tokens = 5;
+    o.trace.top_k = 3;
+    o.trace.attention_top = 2;
+    const bool post = m.cfg().norm_position == "post";
+    o.trace.dla = !post;
+    Hooks zero;  // an intervention: the trace must show the model as edited
+    zero.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { for (float& v : a.data) v *= 0.5f; });
+    for (const Hooks* hooks : {static_cast<const Hooks*>(nullptr), static_cast<const Hooks*>(&zero)}) {
+        std::vector<TraceStep> trace;
+        const Tokens got = generate(m, prompt, o, hooks, &trace);
+        CHECK(trace.size() == got.size());
+        Tokens text = prompt;
+        for (size_t i = 0; i < trace.size() && i < got.size(); ++i) {
+            const TraceStep& st = trace[i];
+            const int64_t pos = static_cast<int64_t>(text.size()) - 1;
+            CHECK(st.token == got[i] && st.position == pos);
+            ActivationCache acts;
+            const Tensor lg = m.run_with_cache(text, acts, nullptr, hooks);
+            Tensor p = rows(lg, pos, pos + 1);
+            softmax_(p.ptr(), p.shape[1]);
+            CHECK_NEAR(st.prob, p.data[st.token], 1e-4);
+            CHECK_NEAR(st.logprob, std::log(p.data[st.token]), 1e-3);
+            CHECK(st.top_tokens.size() == 3 && st.top_probs[0] >= st.top_probs[2]);
+            const std::vector<LensEntry> lens = logit_lens_from(m, acts, pos, st.token, 3);
+            CHECK(st.lens.size() == lens.size());
+            for (size_t s = 0; s < lens.size() && s < st.lens.size(); ++s) {
+                CHECK(st.lens[s].stage == lens[s].stage);
+                CHECK_NEAR(st.lens[s].target_prob, lens[s].target_prob, 1e-4);
+                CHECK(std::abs(st.lens[s].target_rank - lens[s].target_rank) <= 1);  // near ties may swap
+            }
+            if (!post) {
+                const DLAResult dla = direct_logit_attribution_from(m, acts, pos, st.token);
+                CHECK(st.dla.labels == dla.labels);
+                for (size_t k = 0; k < dla.values.size() && k < st.dla.values.size(); ++k)
+                    CHECK_NEAR(st.dla.values[k], dla.values[k], 1e-3 * std::max(1.f, std::fabs(dla.values[k])));
+                // Parts add up to the logit, unless the hook edited attention's output after the heads' z,
+                // which DLA attributes from (the full pass then misses it the same way).
+                if (!hooks) CHECK_NEAR(st.dla.sum, st.dla.actual, 1e-3 * std::max(1.f, std::fabs(st.dla.actual)));
+            }
+            size_t a = 0;  // the heads' most attended positions = the whole pass's pattern row
+            for (int64_t l = 0; l < m.cfg().n_layers; ++l) {
+                const Tensor& P = acts.at("blocks." + std::to_string(l) + ".attn.hook_pattern");
+                const int64_t H = P.shape[0], T = P.shape[1];
+                for (int64_t h = 0; h < H && a < st.attention.size(); ++h, ++a) {
+                    const TraceStep::Attention& at = st.attention[a];
+                    CHECK(at.head == "L" + std::to_string(l) + "H" + std::to_string(h) && at.positions.size() == 2);
+                    for (size_t j = 0; j < at.positions.size(); ++j)
+                        CHECK_NEAR(at.weights[j], P.data[(h * T + pos) * T + at.positions[j]], 1e-4);
+                }
+            }
+            CHECK(a == st.attention.size());
+            text.push_back(got[i]);
+        }
+    }
+    if (post) {  // DLA is refused up front on post-norm models, not mid-generation
+        GenerateOptions bad = o;
+        bad.trace.dla = true;
+        std::vector<TraceStep> t;
+        CHECK_THROWS(generate(m, prompt, bad, nullptr, &t));
+    }
+}
+
 // The sampler alone: frequencies follow softmax(logits / temperature), restricted by top_k and top_p;
 // NaN and -inf are never picked.
 static void test_sampler() {
@@ -3033,6 +3100,56 @@ static void test_sampler() {
     CHECK(greedy(tie.data(), 3) == 1);  // the lowest id among equal logits
     const std::vector<float> none = {-INFINITY, std::nanf("")};
     CHECK_THROWS(greedy(none.data(), 2));
+
+    // The sampler only sorts the tokens that can be in the nucleus: it picks exactly what sorting
+    // every token would, on a vocabulary-sized row, pick for pick from the same seed.
+    std::mt19937_64 gen(9);
+    std::normal_distribution<float> normal(0.f, 3.f);
+    std::vector<float> row(20000);
+    for (float& v : row) v = normal(gen);
+    for (const double top_p : {0.5, 0.9, 0.99})
+        for (const int64_t top_k : {int64_t(0), int64_t(50)})
+            for (const double temp : {0.7, 1.5}) {
+                GenerateOptions so;
+                so.temperature = temp;
+                so.top_p = top_p;
+                so.top_k = top_k;
+                so.seed = 11;
+                Sampler fast(so);
+                std::mt19937_64 rng(11);
+                for (int pick = 0; pick < 300; ++pick) {
+                    std::vector<std::pair<double, int64_t>> c;  // the full sort
+                    const float top = *std::max_element(row.begin(), row.end());
+                    double mass = 0;
+                    for (int64_t i = 0; i < static_cast<int64_t>(row.size()); ++i) c.push_back({std::exp((row[i] - double(top)) / temp), i});
+                    std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+                    size_t keep = top_k ? static_cast<size_t>(top_k) : c.size();
+                    if (top_k) {
+                        for (size_t i = 0; i < keep; ++i) mass += c[i].first;
+                    } else {
+                        for (int64_t i = 0; i < static_cast<int64_t>(row.size()); ++i) mass += std::exp((row[i] - double(top)) / temp);
+                    }
+                    double sum = 0;
+                    size_t n = 0;
+                    while (n < keep) {
+                        sum += c[n++].first;
+                        if (sum >= top_p * mass) break;
+                    }
+                    double total = 0;
+                    for (size_t i = 0; i < n; ++i) total += c[i].first;
+                    const double u = static_cast<double>(rng() >> 11) * 0x1.0p-53 * total;
+                    int64_t want = c[n - 1].second;
+                    double acc = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        acc += c[i].first;
+                        if (u < acc) {
+                            want = c[i].second;
+                            break;
+                        }
+                    }
+                    CHECK(fast(row.data(), static_cast<int64_t>(row.size())) == want);
+                }
+            }
 }
 
 #ifdef TFI_USE_ACCELERATE
@@ -3046,10 +3163,45 @@ static void test_gpu_forward_cached(const Model& m) {
     set_device(Device::Gpu);
     test_forward_cached(m);
     test_generate(m);
+    test_generate_trace(m);
     set_device(Device::Both);
     detail::set_gpu_min_rows(2);
     test_forward_cached(m);
     detail::set_gpu_min_rows(0);
+}
+#endif
+
+#ifdef TFI_USE_ACCELERATE
+// A long cached sequence on the GPU (macOS): steps of 1-8 tokens over ~600 earlier positions use
+// split-key attention (several chunks of keys merged), longer chunks the usual kernels; all = the CPU's
+// whole pass, with windows, softcaps, ALiBi, GQA and head sizes of every kernel.
+static void test_gpu_forward_cached_long() {
+    for (auto [name, c] : long_attention_configs()) {
+        if (c.positional == "learned") continue;  // positions past max_seq_len
+        c.max_seq_len = 1024;
+        const Model m = random_model(c, 58);
+        if (!m.gpu()) {
+            std::printf("     (no Metal device: GPU path not tested)\n");
+            return;
+        }
+        const Tokens t = seq(620, 59);
+        set_device(Device::Cpu);
+        const Tensor full = m.forward(t);
+        for (const Device dev : {Device::Gpu, Device::Both}) {
+            set_device(dev);
+            detail::set_gpu_min_rows(2);  // both mode: chunks of 2+ rows on the GPU, single tokens on the CPU
+            KVCache cache;
+            std::vector<Tensor> parts{m.forward_cached(Tokens(t.begin(), t.begin() + 560), cache)};
+            int64_t at = 560;
+            for (const int64_t n : {1, 1, 3, 8, 1, 40, 1, 5}) {
+                parts.push_back(m.forward_cached(Tokens(t.begin() + at, t.begin() + at + n), cache));
+                at += n;
+            }
+            check_close(stack_rows(parts), rows(full, 0, at));
+            detail::set_gpu_min_rows(0);
+        }
+        set_device(Device::Both);
+    }
 }
 #endif
 
@@ -3133,6 +3285,7 @@ int main(int argc, char** argv) {
         run("analysis", "circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
         run("analysis", "KV cache: forward_cached = forward, hooks, copies: " + kv.first, [&] { test_forward_cached(m); });
         run("analysis", "generate: greedy = argmax, stops, hooks, sampling: " + kv.first, [&] { test_generate(m); });
+        run("analysis", "generate's trace = full-pass analyses at each step: " + kv.first, [&] { test_generate_trace(m); });
     }
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
     run("fp16", "linear layers on 1-4 rows: direct from the weights, fp16 = rounded float32", test_linear_few_rows);
@@ -3213,6 +3366,7 @@ int main(int argc, char** argv) {
     for (const auto& kv : gpu_block_configs())
         run("gpu", "KV cache and generate on the GPU = forward (macOS): " + kv.first,
             [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
+    run("gpu", "KV cache on the GPU: long sequences, split-key attention = CPU (macOS)", test_gpu_forward_cached_long);
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);
     });

@@ -84,31 +84,47 @@ NameFilter names_filter(const Model& m, const std::optional<std::vector<std::str
 }
 
 // Engine hooks calling Python functions fn(activation, name). Each gets a float32 copy of the
-// activation; what it returns (an array of the same shape), or else the copy as it left it, replaces
-// the activation. `fns` must outlive the hooks (it holds the references; the hooks only borrow them,
-// so copying the hooks never touches reference counts without the GIL).
-Hooks python_hooks(const Model& m, const nb::dict& fns) {
+// activation. A hook's return value (an array of the same shape), or else the copy as it left it,
+// replaces the activation. A capture only reads: its return value is ignored, and a pass on the GPU
+// doesn't stop for it (it may be called when the pass has moved on, with the activation as it was).
+// Hooks run first, then captures, so captures see what the hooks left. The dicts must outlive the
+// hooks (they hold the references; the hooks only borrow them, so copying the hooks never touches
+// reference counts without the GIL). None when neither is given.
+std::optional<Hooks> python_hooks(const Model& m, const std::optional<nb::dict>& hooks, const std::optional<nb::dict>& captures = std::nullopt) {
+    if (!hooks && !captures) return std::nullopt;
     Hooks h;
     const std::vector<std::string> all = m.hook_names();
     const std::set<std::string> known(all.begin(), all.end());
-    for (auto [key, value] : fns) {
-        const std::string name = nb::cast<std::string>(key);
-        if (!known.count(name)) throw std::invalid_argument("no hook point named '" + name + "' (Model.hook_names() lists them)");
-        if (!PyCallable_Check(value.ptr())) throw std::invalid_argument("the hook for '" + name + "' is not callable");
-        nb::handle fn = value;
-        h.add(name, [fn](const std::string& n, Tensor& act) {
-            nb::gil_scoped_acquire gil;
-            const Shape shape = act.shape;
-            nb::object arr = to_numpy(Tensor(act));
-            nb::object out = fn(arr, n);
-            FloatIn result = nb::cast<FloatIn>(out.is_none() ? arr : out);
-            Tensor t = from_numpy(result);
-            if (t.shape != shape)
-                throw std::invalid_argument("the hook for '" + n + "' returned shape " + shape_str(t.shape) + ", expected " +
-                                            shape_str(shape));
-            act = std::move(t);
+    auto each = [&](const nb::dict& fns, const char* what, auto&& add) {
+        for (auto [key, value] : fns) {
+            const std::string name = nb::cast<std::string>(key);
+            if (!known.count(name)) throw std::invalid_argument("no hook point named '" + name + "' (Model.hook_names() lists them)");
+            if (!PyCallable_Check(value.ptr())) throw std::invalid_argument(std::string("the ") + what + " for '" + name + "' is not callable");
+            add(name, nb::handle(value));
+        }
+    };
+    if (hooks)
+        each(*hooks, "hook", [&](const std::string& name, nb::handle fn) {
+            h.add(name, [fn](const std::string& n, Tensor& act) {
+                nb::gil_scoped_acquire gil;
+                const Shape shape = act.shape;
+                nb::object arr = to_numpy(Tensor(act));
+                nb::object out = fn(arr, n);
+                FloatIn result = nb::cast<FloatIn>(out.is_none() ? arr : out);
+                Tensor t = from_numpy(result);
+                if (t.shape != shape)
+                    throw std::invalid_argument("the hook for '" + n + "' returned shape " + shape_str(t.shape) + ", expected " +
+                                                shape_str(shape));
+                act = std::move(t);
+            });
         });
-    }
+    if (captures)
+        each(*captures, "capture", [&](const std::string& name, nb::handle fn) {
+            h.add_capture([name](const std::string& n) { return n == name; }, [fn](const std::string& n, Tensor& act) {
+                nb::gil_scoped_acquire gil;
+                fn(to_numpy(Tensor(act)), n);
+            });
+        });
     return h;
 }
 
@@ -255,35 +271,33 @@ NB_MODULE(_tfi, mod) {
             Tensor t = w.dim() == 2 ? w.to_tensor() : w.f32();
             return to_numpy(std::move(t));
         }, "name"_a, "A weight's values as float32 (a copy).")
-        .def("forward", [](const Model& m, const Tokens& tokens, std::optional<nb::dict> hooks) {
-            std::optional<Hooks> h;
-            if (hooks) h = python_hooks(m, *hooks);
+        .def("forward", [](const Model& m, const Tokens& tokens, std::optional<nb::dict> hooks, std::optional<nb::dict> captures) {
+            std::optional<Hooks> h = python_hooks(m, hooks, captures);
             Tensor logits;
             {
                 nb::gil_scoped_release release;
                 logits = m.forward(tokens, h ? &*h : nullptr);
             }
             return to_numpy(std::move(logits));
-        }, "tokens"_a, "hooks"_a = nb::none(),
-             "Logits (T, vocab). hooks: {hook name: fn(activation, name)}; fn may edit the array or return a new one.")
+        }, "tokens"_a, "hooks"_a = nb::none(), "captures"_a = nb::none(),
+             "Logits (T, vocab). hooks: {hook name: fn(activation, name)}; fn may edit the array or return a new one. "
+             "captures: the same, only reading (the return value is ignored; a GPU pass doesn't stop for them).")
         .def("forward_cached", [](const Model& m, const Tokens& tokens, KVCache& cache, std::optional<nb::dict> hooks,
-                                  bool last_only) {
-            std::optional<Hooks> h;
-            if (hooks) h = python_hooks(m, *hooks);
+                                  bool last_only, std::optional<nb::dict> captures) {
+            std::optional<Hooks> h = python_hooks(m, hooks, captures);
             Tensor logits;
             {
                 nb::gil_scoped_release release;
                 logits = m.forward_cached(tokens, cache, h ? &*h : nullptr, last_only);
             }
             return to_numpy(std::move(logits));
-        }, "tokens"_a, "cache"_a, "hooks"_a = nb::none(), "last_only"_a = false,
+        }, "tokens"_a, "cache"_a, "hooks"_a = nb::none(), "last_only"_a = false, "captures"_a = nb::none(),
              "Logits for tokens continuing the sequence in cache, which then holds them too: (T, vocab), or (1, vocab) "
              "with last_only. Hooks see only the new rows; hook_pattern is (H, T, cache.size + T).")
         .def("run_with_cache", [](const Model& m, const Tokens& tokens, std::optional<std::vector<std::string>> names,
-                                  std::optional<nb::dict> hooks) {
+                                  std::optional<nb::dict> hooks, std::optional<nb::dict> captures) {
             NameFilter filter = names_filter(m, names);
-            std::optional<Hooks> h;
-            if (hooks) h = python_hooks(m, *hooks);
+            std::optional<Hooks> h = python_hooks(m, hooks, captures);
             ActivationCache cache;
             Tensor logits;
             {
@@ -291,7 +305,7 @@ NB_MODULE(_tfi, mod) {
                 logits = m.run_with_cache(tokens, cache, filter, h ? &*h : nullptr);
             }
             return nb::make_tuple(to_numpy(std::move(logits)), cache_to_dict(std::move(cache)));
-        }, "tokens"_a, "names"_a = nb::none(), "hooks"_a = nb::none(),
+        }, "tokens"_a, "names"_a = nb::none(), "hooks"_a = nb::none(), "captures"_a = nb::none(),
              "(logits, {hook name: activation}) for the named hook points (all when names is None).")
         .def("embed", [](const Model& m, const Tokens& tokens) {
             Tensor t;
@@ -329,7 +343,8 @@ NB_MODULE(_tfi, mod) {
     // --- generation ----------------------------------------------------------------------
     mod.def("generate", [](const Model& m, nb::object prompt, int64_t max_new_tokens, double temperature, int64_t top_k,
                            double top_p, uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos,
-                           std::optional<nb::dict> hooks, nb::object on_token) {
+                           std::optional<nb::dict> hooks, nb::object on_token, std::optional<nb::dict> captures, bool trace,
+                           int64_t trace_top_k, bool trace_lens, bool trace_dla, int64_t trace_attention) -> nb::object {
         Tokens tokens;
         if (nb::isinstance<nb::str>(prompt)) {
             const std::string text = nb::cast<std::string>(prompt);
@@ -346,6 +361,10 @@ NB_MODULE(_tfi, mod) {
         o.seed = seed;
         if (stop_tokens) o.stop_tokens = *stop_tokens;
         o.stop_at_eos = stop_at_eos;
+        o.trace.top_k = trace_top_k;
+        o.trace.lens = trace_lens;
+        o.trace.dla = trace_dla;
+        o.trace.attention_top = trace_attention;
         if (!on_token.is_none()) {
             if (!PyCallable_Check(on_token.ptr())) throw std::invalid_argument("on_token is not callable");
             nb::handle fn = on_token;  // borrowed: on_token outlives the call
@@ -355,16 +374,74 @@ NB_MODULE(_tfi, mod) {
                 return r.is_none() || nb::cast<bool>(r);
             };
         }
-        std::optional<Hooks> h;
-        if (hooks) h = python_hooks(m, *hooks);
-        nb::gil_scoped_release release;
-        return generate(m, tokens, o, h ? &*h : nullptr);
+        std::optional<Hooks> h = python_hooks(m, hooks, captures);
+        std::vector<TraceStep> steps;
+        Tokens out;
+        {
+            nb::gil_scoped_release release;
+            out = generate(m, tokens, o, h ? &*h : nullptr, trace ? &steps : nullptr);
+        }
+        if (!trace) return nb::cast(out);
+        nb::list list;
+        for (TraceStep& st : steps) {
+            nb::dict d;
+            d["token"] = st.token;
+            d["position"] = st.position;
+            d["prob"] = st.prob;
+            d["logprob"] = st.logprob;
+            d["top_tokens"] = st.top_tokens;
+            d["top_probs"] = st.top_probs;
+            if (o.trace.lens) {
+                const size_t S = st.lens.size();
+                std::vector<std::string> stages;
+                std::vector<float> prob;
+                std::vector<int64_t> rank, top;
+                for (const LensEntry& e : st.lens) {
+                    stages.push_back(e.stage);
+                    prob.push_back(e.target_prob);
+                    rank.push_back(e.target_rank);
+                    top.push_back(e.top_tokens.empty() ? -1 : e.top_tokens[0]);
+                }
+                nb::dict lens;
+                lens["stages"] = stages;
+                lens["prob"] = to_numpy(std::move(prob), {S});
+                lens["rank"] = to_numpy(std::move(rank), {S});
+                lens["top"] = to_numpy(std::move(top), {S});
+                d["lens"] = lens;
+            }
+            if (o.trace.dla) {
+                nb::dict dla;
+                const size_t n = st.dla.values.size();
+                dla["labels"] = st.dla.labels;
+                dla["values"] = to_numpy(std::move(st.dla.values), {n});
+                dla["sum"] = st.dla.sum;
+                dla["actual"] = st.dla.actual;
+                d["dla"] = dla;
+            }
+            if (o.trace.attention_top > 0) {
+                nb::dict att;
+                for (const TraceStep::Attention& a : st.attention) {
+                    nb::dict one;
+                    one["positions"] = a.positions;
+                    one["weights"] = a.weights;
+                    att[nb::str(a.head.c_str())] = one;
+                }
+                d["attention"] = att;
+            }
+            list.append(d);
+        }
+        return nb::make_tuple(out, list);
     }, "model"_a, "prompt"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0, "top_k"_a = 0, "top_p"_a = 1.0, "seed"_a = 0,
        "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(), "on_token"_a = nb::none(),
+       "captures"_a = nb::none(), "trace"_a = false, "trace_top_k"_a = 5, "trace_lens"_a = true, "trace_dla"_a = true,
+       "trace_attention"_a = 0,
        "New token ids continuing prompt (token ids, or text for the model's tokenizer), with a KV cache. Greedy at "
        "temperature 0; otherwise sampled from the top_k most likely and the fewest reaching top_p, reproducibly from "
        "seed. Stops at stop_tokens, the model's eos_tokens (unless stop_at_eos is False), or when on_token(token) "
-       "returns False. hooks apply at every step: the prompt's pass, then each new token's.");
+       "returns False. hooks (editing) and captures (reading only) apply at every step: the prompt's pass, then each "
+       "new token's. With trace, returns (tokens, steps): per new token a dict of its probability, the top tokens, "
+       "and (trace_lens) the logit lens at its position, (trace_dla) direct logit attribution of its logit, "
+       "(trace_attention > 0) each head's most attended positions.");
 
     // --- analyses ------------------------------------------------------------------------
     mod.def("logit_metric", [](const FloatIn& logits, int64_t pos, int64_t target, int64_t other) {

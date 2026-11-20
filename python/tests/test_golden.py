@@ -300,6 +300,10 @@ def test_cli_generate(tools, tmp_path, opts):
     assert [int(t) for t in stop.stdout.split(" |")[1].split()][-1] == want[3]
     sample = gen + ["--max-new", "10", "--temperature", "1", "--top-p", "0.9", "--seed", "4"]
     assert subprocess.run(sample, capture_output=True, text=True).stdout == subprocess.run(sample, capture_output=True, text=True).stdout
+    traced = subprocess.run(gen + ["--max-new", "6", "--trace"], capture_output=True, text=True)
+    assert traced.returncode == 0, traced.stderr
+    table = traced.stdout.split("top-1 from")[1].strip().split("\n")[1:]
+    assert len(table) == 6 and [int(r.split()[1]) for r in table] == want[:6]  # one row per new token, its id
     for bad, msg in [(["--temperature", "-1"], "temperature"), (["--top-p", "2"], "top_p"), (["--stop", "999"], "outside the vocabulary")]:
         r = subprocess.run(gen + bad, capture_output=True, text=True)
         assert r.returncode == 1 and msg in r.stderr, r.stderr

@@ -185,8 +185,11 @@ int num_threads() {
         const int n = std::atoi(env);
         if (n > 0) return n;
     }
-    const unsigned hw = std::thread::hardware_concurrency();
-    return hw ? static_cast<int>(hw) : 1;
+    static const int hw = [] {  // asks the system, so once: linear layers on few rows call this every time
+        const unsigned n = std::thread::hardware_concurrency();
+        return n ? static_cast<int>(n) : 1;
+    }();
+    return hw;
 }
 
 float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
@@ -205,9 +208,9 @@ float next_token_loss(const Tensor& logits, const Tokens& tokens) {
 
 // --- logit lens ---------------------------------------------------------------------
 
-std::vector<LensEntry> logit_lens(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t k) {
-    check_pos(tokens, pos);
-    if (target >= 0) check_token(m, target, "target");
+namespace {
+// (label, hook point) of every stage the logit lens decodes.
+std::vector<std::pair<std::string, std::string>> lens_stages(const Model& m) {
     std::vector<std::pair<std::string, std::string>> stages = {{"embed", "blocks.0.hook_resid_pre"}};
     for (int64_t i = 0; i < m.cfg().n_layers; ++i) {
         const std::string L = "L" + std::to_string(i);
@@ -218,86 +221,124 @@ std::vector<LensEntry> logit_lens(const Model& m, const Tokens& tokens, int64_t 
             stages.push_back({L + ".attn", lp(i) + "hook_resid_post"});
         }
     }
-    // Only the stages decoded: later layers' resid_pre would just duplicate the previous resid_post.
-    std::set<std::string> needed;
-    for (const auto& st : stages) needed.insert(st.second);
-    ActivationCache cache;
-    m.run_with_cache(tokens, cache, only(std::move(needed)));
+    return stages;
+}
+}  // namespace
+
+std::vector<std::string> lens_hook_points(const Model& m) {
+    std::vector<std::string> out;
+    for (const auto& st : lens_stages(m)) out.push_back(st.second);
+    return out;
+}
+
+std::vector<LensEntry> logit_lens_from(const Model& m, const ActivationCache& cache, int64_t row, int64_t target, int64_t k) {
+    if (target >= 0) check_token(m, target, "target");
+    const std::vector<std::pair<std::string, std::string>> stages = lens_stages(m);
+    const int64_t V = m.cfg().vocab_size, d = m.cfg().d_model, S = static_cast<int64_t>(stages.size());
+    // Every stage's row, decoded together: one pass over the unembedding instead of one per stage.
+    Tensor stack({S, d});
+    for (int64_t s = 0; s < S; ++s) {
+        const Tensor& a = cache.at(stages[s].second);
+        if (a.dim() != 2 || a.shape[1] != d || row < 0 || row >= a.shape[0])
+            throw std::out_of_range("logit lens: row " + std::to_string(row) + " is outside " + stages[s].second);
+        std::copy(a.ptr() + row * d, a.ptr() + (row + 1) * d, stack.ptr() + s * d);
+    }
+    Tensor probs = m.logits_from_final(m.final_norm(stack));
     std::vector<LensEntry> out;
-    const int64_t V = m.cfg().vocab_size;
-    for (const auto& st : stages) {
-        Tensor r = rows(cache.at(st.second), pos, pos + 1);
-        Tensor probs = m.logits_from_final(m.final_norm(r));
-        softmax_(probs.ptr(), V);
+    for (int64_t s = 0; s < S; ++s) {
+        float* p = probs.ptr() + s * V;
+        softmax_(p, V);
         LensEntry e;
-        e.stage = st.first;
-        e.top_tokens = topk(probs.ptr(), V, k);
-        for (int64_t t : e.top_tokens) e.top_probs.push_back(probs.data[t]);
+        e.stage = stages[s].first;
+        e.top_tokens = topk(p, V, k);
+        for (int64_t t : e.top_tokens) e.top_probs.push_back(p[t]);
         if (target >= 0) {
-            e.target_prob = probs.data[target];
-            e.target_rank = rank_of(probs.ptr(), V, target);
+            e.target_prob = p[target];
+            e.target_rank = rank_of(p, V, target);
         }
         out.push_back(std::move(e));
     }
     return out;
 }
 
+std::vector<LensEntry> logit_lens(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t k) {
+    check_pos(tokens, pos);
+    if (target >= 0) check_token(m, target, "target");
+    // Only the stages decoded: later layers' resid_pre would just duplicate the previous resid_post.
+    const std::vector<std::string> points = lens_hook_points(m);
+    ActivationCache cache;
+    m.run_with_cache(tokens, cache, only(std::set<std::string>(points.begin(), points.end())));
+    return logit_lens_from(m, cache, pos, target, k);
+}
+
 // --- direct logit attribution --------------------------------------------------------
 
-DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t other) {
-    const ModelConfig& cfg = m.cfg();
-    if (cfg.norm_position == "post")
+namespace {
+void check_dla_model(const Model& m) {
+    if (m.cfg().norm_position == "post")
         throw std::runtime_error("direct logit attribution needs an additive residual stream; post-norm models have none");
-    for (int64_t i = 0; i < cfg.n_layers; ++i)  // a single post-norm layer (via layer_overrides) breaks it too
+    for (int64_t i = 0; i < m.cfg().n_layers; ++i)  // a single post-norm layer (via layer_overrides) breaks it too
         if (m.layer_cfg(i).norm_position == "post")
             throw std::runtime_error("direct logit attribution needs an additive residual stream; layer " +
                                      std::to_string(i) + " is post-norm");
-    check_pos(tokens, pos);
-    check_token(m, target, "target");
-    if (other >= 0) check_token(m, other, "other");
+}
+}  // namespace
 
-    const int64_t d = cfg.d_model, L = cfg.n_layers;
-    std::set<std::string> needed = {"hook_embed", "hook_pos_embed", "hook_final", lp(L - 1) + "hook_resid_post"};
+std::vector<std::string> dla_hook_points(const Model& m) {
+    const int64_t L = m.cfg().n_layers;
+    std::vector<std::string> out = {"hook_embed", "hook_final", lp(L - 1) + "hook_resid_post"};
+    if (m.cfg().embedding_positional()) out.push_back("hook_pos_embed");
     for (int64_t i = 0; i < L; ++i) {
         const ModelConfig& c = m.layer_cfg(i);
-        needed.insert(lp(i) + (c.norm_position == "sandwich" ? "hook_attn_out" : "attn.hook_z"));
-        if (c.has_mlp()) needed.insert(lp(i) + "hook_mlp_out");
+        out.push_back(lp(i) + (c.norm_position == "sandwich" ? "hook_attn_out" : "attn.hook_z"));
+        if (c.has_mlp()) out.push_back(lp(i) + "hook_mlp_out");
     }
-    ActivationCache cache;
-    m.run_with_cache(tokens, cache, only(std::move(needed)));
+    return out;
+}
+
+DLAResult direct_logit_attribution_from(const Model& m, const ActivationCache& cache, int64_t row, int64_t target, int64_t other) {
+    check_dla_model(m);
+    check_token(m, target, "target");
+    if (other >= 0) check_token(m, other, "other");
+    const ModelConfig& cfg = m.cfg();
+    const int64_t d = cfg.d_model, L = cfg.n_layers;
+    auto at_row = [&](const std::string& name, int64_t width) {  // row `row` of a (rows, width...) activation
+        const Tensor& a = cache.at(name);
+        if (a.dim() < 2 || row < 0 || row >= a.shape[0] || a.numel() / a.shape[0] != width)
+            throw std::out_of_range("direct logit attribution: row " + std::to_string(row) + " is outside " + name);
+        return a.ptr() + row * width;
+    };
     const std::vector<float> u = logit_direction(m, target, other);
 
     // Final norm as a fixed linear map: f(c) = gamma * (c - mean(c)) / sigma for LayerNorm,
     // gamma * c / rms for RMSNorm, with sigma / rms taken from the real final residual.
-    const Tensor resid = row(cache.at(lp(L - 1) + "hook_resid_post"), pos);
+    const float* resid = at_row(lp(L - 1) + "hook_resid_post", d);
     std::vector<float> w(u);  // u * gamma / scale
     bool center = false;
     float bias_term = 0;
     if (cfg.norm != "none") {
         const Tensor& gamma = m.weight("ln_final.weight").f32();
         double mean = 0, sq = 0;
-        for (float v : resid.data) mean += v;
+        for (int64_t j = 0; j < d; ++j) mean += resid[j];
         mean /= d;
         if (cfg.norm == "layernorm") {
-            for (float v : resid.data) sq += (v - mean) * (v - mean);
+            for (int64_t j = 0; j < d; ++j) sq += (resid[j] - mean) * (resid[j] - mean);
             center = true;
         } else {
-            for (float v : resid.data) sq += double(v) * v;
+            for (int64_t j = 0; j < d; ++j) sq += double(resid[j]) * resid[j];
         }
         const float inv = 1.0f / std::sqrt(static_cast<float>(sq / d) + static_cast<float>(cfg.norm_eps));
         for (int64_t j = 0; j < d; ++j) w[j] = u[j] * gamma.data[j] * inv;
         if (const Weight* beta = m.weight_or_null("ln_final.bias")) bias_term = dot(u.data(), beta->f32().ptr(), d);
     }
-    auto contribution = [&](const float* c) {
-        float mean = 0;
-        if (center) {
-            for (int64_t j = 0; j < d; ++j) mean += c[j];
-            mean /= d;
-        }
-        float s = 0;
-        for (int64_t j = 0; j < d; ++j) s += w[j] * (c[j] - mean);
-        return s;
-    };
+    // LayerNorm's centring is linear too: w . (c - mean(c)) = (w - mean(w)) . c.
+    if (center) {
+        double wm = 0;
+        for (float v : w) wm += v;
+        wm /= d;
+        for (float& v : w) v -= static_cast<float>(wm);
+    }
+    auto contribution = [&](const float* c) { return dot(w.data(), c, d); };
 
     DLAResult res;
     auto push = [&](const std::string& label, float v) {
@@ -305,31 +346,39 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
         res.values.push_back(v);
         res.sum += v;
     };
-    push("embed", contribution(cache.at("hook_embed").ptr() + pos * d));
-    if (cache.count("hook_pos_embed")) push("pos_embed", contribution(cache.at("hook_pos_embed").ptr() + pos * d));
+    push("embed", contribution(at_row("hook_embed", d)));
+    if (cache.count("hook_pos_embed")) push("pos_embed", contribution(at_row("hook_pos_embed", d)));
+    const Tensor wrow({1, d}, w);
     for (int64_t i = 0; i < L; ++i) {
         const ModelConfig& c = m.layer_cfg(i);
         if (c.norm_position == "sandwich") {  // per-head outputs pass through a norm; attribute the layer
-            push("L" + std::to_string(i) + ".attn", contribution(cache.at(lp(i) + "hook_attn_out").ptr() + pos * d));
+            push("L" + std::to_string(i) + ".attn", contribution(at_row(lp(i) + "hook_attn_out", d)));
         } else {
-            const Tensor& z = cache.at(lp(i) + "attn.hook_z");  // (T, H, D)
-            const Weight& Wo = m.weight(lp(i) + "attn.o_proj.weight");  // (d, H*D)
+            // Head h writes o_proj's columns h*D..(h+1)*D times z_h, so its part is (w W_O)[h*D..] . z_h:
+            // one pass over W_O for the layer, then a dot of D per head.
             const int64_t H = c.n_heads, D = c.head_dim();
-            std::vector<float> out(d);
-            for (int64_t h = 0; h < H; ++h) {
-                const float* zh = z.ptr() + (pos * H + h) * D;
-                const Tensor Woh = Wo.cols(h * D, (h + 1) * D);  // (d, D)
-                for (int64_t j = 0; j < d; ++j) out[j] = dot(Woh.ptr() + j * D, zh, D);
-                push(head_label(i, h), contribution(out.data()));
-            }
+            const float* z = at_row(lp(i) + "attn.hook_z", H * D);  // (H, D) at this row
+            const Tensor g = matmul(wrow, m.weight(lp(i) + "attn.o_proj.weight"));  // (1, H*D)
+            for (int64_t h = 0; h < H; ++h) push(head_label(i, h), dot(g.ptr() + h * D, z + h * D, D));
             if (const Weight* bo = m.weight_or_null(lp(i) + "attn.o_proj.bias"))
                 push("L" + std::to_string(i) + ".attn_bias", contribution(bo->f32().ptr()));
         }
-        if (c.has_mlp()) push("L" + std::to_string(i) + ".mlp", contribution(cache.at(lp(i) + "hook_mlp_out").ptr() + pos * d));
+        if (c.has_mlp()) push("L" + std::to_string(i) + ".mlp", contribution(at_row(lp(i) + "hook_mlp_out", d)));
     }
     if (bias_term != 0) push("final_norm_bias", bias_term);
-    res.actual = dot(u.data(), cache.at("hook_final").ptr() + pos * d, d);
+    res.actual = dot(u.data(), at_row("hook_final", d), d);
     return res;
+}
+
+DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t other) {
+    check_dla_model(m);
+    check_pos(tokens, pos);
+    check_token(m, target, "target");
+    if (other >= 0) check_token(m, other, "other");
+    const std::vector<std::string> points = dla_hook_points(m);
+    ActivationCache cache;
+    m.run_with_cache(tokens, cache, only(std::set<std::string>(points.begin(), points.end())));
+    return direct_logit_attribution_from(m, cache, pos, target, other);
 }
 
 // --- head pattern scores --------------------------------------------------------------

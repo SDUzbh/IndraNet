@@ -136,8 +136,13 @@ build/indra generate llama.safetensors --text "The capital of France is" --max-n
 build/indra generate llama.safetensors --text "Once upon a time" --temperature 0.8 --top-p 0.9 --seed 1
 ```
 
+`--trace` adds a table: for each new token, its probability and the alternatives, the first
+logit-lens stage where it was the top prediction, and the largest parts of its logit (direct logit
+attribution), all from the pass that chose it.
+
 `generate` runs the prompt in one pass and then each new token alone, reading the earlier
-positions' keys and values from a KV cache. It stops at the model's end-of-text tokens (stored for
+positions' keys and values from a KV cache. On macOS, models of a few hundred million weights or
+more generate on the GPU, with the cache kept there. It stops at the model's end-of-text tokens (stored for
 converted models; `--no-eos` ignores them), at `--stop` ids, or after `--max-new` tokens.
 
 ## Walkthrough: the 2-layer induction circuit
@@ -326,6 +331,8 @@ GenerateOptions opt;                                         // tfi/generate.h
 opt.max_new_tokens = 20;
 opt.temperature = 0.8;                                       // 0 (default): greedy
 Tokens more = generate(m, t, opt, &hooks);                   // hooks apply at every step
+std::vector<TraceStep> trace;                                // per new token: prob, logit lens, DLA, attention
+generate(m, t, opt, nullptr, &trace);                        // (opt.trace says which)
 std::string text = m.decode(more);
 
 const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
@@ -365,6 +372,10 @@ r = tfi.patch(m, clean, corrupt, "resid_pre", pos=-1, target=mary, other=john, m
 new = tfi.generate(m, "The capital of France is", max_new_tokens=20)          # token ids, KV cache
 m.decode(new)
 tfi.generate(m, t, temperature=0.8, top_p=0.9, seed=1, hooks={"blocks.15.attn.hook_z": knock_out})
+new, steps = tfi.generate(m, t, max_new_tokens=20, trace=True)   # per token: prob, top tokens, logit lens,
+steps[0]["lens"]["rank"], steps[0]["dla"]["labels"]                # DLA (+ trace_attention=k: where heads looked)
+keep = lambda a, name: print(name, a.shape)                        # captures only read: a GPU pass doesn't stop
+tfi.generate(m, t, max_new_tokens=5, captures={"blocks.10.hook_resid_post": keep})
 cache = tfi.KVCache()                      # step by step: forward_cached runs only the new tokens
 logits = m.forward_cached(t, cache)
 logits = m.forward_cached([mary], cache)   # (1, vocab); hooks see the new rows

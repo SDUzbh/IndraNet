@@ -80,6 +80,9 @@ class Gpu::Seq {
     void glu(int gate, int up, int64_t n, GpuAct act);   // gate = act(gate) * up
     void add(int a, int b, int out, int64_t n);          // out = a + b; out may be a or b
     void copy(int x, int y, int64_t n);
+    // A KV cache's new positions: rows of `src` (rows, heads * D) into `dst` (heads, cap, D), as
+    // positions start .. start + rows - 1 (start + rows <= cap).
+    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start);
     // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
     // norm()'s input gradient given its input x and output gradient dy (as grad.cpp's norm_backward);
     // dpre = dpost * act'(pre); and for a GLU, post = act(pre) * up: dpre = dpost * up * act'(pre),
@@ -136,6 +139,21 @@ class Gpu::Seq {
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// A KVCache's copy on the GPU (Model::forward_cached): every layer's keys and values in slots of a
+// Gpu::Seq that lives with the cache, so that a generated token's pass neither copies the earlier
+// positions to the GPU nor allocates. Layer l's keys are in slot kSlot0 + 4 l, its values in the next
+// slot, its RoPE frequencies and ALiBi slopes in the two after: (heads, cap, D) and per-layer inputs.
+struct GpuKV {
+    static constexpr int kSlot0 = 256;  // above every slot run_rows uses
+    std::shared_ptr<Gpu> gpu;           // kept alive with the cache
+    std::unique_ptr<Gpu::Seq> seq;
+    int64_t cap = 0;                    // positions each layer's slots hold
+    static int keys(int64_t layer) { return kSlot0 + 4 * static_cast<int>(layer); }
+    static int values(int64_t layer) { return keys(layer) + 1; }
+    static int inv_freq(int64_t layer) { return keys(layer) + 2; }
+    static int slopes(int64_t layer) { return keys(layer) + 3; }
 };
 
 // Independent GPU work whose results only come back to the CPU at the end (circuits). Operations

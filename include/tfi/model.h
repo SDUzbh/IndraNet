@@ -21,6 +21,7 @@ namespace detail {
 struct RowBatch;  // internal (src/ops.h)
 struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model.cpp)
 class Gpu;        // internal (src/gpu.h, macOS)
+struct GpuKV;     // internal (src/gpu.h, macOS): a KVCache's copy on the GPU
 
 // A model's GPU context, created on first use. Copies start empty: each model has its own context
 // (a copy shares the weights' memory, which each context uses in place).
@@ -76,6 +77,20 @@ class Model;
 // continues on its own: several continuations of one prompt can share its prefill.
 class KVCache {
   public:
+    KVCache() = default;
+    // A copy has the keys and values, not the GPU copy of them: it makes its own when it needs one.
+    KVCache(const KVCache& o) : k_(o.k_), v_(o.v_), len_(o.len_) {}
+    KVCache& operator=(const KVCache& o) {
+        k_ = o.k_;
+        v_ = o.v_;
+        len_ = o.len_;
+        gpu_.reset();
+        gpu_len_ = 0;
+        return *this;
+    }
+    KVCache(KVCache&&) = default;
+    KVCache& operator=(KVCache&&) = default;
+
     int64_t size() const { return len_; }  // positions held
     bool empty() const { return len_ == 0; }
     void clear();
@@ -89,6 +104,9 @@ class KVCache {
     // Per layer (Hkv, capacity, D), positions [0, len_) in use: room to grow without copying each step.
     std::vector<Tensor> k_, v_;
     int64_t len_ = 0;
+    // macOS: the same keys and values on the GPU, positions [0, gpu_len_) up to date (see forward_cached).
+    std::shared_ptr<detail::GpuKV> gpu_;
+    int64_t gpu_len_ = 0;
     void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);
 };
 
@@ -111,9 +129,11 @@ class Model {
     // With an empty cache this is forward() (on the GPU when that is worth it). Later calls compute
     // only the new rows, so hooks see those: activations are (T, ...), hook_pattern is
     // (H, T, cache.size() + T), each new query over every key, and hook_pos_embed is the new positions'.
-    // Whatever hook_k and hook_v leave is what later tokens attend to. These calls run on the CPU
-    // except for chunks of tokens large enough for the GPU (any size in GPU-only mode), unless a
-    // hook reads hook_pattern.
+    // Whatever hook_k and hook_v leave is what later tokens attend to.
+    // macOS: these calls go to the GPU for chunks of tokens large enough, for single tokens of models of
+    // a few hundred million weights or more, and always in GPU-only mode; then the cache keeps a copy
+    // of its keys and values on the GPU, appended to there, and the pass is one GPU submission. Not when
+    // a hook reads hook_pattern, or a layer's heads are too wide for the GPU's attention: the CPU then.
     Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.

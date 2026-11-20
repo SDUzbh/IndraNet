@@ -7,9 +7,37 @@
 #include <random>
 #include <vector>
 
+#include "tfi/analysis.h"
 #include "tfi/model.h"
 
 namespace tfi {
+
+// What generate() records about each new token, from the pass whose logits chose it (the prompt's last
+// position for the first token, then each new token's position): taken with capture hooks, so a pass
+// on the GPU doesn't stop for them.
+struct TraceOptions {
+    int64_t top_k = 5;          // the most likely tokens at each step, with their probabilities
+    bool lens = true;           // logit lens at the step's position (every stage, one batched unembedding)
+    bool dla = true;            // direct logit attribution of the chosen token's logit (not post-norm models)
+    int64_t attention_top = 0;  // per head, the positions the step attended to most (0: none). Needs the
+                                // attention pattern, so cached steps run attention on the CPU
+};
+
+struct TraceStep {
+    int64_t token = -1;     // the chosen token
+    int64_t position = -1;  // the position whose logits chose it (the token goes at position + 1)
+    float prob = 0, logprob = 0;  // its probability under the model's distribution (before temperature, top_k, top_p)
+    std::vector<int64_t> top_tokens;
+    std::vector<float> top_probs;
+    std::vector<LensEntry> lens;  // target_prob / target_rank: the chosen token's, at each stage
+    DLAResult dla;                // parts of the chosen token's logit
+    struct Attention {
+        std::string head;              // "L3H5"
+        std::vector<int64_t> positions;  // most attended first
+        std::vector<float> weights;
+    };
+    std::vector<Attention> attention;  // every head, with TraceOptions::attention_top
+};
 
 struct GenerateOptions {
     int64_t max_new_tokens = 32;
@@ -21,6 +49,7 @@ struct GenerateOptions {
     bool stop_at_eos = true;           // ... or one of the model's eos_tokens()
     // Called with each new token as it is chosen; returning false stops after it.
     std::function<bool(int64_t token)> on_token;
+    TraceOptions trace;  // what generate() records when given a trace to fill
 };
 
 // Picks the next token from a row of logits by GenerateOptions' rules: temperature, then top_k, then
@@ -41,7 +70,10 @@ class Sampler {
 // pass, then each new token alone. `hooks` apply to every pass: the prompt's activations first, then
 // each new token's (see Model::forward_cached for their shapes), so an intervention lasts through the
 // whole text.
+// With `trace`, it also receives a TraceStep per new token (options.trace says what each holds), before
+// on_token is called for that token. Activations are recorded after `hooks` ran: the trace shows what
+// the model computed, interventions included.
 Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
-                const Hooks* hooks = nullptr);
+                const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
 
 }  // namespace tfi
