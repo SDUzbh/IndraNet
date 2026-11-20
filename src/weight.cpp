@@ -115,6 +115,8 @@ void linear_direct(const float* x, int64_t n_rows, const WT* W, int64_t in, int6
                          });
         return;
     }
+#else
+    (void)chunks;  // elsewhere one thread: the chunks run in order, as one
 #endif
     rows(0, out);
 }

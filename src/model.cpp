@@ -792,6 +792,9 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
     hook(hooks, p + "hook_q", q);
     hook(hooks, p + "hook_k", k);
     hook(hooks, p + "hook_v", v);
+    // Attention reads T rows of each: a hook that resized one would make it read past the end.
+    if (q.shape != Shape{H, T, D} || k.shape != Shape{Hkv, T, D} || v.shape != Shape{Hkv, T, D})
+        throw std::runtime_error(p + "hook_q / hook_k / hook_v: a hook changed the activation's shape");
 
     const std::vector<float> slopes = c.positional == "alibi" ? alibi_slopes(H) : std::vector<float>();
     HeadAttention ha{D, static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D))),
