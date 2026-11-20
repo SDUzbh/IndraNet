@@ -277,6 +277,40 @@ def test_cli_commands(tools, tmp_path, opts):
     assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
 
 
+
+@pytest.mark.parametrize("opts", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
+                                  MIXED_HEADS], ids=_id)
+def test_cli_generate(tools, tmp_path, opts):
+    """indra generate: greedy = indranet's generate; token ids without a vocabulary, text with one; sampling
+    is reproducible; options are checked."""
+    torch.manual_seed(0)
+    model = DecoderLM(tiny(**opts)).eval()
+    path = tmp_path / "model.safetensors"
+    export_model(model, path)
+    prompt = [5, 9, 13, 2, 7]
+    with torch.no_grad():
+        want = model.generate(torch.tensor([prompt]), 10, temperature=0)[0, len(prompt):].tolist()
+    gen = [str(tools / "indra"), "generate", str(path), "--tokens", ",".join(map(str, prompt))]
+    r = subprocess.run(gen + ["--max-new", "10"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    shown, new = r.stdout.strip().split(" |")
+    assert shown == ",".join(map(str, prompt)) and [int(t) for t in new.split()] == want
+    assert "10 new tokens" in r.stderr
+    stop = subprocess.run(gen + ["--max-new", "10", "--stop", str(want[3])], capture_output=True, text=True)
+    assert [int(t) for t in stop.stdout.split(" |")[1].split()][-1] == want[3]
+    sample = gen + ["--max-new", "10", "--temperature", "1", "--top-p", "0.9", "--seed", "4"]
+    assert subprocess.run(sample, capture_output=True, text=True).stdout == subprocess.run(sample, capture_output=True, text=True).stdout
+    for bad, msg in [(["--temperature", "-1"], "temperature"), (["--top-p", "2"], "top_p"), (["--stop", "999"], "outside the vocabulary")]:
+        r = subprocess.run(gen + bad, capture_output=True, text=True)
+        assert r.returncode == 1 and msg in r.stderr, r.stderr
+    # With a vocabulary: the text, then its continuation.
+    vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
+    export_model(model, tmp_path / "vocab.safetensors", vocab=vocab)
+    r = subprocess.run([str(tools / "indra"), "generate", str(tmp_path / "vocab.safetensors"), "--text", "fjnch",
+                        "--max-new", "10"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "fjnch" + "".join(vocab[t] for t in want) + "\n"
+
 def test_export_rejects_custom_components(tmp_path):
     from torch import nn
     from indranet import register

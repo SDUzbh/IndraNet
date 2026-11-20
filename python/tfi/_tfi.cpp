@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "tfi/analysis.h"
+#include "tfi/generate.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
 #include "tfi/tokenizer.h"
@@ -111,6 +112,13 @@ Hooks python_hooks(const Model& m, const nb::dict& fns) {
     return h;
 }
 
+// Decoded bytes as a Python str; bytes that aren't valid UTF-8 (a character cut off) become U+FFFD.
+nb::str utf8_str(const std::string& bytes) {
+    PyObject* s = PyUnicode_DecodeUTF8(bytes.data(), static_cast<Py_ssize_t>(bytes.size()), "replace");
+    if (!s) throw nb::python_error();
+    return nb::steal<nb::str>(s);
+}
+
 int64_t resolve_pos(const Tokens& t, int64_t pos) {
     const int64_t T = static_cast<int64_t>(t.size());
     if (pos < 0) pos += T;
@@ -180,7 +188,27 @@ NB_MODULE(_tfi, mod) {
     nb::class_<Tokenizer>(mod, "Tokenizer", "A Hugging Face tokenizer.json, as the engine runs it.")
         .def_static("from_json", &Tokenizer::from_json, "tokenizer_json"_a)
         .def("encode", &Tokenizer::encode, "text"_a, "add_special_tokens"_a = true,
-             nb::call_guard<nb::gil_scoped_release>());
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("decode", [](const Tokenizer& t, const Tokens& ids, bool skip_special_tokens) {
+            return utf8_str(t.decode(ids, skip_special_tokens));
+        }, "ids"_a, "skip_special_tokens"_a = false, "Text for token ids.");
+
+    // --- KV cache ------------------------------------------------------------------------
+    nb::class_<KVCache>(mod, "KVCache",
+                        "Every layer's keys and values for the positions run so far (Model.forward_cached). "
+                        "copy() continues separately, e.g. several continuations of one prompt.")
+        .def(nb::init<>())
+        .def_prop_ro("size", &KVCache::size, "Positions held.")
+        .def("__len__", &KVCache::size)
+        .def("clear", &KVCache::clear)
+        .def("truncate", &KVCache::truncate, "n"_a, "Keep positions 0..n-1.")
+        .def("keys", [](const KVCache& c, int64_t layer) { return to_numpy(c.keys(layer)); }, "layer"_a,
+             "Layer's keys (kv_heads, size, d_head), as hook_k gave them.")
+        .def("values", [](const KVCache& c, int64_t layer) { return to_numpy(c.values(layer)); }, "layer"_a,
+             "Layer's values (kv_heads, size, d_head), as hook_v gave them.")
+        .def("copy", [](const KVCache& c) { return KVCache(c); })
+        .def("__copy__", [](const KVCache& c) { return KVCache(c); })
+        .def("__deepcopy__", [](const KVCache& c, nb::handle) { return KVCache(c); }, "memo"_a);
 
     // --- model ---------------------------------------------------------------------------
     nb::class_<Model>(mod, "Model", "A model loaded from a safetensors file (indranet.export or indranet_hf).")
@@ -210,6 +238,12 @@ NB_MODULE(_tfi, mod) {
         .def("tokenize", &Model::tokenize, "text"_a, "add_special_tokens"_a = true,
              nb::call_guard<nb::gil_scoped_release>(),
              "Token ids: the model's tokenizer, or the longest vocabulary match.")
+        .def("decode", [](const Model& m, const Tokens& ids, bool skip_special_tokens) {
+            return utf8_str(m.decode(ids, skip_special_tokens));
+        }, "ids"_a, "skip_special_tokens"_a = false,
+             "Text for token ids: the model's tokenizer, or its vocabulary's strings joined.")
+        .def_prop_rw("eos_tokens", &Model::eos_tokens, &Model::set_eos_tokens,
+                     "Token ids that end a text (Hugging Face's eos_token_id for converted models).")
         .def("hook_names", &Model::hook_names)
         .def("weight_names", [](const Model& m) {
             std::vector<std::string> n;
@@ -232,6 +266,19 @@ NB_MODULE(_tfi, mod) {
             return to_numpy(std::move(logits));
         }, "tokens"_a, "hooks"_a = nb::none(),
              "Logits (T, vocab). hooks: {hook name: fn(activation, name)}; fn may edit the array or return a new one.")
+        .def("forward_cached", [](const Model& m, const Tokens& tokens, KVCache& cache, std::optional<nb::dict> hooks,
+                                  bool last_only) {
+            std::optional<Hooks> h;
+            if (hooks) h = python_hooks(m, *hooks);
+            Tensor logits;
+            {
+                nb::gil_scoped_release release;
+                logits = m.forward_cached(tokens, cache, h ? &*h : nullptr, last_only);
+            }
+            return to_numpy(std::move(logits));
+        }, "tokens"_a, "cache"_a, "hooks"_a = nb::none(), "last_only"_a = false,
+             "Logits for tokens continuing the sequence in cache, which then holds them too: (T, vocab), or (1, vocab) "
+             "with last_only. Hooks see only the new rows; hook_pattern is (H, T, cache.size + T).")
         .def("run_with_cache", [](const Model& m, const Tokens& tokens, std::optional<std::vector<std::string>> names,
                                   std::optional<nb::dict> hooks) {
             NameFilter filter = names_filter(m, names);
@@ -278,6 +325,46 @@ NB_MODULE(_tfi, mod) {
             }
             return to_numpy(std::move(out));
         }, "normed"_a, "Unembedding (and final softcap) of final-normed rows (T, d_model).");
+
+    // --- generation ----------------------------------------------------------------------
+    mod.def("generate", [](const Model& m, nb::object prompt, int64_t max_new_tokens, double temperature, int64_t top_k,
+                           double top_p, uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos,
+                           std::optional<nb::dict> hooks, nb::object on_token) {
+        Tokens tokens;
+        if (nb::isinstance<nb::str>(prompt)) {
+            const std::string text = nb::cast<std::string>(prompt);
+            nb::gil_scoped_release release;
+            tokens = m.tokenize(text);
+        } else {
+            tokens = nb::cast<Tokens>(prompt);
+        }
+        GenerateOptions o;
+        o.max_new_tokens = max_new_tokens;
+        o.temperature = temperature;
+        o.top_k = top_k;
+        o.top_p = top_p;
+        o.seed = seed;
+        if (stop_tokens) o.stop_tokens = *stop_tokens;
+        o.stop_at_eos = stop_at_eos;
+        if (!on_token.is_none()) {
+            if (!PyCallable_Check(on_token.ptr())) throw std::invalid_argument("on_token is not callable");
+            nb::handle fn = on_token;  // borrowed: on_token outlives the call
+            o.on_token = [fn](int64_t t) {
+                nb::gil_scoped_acquire gil;
+                nb::object r = fn(t);
+                return r.is_none() || nb::cast<bool>(r);
+            };
+        }
+        std::optional<Hooks> h;
+        if (hooks) h = python_hooks(m, *hooks);
+        nb::gil_scoped_release release;
+        return generate(m, tokens, o, h ? &*h : nullptr);
+    }, "model"_a, "prompt"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0, "top_k"_a = 0, "top_p"_a = 1.0, "seed"_a = 0,
+       "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(), "on_token"_a = nb::none(),
+       "New token ids continuing prompt (token ids, or text for the model's tokenizer), with a KV cache. Greedy at "
+       "temperature 0; otherwise sampled from the top_k most likely and the fewest reaching top_p, reproducibly from "
+       "seed. Stops at stop_tokens, the model's eos_tokens (unless stop_at_eos is False), or when on_token(token) "
+       "returns False. hooks apply at every step: the prompt's pass, then each new token's.");
 
     // --- analyses ------------------------------------------------------------------------
     mod.def("logit_metric", [](const FloatIn& logits, int64_t pos, int64_t target, int64_t other) {

@@ -4,12 +4,18 @@
 #include <cstdlib>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
+
 #include "half.h"
 #include "ops.h"
+#include "tfi/analysis.h"  // num_threads
 
 namespace tfi {
 
@@ -22,6 +28,95 @@ std::vector<float>& block_buffer(int64_t floats) {
     thread_local std::vector<float> buf;
     if (static_cast<int64_t>(buf.size()) < floats) buf.resize(static_cast<size_t>(floats));
     return buf;
+}
+
+// Up to this many rows, a linear layer multiplies straight from the weights (direct_rows): for one row
+// (a generated token) converting fp16 weights to float32 first would cost more than the multiply, and
+// the library's matrix multiply gains nothing. More rows use the library (fp16: converted blocks).
+constexpr int64_t kDirectRows = 4;
+
+// One weight value as float32: as stored, or converted from fp16 (exactly).
+inline float weight_value(float w) { return w; }
+inline float weight_value(uint16_t w) { return detail::half_to_float(w); }
+
+// y[r * ldy + j] = x[r] . W[j] for R rows of x (stride in) and weight rows j0..j1-1 of W (float32 or
+// fp16, `in` columns), in float32, each weight row read once. fp16 weights take the same steps on
+// their (exact) float32 values, so an fp16 model gives bit for bit what float32 weights holding the
+// same rounded values give.
+template <int R, typename WT>
+void direct_rows(const float* x, const WT* W, int64_t in, int64_t j0, int64_t j1, float* y, int64_t ldy) {
+    for (int64_t j = j0; j < j1; ++j) {
+        const WT* w = W + j * in;
+        float sum[R];
+        int64_t k = 0;
+#if defined(__aarch64__)
+        float32x4_t acc[R][2];
+        for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = vdupq_n_f32(0.f);
+        for (; k + 8 <= in; k += 8) {
+            float32x4_t lo, hi;
+            if constexpr (std::is_same_v<WT, uint16_t>) {
+                const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(w + k));
+                lo = vcvt_f32_f16(vget_low_f16(h));
+                hi = vcvt_high_f32_f16(h);
+            } else {
+                lo = vld1q_f32(w + k);
+                hi = vld1q_f32(w + k + 4);
+            }
+            for (int r = 0; r < R; ++r) {
+                acc[r][0] = vfmaq_f32(acc[r][0], vld1q_f32(x + r * in + k), lo);
+                acc[r][1] = vfmaq_f32(acc[r][1], vld1q_f32(x + r * in + k + 4), hi);
+            }
+        }
+        for (int r = 0; r < R; ++r) sum[r] = vaddvq_f32(vaddq_f32(acc[r][0], acc[r][1]));
+#else
+        for (int r = 0; r < R; ++r) sum[r] = 0.f;
+#endif
+        for (; k < in; ++k) {
+            const float wk = weight_value(w[k]);
+            for (int r = 0; r < R; ++r) {
+                // Two statements: the compiler may fuse a multiply-add within one, and might do so for
+                // one weight type and not the other, which would break fp16 = rounded float32.
+                const float p = x[r * in + k] * wk;
+                sum[r] += p;
+            }
+        }
+        for (int r = 0; r < R; ++r) y[r * ldy + j] = sum[r];
+    }
+}
+
+// direct_rows over every weight row, split into chunks of rows run side by side (macOS: libdispatch's
+// threads, which stay alive between calls, so a call costs microseconds, not a thread start each).
+template <typename WT>
+void linear_direct(const float* x, int64_t n_rows, const WT* W, int64_t in, int64_t out, float* y) {
+    auto rows = [&](int64_t j0, int64_t j1) {
+        switch (n_rows) {
+            case 1: return direct_rows<1>(x, W, in, j0, j1, y, out);
+            case 2: return direct_rows<2>(x, W, in, j0, j1, y, out);
+            case 3: return direct_rows<3>(x, W, in, j0, j1, y, out);
+            default: return direct_rows<4>(x, W, in, j0, j1, y, out);
+        }
+    };
+    // At least 64K weights per chunk; with several threads allowed, 4 chunks per thread, so that faster
+    // cores take more of them instead of waiting for the slower ones. One thread allowed: no others.
+    const int64_t min_rows = std::max<int64_t>(1, (int64_t(1) << 16) / std::max<int64_t>(in, 1));
+    const int64_t threads = num_threads();
+    const int64_t chunks = threads <= 1 ? 1 : std::max<int64_t>(1, std::min<int64_t>(4 * threads, out / min_rows));
+#if defined(__APPLE__)
+    if (chunks > 1) {
+        struct Job {
+            decltype(rows)* fn;
+            int64_t out, chunks;
+        } job{&rows, out, chunks};
+        dispatch_apply_f(static_cast<size_t>(chunks), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job,
+                         [](void* p, size_t c) {
+                             const Job& jb = *static_cast<const Job*>(p);
+                             const int64_t i = static_cast<int64_t>(c);
+                             (*jb.fn)(jb.out * i / jb.chunks, jb.out * (i + 1) / jb.chunks);
+                         });
+        return;
+    }
+#endif
+    rows(0, out);
 }
 
 }  // namespace
@@ -169,7 +264,10 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
     Tensor y(std::move(s));
     const int64_t n_rows = in ? x.numel() / in : 0;
     if (n_rows && out) {
-        if (!W.is_fp16()) {
+        if (n_rows <= kDirectRows) {
+            if (W.is_fp16()) linear_direct(x.ptr(), n_rows, W.f16(), in, out, y.ptr());
+            else linear_direct(x.ptr(), n_rows, W.f32_data(), in, out, y.ptr());
+        } else if (!W.is_fp16()) {
             detail::gemm(/*trans_b=*/true, n_rows, out, in, x.ptr(), in, W.f32_data(), in, y.ptr(), out);
         } else {
             const int64_t block = std::min(out, std::max<int64_t>(1, kBlockFloats / in));

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "tfi/analysis.h"
+#include "tfi/generate.h"
 #include "tfi/json.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
@@ -49,6 +50,14 @@ Commands
   circuits   weight-only: composition scores, OV copying       [--top 10] [--tokens-sampled 1024]
   attn       where each head attends, query by query           --tokens --layer L [--head H] [--top K] [--pos P]
   tokenize   token ids for text, without loading the weights   --text T | --text-file F (one line each)
+  generate   continue the input, one token at a time           --tokens [--max-new 64] [--temperature 0]
+                                                               [--top-k 0] [--top-p 1] [--seed 0]
+                                                               [--stop ID,...] [--no-eos]
+             greedy by default; --temperature T samples instead, from the --top-k K most likely tokens
+             and the fewest whose probabilities reach --top-p P. Stops at the model's end-of-text tokens
+             (converted models) unless --no-eos, at --stop tokens, or after --max-new tokens. Prints the
+             text as it is generated (token ids for models without a vocabulary). A KV cache keeps each
+             step to the new token.
 
 Token input
   --tokens 5,17,3,...          explicit token ids
@@ -616,6 +625,49 @@ int cmd_circuits(const Args& a, const Model& m) {
     return 0;
 }
 
+int cmd_generate(const Args& a, const Model& m) {
+    const Tokens prompt = input_tokens(a, m);
+    GenerateOptions o;
+    o.max_new_tokens = a.get_int("max-new", 64);
+    o.temperature = a.has("temperature") ? std::stod(a.get("temperature")) : 0.0;
+    o.top_k = a.get_int("top-k", 0);
+    o.top_p = a.has("top-p") ? std::stod(a.get("top-p")) : 1.0;
+    o.seed = static_cast<uint64_t>(a.get_int("seed", 0));
+    if (a.has("stop")) o.stop_tokens = parse_tokens(a.get("stop"));
+    o.stop_at_eos = !a.has("no-eos");
+    for (int64_t id : o.stop_tokens)
+        if (id < 0 || id >= m.cfg().vocab_size) throw std::invalid_argument("--stop token " + std::to_string(id) + " is outside the vocabulary");
+    const bool text = m.has_tokenizer() || !m.vocab().empty();
+    Tokens all = prompt;
+    size_t printed = 0;
+    if (text) {  // the input, then each new piece of the decoded text (special tokens left out)
+        const std::string shown = m.decode(prompt, true);
+        std::fwrite(shown.data(), 1, shown.size(), stdout);
+        printed = shown.size();
+    } else {
+        for (size_t i = 0; i < prompt.size(); ++i) std::printf("%s%lld", i ? "," : "", static_cast<long long>(prompt[i]));
+        std::printf(" |");
+    }
+    std::fflush(stdout);
+    o.on_token = [&](int64_t t) {
+        all.push_back(t);
+        if (text) {
+            const std::string s = m.decode(all, true);
+            if (s.size() > printed) std::fwrite(s.data() + printed, 1, s.size() - printed, stdout);
+            printed = std::max(printed, s.size());
+        } else {
+            std::printf(" %lld", static_cast<long long>(t));
+        }
+        std::fflush(stdout);
+        return true;
+    };
+    const Tokens out = generate(m, prompt, o);
+    std::printf("\n");
+    std::fflush(stdout);
+    std::fprintf(stderr, "%zu new token%s\n", out.size(), out.size() == 1 ? "" : "s");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -652,6 +704,7 @@ int main(int argc, char** argv) {
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},
             {"patch", cmd_patch}, {"ablate", cmd_ablate}, {"circuits", cmd_circuits}, {"attn", cmd_attn},
+            {"generate", cmd_generate},
         };
         auto it = commands.find(a.command);
         if (it == commands.end()) throw std::invalid_argument("unknown command '" + a.command + "'");

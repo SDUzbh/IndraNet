@@ -5,7 +5,9 @@
 IndraNet takes trained decoder-only transformers apart. Its core is **tfi**, a dependency-free
 C++17 engine that re-implements the forward and backward pass with named hook points and runs the
 standard reverse-engineering methods on top: the logit lens, direct logit attribution, head scores,
-activation patching (exact, attribution and mixed), ablation, and weight-only circuit analysis.
+activation patching (exact, attribution and mixed), ablation, and weight-only circuit analysis. It
+also generates text with a KV cache, with hooks applied at every step, to see what an intervention
+does to what the model writes.
 
 The Python package [`indranet`](python/) supplies the models to study. It builds and trains them in
 PyTorch from a single config, with the same hook names as the engine, and exports them in one file.
@@ -102,6 +104,7 @@ python -m indranet_hf path/to/checkpoint model.safetensors    # or a Hub repo id
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
 | `tokenize` | – | Token ids for text, as the model's tokenizer gives them (reads no weights) |
+| `generate` | – | Continues the input, printing the text as it comes: greedy, or sampled with `--temperature`, `--top-k`, `--top-p` and `--seed` |
 
 Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice. Or
 pass `--text "..."` (`--clean-text` / `--corrupt-text` for `patch`):
@@ -125,6 +128,19 @@ The engine's tokenizer reads `tokenizer.json`, and implements what these models 
 Other parts (Unigram or WordPiece models, NFKC) are refused by name. The converter then stores only
 the vocabulary, and `--text` falls back to longest match. Its Unicode data is version 13.0, so text
 with characters assigned later may split differently from Hugging Face.
+
+Decoding (`generate`'s output, `Model::decode`) is worked out from the same pipeline: byte-level
+tokens become their bytes, SentencePiece-style tokens get their spaces and `<0xNN>` bytes back, and
+added tokens are their text. This gives what Hugging Face's decoders give for these models.
+
+```
+build/indra generate llama.safetensors --text "The capital of France is" --max-new 30
+build/indra generate llama.safetensors --text "Once upon a time" --temperature 0.8 --top-p 0.9 --seed 1
+```
+
+`generate` runs the prompt in one pass and then each new token alone, reading the earlier
+positions' keys and values from a KV cache. It stops at the model's end-of-text tokens (stored for
+converted models; `--no-eos` ignores them), at `--stop` ids, or after `--max-new` tokens.
 
 ## Walkthrough: the 2-layer induction circuit
 
@@ -281,6 +297,7 @@ produces activation gradients only, no weight gradients. It costs about one forw
 
 ```cpp
 #include "tfi/analysis.h"
+#include "tfi/generate.h"
 using namespace tfi;
 
 Model m = Model::load("model.safetensors");                 // or (..., WeightFormat::fp16): half the memory
@@ -302,6 +319,16 @@ ActivationCache grads;                                       // d metric / d act
 metric_gradients(m, t, /*pos=*/4, /*target=*/3, /*other=*/9, grads);
 PatchResult atp = attribution_patch_heads(m, clean, corrupt, /*pos=*/4, /*target=*/3, /*other=*/9, /*steps=*/8);
 PatchResult mix = mixed_patch_heads(m, clean, corrupt, 4, 3, 9, /*verify=*/10, /*steps=*/8);  // mix.exact flags measured entries
+
+KVCache kv;                                                  // keys and values of the positions so far
+Tensor first = m.forward_cached(t, kv);                      // = forward(t); kv now holds 5 positions
+Tensor next = m.forward_cached({8}, kv);                     // only the new row: = forward(t + {8})'s last
+
+GenerateOptions opt;                                         // tfi/generate.h
+opt.max_new_tokens = 20;
+opt.temperature = 0.8;                                       // 0 (default): greedy
+Tokens more = generate(m, t, opt, &hooks);                   // hooks apply at every step
+std::string text = m.decode(more);
 
 const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
 Tensor q_rows = Wq.rows(0, 16);                              // read as float32 either way (also cols, to_tensor)
@@ -336,10 +363,17 @@ mary, john = m.tokenize(" Mary", False)[0], m.tokenize(" John", False)[0]
 dla = tfi.direct_logit_attribution(m, t, pos=-1, target=mary, other=john)     # labels, values, sum, actual
 lens = tfi.lens_grid(m, t)                 # the logit lens at every position, one forward pass
 r = tfi.patch(m, clean, corrupt, "resid_pre", pos=-1, target=mary, other=john, method="mixed")
+
+new = tfi.generate(m, "The capital of France is", max_new_tokens=20)          # token ids, KV cache
+m.decode(new)
+tfi.generate(m, t, temperature=0.8, top_p=0.9, seed=1, hooks={"blocks.15.attn.hook_z": knock_out})
+cache = tfi.KVCache()                      # step by step: forward_cached runs only the new tokens
+logits = m.forward_cached(t, cache)
+logits = m.forward_cached([mary], cache)   # (1, vocab); hooks see the new rows
 ```
 
 The functions mirror the C++ API (`logit_lens`, `head_scores`, `patch`, `metric_gradients`,
-`head_ablation`, `composition_scores`, `ov_copying_scores`, `head_weights`, `set_device`, ...).
+`head_ablation`, `composition_scores`, `ov_copying_scores`, `head_weights`, `generate`, `set_device`, ...).
 Activations come back as numpy arrays that take over the engine's buffers, with no copy, and
 analysis results as dicts. Every engine call releases the GIL, so threads can run it side by side.
 

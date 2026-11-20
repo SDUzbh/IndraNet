@@ -230,15 +230,24 @@ void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse, const std::vecto
     const int64_t rot = table.rot, half = rot / 2;
     if (rot > D) throw std::runtime_error("RoPE rotates more values than a head has");
     const std::vector<float>& inv_freq = table.inv_freq;
-    // cos / sin per position, computed once even when many rows share a position.
-    int64_t n_pos = T;
-    if (positions)
-        for (int64_t p : *positions) n_pos = std::max(n_pos, p + 1);
-    check_rope_length(c, table, n_pos);
+    if (T == 0) return;
+    // cos / sin per position, computed once even when many rows share a position, and only for the
+    // positions the rows have (lo..hi): a generated token's step computes its own position's, not
+    // those of every position before it.
+    int64_t lo = 0, hi = T - 1;
+    if (positions) {
+        lo = hi = (*positions)[0];
+        for (int64_t p : *positions) {
+            lo = std::min(lo, p);
+            hi = std::max(hi, p);
+        }
+    }
+    check_rope_length(c, table, hi + 1);
+    const int64_t n_pos = hi - lo + 1;
     std::vector<float> cs(n_pos * half), sn(n_pos * half);
     for (int64_t t = 0; t < n_pos; ++t)
         for (int64_t i = 0; i < half; ++i) {
-            const float a = static_cast<float>(t) * inv_freq[i];
+            const float a = static_cast<float>(lo + t) * inv_freq[i];
             float co = std::cos(a), si = std::sin(a);
             if (table.factor != 1.f) {
                 co *= table.factor;
@@ -248,7 +257,7 @@ void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse, const std::vecto
             sn[t * half + i] = inverse ? -si : si;
         }
     for (int64_t t = 0; t < T; ++t) {
-        const int64_t pt = positions ? (*positions)[t] : t;
+        const int64_t pt = (positions ? (*positions)[t] : t) - lo;
         for (int64_t i = 0; i < half; ++i) {
             const float c_ = cs[pt * half + i], s_ = sn[pt * half + i];
             for (int64_t h = 0; h < H; ++h) {
@@ -459,6 +468,19 @@ Model Model::load(const std::string& path, WeightFormat format) {
         m.set_vocab(std::move(vocab));
     }
     if (auto tk = st.metadata.find("tokenizer"); tk != st.metadata.end()) m.set_tokenizer_json(std::move(tk->second));
+    // A converted model's end-of-text tokens: eos_token_id of its Hugging Face config, an id or a list.
+    if (auto hf = st.metadata.find("hf_config"); hf != st.metadata.end()) {
+        const json::Value cfg = json::parse(hf->second);
+        std::vector<int64_t> eos;
+        if (const json::Value* e = cfg.find("eos_token_id")) {
+            if (e->is_array())
+                for (const json::Value& x : e->array) eos.push_back(x.as_int());
+            else if (!e->is_null())
+                eos.push_back(e->as_int());
+        }
+        eos.erase(std::remove_if(eos.begin(), eos.end(), [&](int64_t id) { return id < 0 || id >= m.cfg().vocab_size; }), eos.end());
+        m.set_eos_tokens(std::move(eos));
+    }
     return m;
 }
 
@@ -498,6 +520,24 @@ void Model::set_vocab(std::vector<std::string> vocab) {
 std::string Model::token_str(int64_t id) const {
     if (id >= 0 && id < static_cast<int64_t>(vocab_.size())) return vocab_[id];
     return std::to_string(id);
+}
+
+std::string Model::decode(const Tokens& ids, bool skip_special_tokens) const {
+    if (tokenizer_) return tokenizer().decode(ids, skip_special_tokens);
+    if (vocab_.empty()) throw std::runtime_error("this model file has no vocabulary or tokenizer to decode tokens with");
+    std::string out;
+    for (int64_t id : ids) {
+        if (id < 0 || id >= static_cast<int64_t>(vocab_.size()))
+            throw std::out_of_range("token " + std::to_string(id) + " is outside the vocabulary");
+        out += vocab_[id];
+    }
+    return out;
+}
+
+void Model::set_eos_tokens(std::vector<int64_t> ids) {
+    for (int64_t id : ids)
+        if (id < 0 || id >= cfg_.vocab_size) throw std::out_of_range("eos token " + std::to_string(id) + " is outside the vocabulary");
+    eos_ = std::move(ids);
 }
 
 Tokens Model::tokenize(const std::string& text, bool add_special_tokens) const {
@@ -610,13 +650,13 @@ Tensor Model::norm(const std::string& prefix, const ModelConfig& c, const Tensor
     return y;
 }
 
-Tensor Model::positional_embedding(int64_t T) const {
+Tensor Model::positional_embedding(int64_t start, int64_t T) const {
     const int64_t d = cfg_.d_model;
     if (cfg_.positional == "learned") {
-        if (T > cfg_.max_seq_len)
-            throw std::runtime_error("sequence length " + std::to_string(T) + " exceeds max_seq_len " +
+        if (start + T > cfg_.max_seq_len)
+            throw std::runtime_error("sequence length " + std::to_string(start + T) + " exceeds max_seq_len " +
                                      std::to_string(cfg_.max_seq_len));
-        return weight("pos_embed.weight").rows(0, T);
+        return weight("pos_embed.weight").rows(start, start + T);
     }
     // sinusoidal: [sin(pos * f_i), cos(pos * f_i)], f_i = exp(-ln(10000) * i / half), zero-padded if d is odd
     const int64_t half = d / 2;
@@ -624,7 +664,7 @@ Tensor Model::positional_embedding(int64_t T) const {
     for (int64_t i = 0; i < half; ++i) {
         const float f = std::exp(static_cast<float>(-std::log(10000.0)) * static_cast<float>(i) / static_cast<float>(half));
         for (int64_t t = 0; t < T; ++t) {
-            const float a = static_cast<float>(t) * f;
+            const float a = static_cast<float>(start + t) * f;
             pe.data[t * d + i] = std::sin(a);
             pe.data[t * d + half + i] = std::cos(a);
         }
@@ -773,6 +813,23 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
             const float* vh = v.ptr() + (h / rep) * T * D;
             ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z + h * D, H * D);
         }
+    } else if (batch->cached && hooks && hooks->matches(p + "hook_pattern")) {
+        // One segment continuing a cached sequence: its queries' pattern over every key, for the hook.
+        const int64_t first = batch->start.at(0), nk = first + T;
+        const Tensor* pk = first ? batch->prefix_k.at(layer) : nullptr;
+        const Tensor* pv = first ? batch->prefix_v.at(layer) : nullptr;
+        const int64_t Tp = pk ? pk->shape[1] : 0;
+        Tensor pattern({H, T, nk});
+        for (int64_t h = 0; h < H; ++h) {
+            ha.slope = slopes.empty() ? 0.f : slopes[h];
+            ha.pattern(q.ptr() + h * T * D, T, first, pk ? pk->ptr() + (h / rep) * Tp * D : nullptr,
+                       k.ptr() + (h / rep) * T * D, pattern.ptr() + h * T * nk, nk);
+        }
+        hook(hooks, p + "hook_pattern", pattern);
+        if (pattern.numel() != H * T * nk) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
+        for (int64_t h = 0; h < H; ++h)
+            ha.apply(pattern.ptr() + h * T * nk, T, first, nk, pv ? pv->ptr() + (h / rep) * Tp * D : nullptr,
+                     v.ptr() + (h / rep) * T * D, z + h * D, H * D);
     } else {  // stacked segments: no hook_pattern (each segment has its own pattern)
         std::vector<float> probs;
         for (size_t s = 0; s < batch->start.size(); ++s) {
@@ -887,9 +944,10 @@ Tensor Model::forward(const Tokens& tokens, const Hooks* hooks) const {
     return forward_from(0, embed(tokens, hooks), hooks);
 }
 
-Tensor Model::embed(const Tokens& tokens, const Hooks* hooks) const {
+Tensor Model::embed(const Tokens& tokens, const Hooks* hooks, int64_t start) const {
     const int64_t T = static_cast<int64_t>(tokens.size()), d = cfg_.d_model;
     if (T == 0) throw std::invalid_argument("forward needs at least one token");
+    if (start < 0) throw std::invalid_argument("embed: negative start position");
     const Weight& E = weight("embed.weight");
     Tensor x({T, d});
     for (int64_t t = 0; t < T; ++t) {
@@ -900,7 +958,7 @@ Tensor Model::embed(const Tokens& tokens, const Hooks* hooks) const {
     if (cfg_.embed_scale) x = scale(x, static_cast<float>(std::sqrt(double(d))));
     hook(hooks, "hook_embed", x);
     if (cfg_.embedding_positional()) {
-        Tensor pe = positional_embedding(T);
+        Tensor pe = positional_embedding(start, T);
         hook(hooks, "hook_pos_embed", pe);
         add_(x, pe);
     }
@@ -914,6 +972,17 @@ detail::Gpu* single_pass_gpu(const Model& m, int64_t layer, int64_t T);
 #endif
 
 Tensor Model::forward_from(int64_t layer, Tensor x, const Hooks* hooks) const {
+    return run_from(layer, std::move(x), hooks, false);
+}
+
+namespace {
+Tensor last_row(const Tensor& x) {
+    const int64_t d = x.shape[1];
+    return Tensor({1, d}, std::vector<float>(x.ptr() + (x.shape[0] - 1) * d, x.ptr() + x.shape[0] * d));
+}
+}  // namespace
+
+Tensor Model::run_from(int64_t layer, Tensor x, const Hooks* hooks, bool last_only) const {
     if (layer < 0 || layer > cfg_.n_layers) throw std::out_of_range("forward_from: layer out of range");
     if (x.dim() != 2 || x.shape[1] != cfg_.d_model)
         throw std::invalid_argument("forward_from: residual must be (T, d_model), got " + shape_str(x.shape));
@@ -931,7 +1000,121 @@ Tensor Model::forward_from(int64_t layer, Tensor x, const Hooks* hooks) const {
         for (int64_t i = layer; i < cfg_.n_layers; ++i) x = block(i, std::move(x), hooks);
     Tensor f = final_norm(x);
     hook(hooks, "hook_final", f);
+    if (last_only) f = last_row(f);
     return logits_from_final(f, rb.gpu ? &rb : nullptr);
+}
+
+void KVCache::clear() {
+    k_.clear();
+    v_.clear();
+    len_ = 0;
+}
+
+void KVCache::truncate(int64_t n) {
+    if (n < 0 || n > len_) throw std::out_of_range("KVCache::truncate: " + std::to_string(n) + " is not in 0.." + std::to_string(len_));
+    if (n == 0) clear();
+    else len_ = n;  // later positions are overwritten as the sequence continues
+}
+
+namespace {
+// Positions [0, n) of a cache tensor (H, capacity, D).
+Tensor cache_prefix(const std::vector<Tensor>& t, int64_t layer, int64_t n) {
+    if (layer < 0 || layer >= static_cast<int64_t>(t.size()))
+        throw std::out_of_range("KVCache: no layer " + std::to_string(layer) + (t.empty() ? " (the cache is empty)" : ""));
+    const Tensor& c = t[layer];
+    const int64_t H = c.shape[0], cap = c.shape[1], D = c.shape[2];
+    Tensor out({H, n, D});
+    for (int64_t h = 0; h < H; ++h) std::copy(c.ptr() + h * cap * D, c.ptr() + (h * cap + n) * D, out.ptr() + h * n * D);
+    return out;
+}
+}  // namespace
+
+Tensor KVCache::keys(int64_t layer) const { return cache_prefix(k_, layer, len_); }
+Tensor KVCache::values(int64_t layer) const { return cache_prefix(v_, layer, len_); }
+
+void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n) {
+    if (k_.empty()) {
+        k_.resize(k.size());
+        v_.resize(v.size());
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<Tensor>& dst = pass ? v_ : k_;
+        const std::vector<Tensor>& src = pass ? v : k;
+        for (size_t l = 0; l < src.size(); ++l) {
+            const int64_t H = src[l].shape[0], D = src[l].shape[2];
+            const int64_t cap = dst[l].empty() ? 0 : dst[l].shape[1];
+            if (len_ + n > cap) {  // grow geometrically, so that appending one position at a time stays linear
+                const int64_t grown = std::max({len_ + n, 2 * cap, int64_t(16)});
+                Tensor t({H, grown, D});
+                for (int64_t h = 0; h < H; ++h)
+                    std::copy(dst[l].ptr() + h * cap * D, dst[l].ptr() + (h * cap + len_) * D, t.ptr() + h * grown * D);
+                dst[l] = std::move(t);
+            }
+            const int64_t c = dst[l].shape[1];
+            for (int64_t h = 0; h < H; ++h)
+                std::copy(src[l].ptr() + h * n * D, src[l].ptr() + (h + 1) * n * D, dst[l].ptr() + (h * c + len_) * D);
+        }
+    }
+    len_ += n;
+}
+
+Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks, bool last_only) const {
+    const int64_t L = cfg_.n_layers, T = static_cast<int64_t>(tokens.size()), start = cache.len_;
+    if (T == 0) throw std::invalid_argument("forward_cached needs at least one token");
+    if (start) {  // the cache must be this model's: a tensor per layer, each with the layer's heads
+        bool ok = static_cast<int64_t>(cache.k_.size()) == L;
+        for (int64_t l = 0; ok && l < L; ++l)
+            ok = cache.k_[l].dim() == 3 && cache.k_[l].shape[0] == layer_cfgs_[l].kv_heads() &&
+                 cache.k_[l].shape[2] == layer_cfgs_[l].head_dim();
+        if (!ok) throw std::invalid_argument("forward_cached: the cache holds another model's keys and values");
+    }
+    // The new positions' keys and values, as the pass leaves them after any hooks, appended at the end.
+    std::vector<Tensor> new_k(L), new_v(L);
+    std::map<std::string, Tensor*> slots;
+    for (int64_t l = 0; l < L; ++l) {
+        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
+        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
+    }
+    Hooks h;
+    if (hooks) h.extend(*hooks);
+    h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
+                  [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
+
+    Tensor logits;
+    if (start == 0) {
+        logits = run_from(0, embed(tokens, &h), &h, last_only);
+    } else {
+        Tensor x = embed(tokens, &h, start);
+        detail::RowBatch rb;
+        rb.add(start, T);
+        rb.cached = true;
+        for (int64_t l = 0; l < L; ++l) {
+            rb.prefix_k.push_back(&cache.k_[l]);
+            rb.prefix_v.push_back(&cache.v_[l]);
+        }
+#ifdef TFI_USE_ACCELERATE
+        // The GPU for chunks of tokens big enough (every chunk in GPU-only mode), unless a hook reads the
+        // pattern, which only the CPU's cached attention hands over.
+        bool pattern_hook = false;
+        for (int64_t l = 0; l < L && hooks; ++l) pattern_hook = pattern_hook || hooks->matches(layer_prefix(l) + "attn.hook_pattern");
+        if (use_gpu() && !pattern_hook && T >= detail::gpu_min_rows()) {
+            rb.gpu = gpu();
+            rb.fp16 = gpu_fp16();
+        }
+#endif
+        x = run_rows(0, std::move(x), rb, &h);
+        Tensor f = final_norm(x);
+        hook(&h, "hook_final", f);
+        if (last_only) f = last_row(f);
+        logits = logits_from_final(f, rb.gpu ? &rb : nullptr);
+    }
+    for (int64_t l = 0; l < L; ++l) {
+        const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
+        if (new_k[l].shape != want || new_v[l].shape != want)
+            throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
+    }
+    cache.append(new_k, new_v, T);
+    return logits;
 }
 
 namespace {

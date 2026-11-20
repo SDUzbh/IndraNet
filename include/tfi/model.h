@@ -69,6 +69,29 @@ class Hooks {
 // The longest vocabulary entry at each point of text (indranet's character vocabularies).
 std::vector<int64_t> tokenize_longest_match(const std::vector<std::string>& vocab, const std::string& text);
 
+class Model;
+
+// The keys and values every layer computed for the positions of a sequence run so far (after qk_norm
+// and RoPE, as hook_k and hook_v see them), so that Model::forward_cached runs only new tokens. A copy
+// continues on its own: several continuations of one prompt can share its prefill.
+class KVCache {
+  public:
+    int64_t size() const { return len_; }  // positions held
+    bool empty() const { return len_ == 0; }
+    void clear();
+    void truncate(int64_t n);  // keep positions 0..n-1 (0 <= n <= size()), e.g. to rerun from there
+    // Layer `layer`'s keys or values, (Hkv, size(), D): what hook_k / hook_v gave for these positions.
+    Tensor keys(int64_t layer) const;
+    Tensor values(int64_t layer) const;
+
+  private:
+    friend class Model;
+    // Per layer (Hkv, capacity, D), positions [0, len_) in use: room to grow without copying each step.
+    std::vector<Tensor> k_, v_;
+    int64_t len_ = 0;
+    void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);
+};
+
 class Model {
   public:
     // `format` fp16 keeps the 2-D weights in half precision (see WeightFormat).
@@ -82,6 +105,16 @@ class Model {
 
     // Logits (T, vocab) for one sequence. Hooks may read or overwrite activations.
     Tensor forward(const Tokens& tokens, const Hooks* hooks = nullptr) const;
+    // Logits for `tokens` continuing the sequence held in `cache`, at positions cache.size() onwards: the
+    // rows forward() on the whole sequence gives for them, (T, vocab), or with last_only just the last,
+    // (1, vocab). `cache` then holds these positions too; if anything throws it is left as it was.
+    // With an empty cache this is forward() (on the GPU when that is worth it). Later calls compute
+    // only the new rows, so hooks see those: activations are (T, ...), hook_pattern is
+    // (H, T, cache.size() + T), each new query over every key, and hook_pos_embed is the new positions'.
+    // Whatever hook_k and hook_v leave is what later tokens attend to. These calls run on the CPU
+    // except for chunks of tokens large enough for the GPU (any size in GPU-only mode), unless a
+    // hook reads hook_pattern.
+    Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
     // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping
@@ -150,6 +183,13 @@ class Model {
     // post-processor tokens, as Hugging Face adds by default), otherwise the longest vocabulary entry
     // at each point (indranet's character vocabularies; add_special_tokens has no effect).
     Tokens tokenize(const std::string& text, bool add_special_tokens = true) const;
+    // Text for token ids: the tokenizer's decoding when the model has one (see Tokenizer::decode), else
+    // the vocabulary's strings joined. Bytes, which may end inside a UTF-8 character. Throws without either.
+    std::string decode(const Tokens& ids, bool skip_special_tokens = false) const;
+    // Token ids that end a text (Hugging Face's eos_token_id, stored with converted models; empty for
+    // others). generate() stops at them by default.
+    const std::vector<int64_t>& eos_tokens() const { return eos_; }
+    void set_eos_tokens(std::vector<int64_t> ids);
 
     // Building blocks reused by the analysis tools.
     Tensor norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const;  // over the last dim
@@ -158,8 +198,8 @@ class Model {
     // The same, with the unembedding on the GPU when `batch` allows it (as in forward_rows).
     Tensor logits_from_final(const Tensor& normed, const detail::RowBatch* batch) const;
     // The input to block 0, (T, d_model): token (+ positional) embeddings, as hook_resid_pre of
-    // block 0 sees it. Calls hook_embed and hook_pos_embed.
-    Tensor embed(const Tokens& tokens, const Hooks* hooks = nullptr) const;
+    // block 0 sees it, for tokens at positions start, start + 1, ... Calls hook_embed and hook_pos_embed.
+    Tensor embed(const Tokens& tokens, const Hooks* hooks = nullptr, int64_t start = 0) const;
 
   private:
     Model(ModelConfig cfg, std::map<std::string, Weight> weights, WeightFormat format);
@@ -170,6 +210,7 @@ class Model {
     WeightFormat format_ = WeightFormat::fp32;
     std::map<std::string, Weight> w_;  // declared before gpu_, which may use their memory in place
     std::vector<std::string> vocab_;
+    std::vector<int64_t> eos_;
     std::shared_ptr<detail::TokenizerSlot> tokenizer_;
     mutable detail::GpuSlot gpu_;
 
@@ -187,7 +228,9 @@ class Model {
                     bool last_rows = false) const;
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
     Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
-    Tensor positional_embedding(int64_t T) const;
+    Tensor positional_embedding(int64_t start, int64_t T) const;  // positions start..start+T-1
+    // forward_from, with only the last row unembedded when last_only (hook_final still sees every row).
+    Tensor run_from(int64_t layer, Tensor resid, const Hooks* hooks, bool last_only) const;
 };
 
 }  // namespace tfi

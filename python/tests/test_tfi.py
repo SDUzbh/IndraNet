@@ -230,3 +230,124 @@ def test_releases_the_gil(tfi, tmp_path):
         t.join()
     for o in out:
         np.testing.assert_allclose(o, want, atol=0)
+
+
+@pytest.mark.parametrize("kw", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
+                                dict(n_kv_heads=2, qk_norm=True, positional="alibi", sliding_window=4,
+                                     layer_overrides={1: {"n_heads": 2}})],
+                         ids=["llama", "gpt2", "mixed"])
+def test_generate_matches_pytorch(tfi, tmp_path, kw):
+    """Greedy generation with the KV cache = PyTorch's argmax over a full forward pass at every step, and
+    indranet's own generate (its KV cache)."""
+    model, path = exported(tmp_path, **kw)
+    m = tfi.Model.load(str(path))
+    got = tfi.generate(m, TOKENS, max_new_tokens=12)
+    seq = list(TOKENS)
+    with torch.no_grad():
+        for _ in range(12):
+            seq.append(int(model(torch.tensor([seq])).logits[0, -1].argmax()))
+        ref = model.generate(torch.tensor([TOKENS]), 12, temperature=0)
+    assert got == seq[len(TOKENS):]
+    assert got == ref[0, len(TOKENS):].tolist()
+
+
+def test_kv_cache(tfi, tmp_path):
+    _, path = exported(tmp_path, n_kv_heads=2)
+    m = tfi.Model.load(str(path))
+    seq = TOKENS + [3, 8, 1]
+    want, acts = m.run_with_cache(seq)
+    cache = tfi.KVCache()
+    parts = [m.forward_cached(seq[:5], cache)] + [m.forward_cached([t], cache) for t in seq[5:]]
+    np.testing.assert_allclose(np.concatenate(parts), want, rtol=1e-4, atol=1e-5)
+    assert len(cache) == cache.size == len(seq)
+    np.testing.assert_allclose(cache.keys(1), acts["blocks.1.attn.hook_k"], rtol=1e-4, atol=1e-5)
+    assert cache.values(0).shape == (2, len(seq), 8)
+    # A copy continues on its own; truncate rewinds.
+    branch = cache.copy()
+    branch.truncate(5)
+    np.testing.assert_allclose(m.forward_cached(seq[5:], branch, last_only=True), want[-1:], rtol=1e-4, atol=1e-5)
+    assert len(cache) == len(seq) and len(branch) == len(seq)
+    # Hooks see the new rows; the pattern covers every key.
+    seen = {}
+
+    def keep(a, name):
+        seen[name] = a.copy()
+
+    c = tfi.KVCache()
+    m.forward_cached(seq[:9], c)
+    m.forward_cached(seq[9:], c, hooks={"blocks.0.attn.hook_pattern": keep, "blocks.1.hook_resid_post": keep})
+    np.testing.assert_allclose(seen["blocks.0.attn.hook_pattern"], acts["blocks.0.attn.hook_pattern"][:, 9:, :],
+                               rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(seen["blocks.1.hook_resid_post"], acts["blocks.1.hook_resid_post"][9:], rtol=1e-4, atol=1e-5)
+    with pytest.raises(ValueError):
+        m.forward_cached([], c)
+
+
+def test_generate_options(tfi, tmp_path):
+    vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
+    _, path = exported(tmp_path, vocab=vocab)
+    m = tfi.Model.load(str(path))
+    assert m.eos_tokens == []
+    greedy = tfi.generate(m, TOKENS, max_new_tokens=10)
+    assert len(greedy) == 10
+    assert tfi.generate(m, "abc", max_new_tokens=3) == tfi.generate(m, [0, 1, 2], max_new_tokens=3)
+    assert m.decode([0, 1, 2]) == "abc"
+    # Stops: a stop token (returned), the model's eos tokens, on_token returning False.
+    assert tfi.generate(m, TOKENS, max_new_tokens=10, stop_tokens=[greedy[3]])[-1] == greedy[3]
+    m.eos_tokens = [greedy[2]]
+    assert len(tfi.generate(m, TOKENS, max_new_tokens=10)) <= 3
+    assert tfi.generate(m, TOKENS, max_new_tokens=10, stop_at_eos=False) == greedy
+    m.eos_tokens = []
+    seen = []
+    assert tfi.generate(m, TOKENS, max_new_tokens=10, on_token=lambda t: seen.append(t) or len(seen) < 4) == greedy[:4]
+    assert seen == greedy[:4]
+    # Sampling: reproducible from its seed; top_k=1 is greedy.
+    a = tfi.generate(m, TOKENS, max_new_tokens=10, temperature=1.0, seed=7)
+    assert a == tfi.generate(m, TOKENS, max_new_tokens=10, temperature=1.0, seed=7)
+    assert tfi.generate(m, TOKENS, max_new_tokens=10, temperature=1.0, top_k=1) == greedy
+    # Hooks apply at every step.
+    def zero(a, name):
+        a[:] = 0
+    hooked = tfi.generate(m, TOKENS, max_new_tokens=6, hooks={"blocks.1.hook_attn_out": zero})
+    seq = list(TOKENS)
+    for _ in range(6):
+        seq.append(int(m.forward(seq, hooks={"blocks.1.hook_attn_out": zero})[-1].argmax()))
+    assert hooked == seq[len(TOKENS):]
+    with pytest.raises(ValueError, match="temperature"):
+        tfi.generate(m, TOKENS, temperature=-1.0)
+    with pytest.raises(ValueError, match="top_p"):
+        tfi.generate(m, TOKENS, top_p=0.0)
+
+    def boom(t):
+        raise RuntimeError("stop here")
+    with pytest.raises(RuntimeError, match="stop here"):
+        tfi.generate(m, TOKENS, on_token=boom)
+
+
+def _hf_decoder(style):
+    """The decoder models of each kind ship: byte-level, or Llama 2's SentencePiece decoder (without the
+    final Strip where the encoder prepends no ▁, as Gemma's). tokenizers' Metaspace decoder is left out:
+    it drops every ▁ of the first token, not just the one the encoder added."""
+    from tokenizers import decoders
+    if style in ("llama2_legacy", "llama2_metaspace", "metaspace_split", "gemma"):
+        steps = [decoders.Replace("▁", " "), decoders.ByteFallback(), decoders.Fuse()]
+        return decoders.Sequence(steps + ([] if style == "gemma" else [decoders.Strip(" ", 1, 0)]))
+    return decoders.ByteLevel()
+
+
+def test_tokenizer_decode_matches_tokenizers(tfi):
+    """Tokenizer.decode = tokenizers' decode with the decoder each kind of model ships, for every kind of
+    tokenizer the engine implements, special tokens kept and skipped."""
+    pytest.importorskip("tokenizers")
+    import json
+    from test_hf import TOKENIZER_STYLES, TOKENIZER_TEXTS, MULTILINE_TEXTS, _tokenizer
+    for style in TOKENIZER_STYLES:
+        hf, d = _tokenizer(style)
+        hf.decoder = _hf_decoder(style)
+        stored = {k: d.get(k) for k in ("normalizer", "pre_tokenizer", "model", "post_processor", "added_tokens")}
+        tok = tfi.Tokenizer.from_json(json.dumps(stored))
+        for text in TOKENIZER_TEXTS + MULTILINE_TEXTS:
+            for special in (True, False):
+                ids = hf.encode(text, add_special_tokens=special).ids
+                for skip in (False, True):
+                    assert tok.decode(ids, skip) == hf.decode(ids, skip_special_tokens=skip), (style, text, special, skip)

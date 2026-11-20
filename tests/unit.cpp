@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "tfi/analysis.h"
+#include "tfi/generate.h"
 #include "tfi/json.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
@@ -2755,6 +2756,303 @@ static void test_gpu_wide_heads() {
 //   grad      gradients against finite differences, attribution and mixed patching
 //   fp16      fp16 conversion and weights, and the analysis invariants with fp16 weights
 //   gpu       GPU work: chunking and thresholds everywhere; kernels, resident passes, attention on macOS
+// Linear layers on 1-4 rows multiply straight from the weights (src/weight.cpp): = a double-precision
+// reference, for float32 and fp16 weights and sizes with a tail past the 8-wide steps; fp16 weights =
+// float32 weights holding the same rounded values, bit for bit (on 1-4 rows); the same with one thread
+// or many.
+static void test_linear_few_rows() {
+    std::mt19937_64 rng(5);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    for (const auto& [in, out] : std::vector<std::pair<int64_t, int64_t>>{{16, 50}, {13, 7}, {2048, 300}, {5, 70000}}) {
+        Tensor W({out, in});
+        for (float& v : W.data) v = normal(rng);
+        Tensor bias({out});
+        for (float& v : bias.data) v = normal(rng);
+        const Weight w32(W), w16 = Weight::fp16(W);
+        const Weight rounded(w16.to_tensor());  // float32 weights holding fp16's values
+        const Weight b(bias);
+        for (int64_t rows = 1; rows <= 5; ++rows) {
+            Tensor x({rows, in});
+            for (float& v : x.data) v = normal(rng);
+            for (const Weight* wp : {&w32, &rounded}) {
+                const Tensor y = linear(x, *wp, &b);
+                const Tensor dense = wp->to_tensor();
+                float worst = 0;
+                for (int64_t r = 0; r < rows; ++r)
+                    for (int64_t j = 0; j < out; ++j) {
+                        double want = bias.data[j];
+                        for (int64_t k = 0; k < in; ++k) want += double(x.data[r * in + k]) * dense.data[j * in + k];
+                        worst = std::max(worst, float(std::fabs(y.data[r * out + j] - want) / (1.0 + std::fabs(want))));
+                    }
+                CHECK(worst < 1e-5f * std::sqrt(float(in)));
+            }
+            if (rows <= 4) CHECK(linear(x, w16, &b).data == linear(x, rounded, &b).data);  // 5: the library's blocks
+            set_num_threads(1);
+            const Tensor one = linear(x, w16, &b);
+            set_num_threads(0);
+            CHECK(one.data == linear(x, w16, &b).data);
+        }
+    }
+}
+
+// Rows of logits from several calls, stacked.
+static Tensor stack_rows(const std::vector<Tensor>& parts) {
+    std::vector<float> data;
+    int64_t n = 0, V = 0;
+    for (const Tensor& p : parts) {
+        data.insert(data.end(), p.data.begin(), p.data.end());
+        n += p.shape[0];
+        V = p.shape[1];
+    }
+    return Tensor({n, V}, std::move(data));
+}
+
+// Positions [first, first + n) of a whole pass's hook_pattern (H, T, T), over keys 0..first+n-1.
+static Tensor pattern_rows(const Tensor& P, int64_t first, int64_t n) {
+    const int64_t H = P.shape[0], T = P.shape[1], nk = first + n;
+    Tensor out({H, n, nk});
+    for (int64_t h = 0; h < H; ++h)
+        for (int64_t r = 0; r < n; ++r)
+            for (int64_t j = 0; j < nk; ++j) out.data[(h * n + r) * nk + j] = P.data[(h * T + first + r) * T + j];
+    return out;
+}
+
+// forward_cached, in chunks of every size, gives forward()'s rows; the cache holds hook_k / hook_v; a
+// copy or a truncated cache continues on its own; hooks see the new rows and their edits carry over.
+static void test_forward_cached(const Model& m) {
+    const int64_t T = 12, L = m.cfg().n_layers;
+    const Tokens t = seq(T, 61);
+    ActivationCache acts;
+    const Tensor full = m.run_with_cache(t, acts);
+    for (const std::vector<int64_t>& chunks : std::vector<std::vector<int64_t>>{
+             {12}, {5, 1, 1, 1, 1, 1, 1, 1}, {3, 4, 5}, {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}}) {
+        KVCache cache;
+        std::vector<Tensor> parts;
+        int64_t at = 0;
+        for (int64_t n : chunks) {
+            const Tokens part(t.begin() + at, t.begin() + at + n);
+            parts.push_back(m.forward_cached(part, cache));
+            at += n;
+            CHECK(cache.size() == at);
+        }
+        check_close(stack_rows(parts), full);
+        for (int64_t l = 0; l < L; ++l) {
+            check_close(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+            check_close(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+        }
+    }
+    KVCache cache;
+    check_close(m.forward_cached(Tokens(t.begin(), t.begin() + 7), cache, nullptr, true), rows(full, 6, 7));
+    // A copy continues on its own, with other tokens; the original is untouched.
+    KVCache branch = cache;
+    Tokens other(t.begin(), t.begin() + 7);
+    other.push_back((t[7] + 3) % m.cfg().vocab_size);
+    check_close(m.forward_cached({other[7]}, branch), rows(m.forward(other), 7, 8));
+    CHECK(branch.size() == 8 && cache.size() == 7);
+    check_close(m.forward_cached(Tokens(t.begin() + 7, t.end()), cache), rows(full, 7, T));
+    // Truncated back to 4 positions, then continued.
+    cache.truncate(4);
+    CHECK(cache.size() == 4);
+    check_close(m.forward_cached(Tokens(t.begin() + 4, t.end()), cache), rows(full, 4, T));
+    CHECK_THROWS(cache.truncate(13));
+    CHECK_THROWS(cache.truncate(-1));
+    CHECK_THROWS(m.forward_cached({}, cache));
+    cache.truncate(0);
+    CHECK(cache.empty());
+    CHECK_THROWS(cache.keys(0));
+
+    // Hooks on a cached step see its rows: the pattern of the new queries over every key.
+    {
+        KVCache c;
+        m.forward_cached(Tokens(t.begin(), t.begin() + 9), c);
+        ActivationCache seen;
+        Hooks capture;
+        capture.add_filter([](const std::string&) { return true; }, [&](const std::string& n, Tensor& a) { seen[n] = a; });
+        m.forward_cached(Tokens(t.begin() + 9, t.end()), c, &capture);
+        for (int64_t l = 0; l < L; ++l) {
+            const std::string p = "blocks." + std::to_string(l) + ".";
+            check_close(seen.at(p + "attn.hook_pattern"), pattern_rows(acts.at(p + "attn.hook_pattern"), 9, 3));
+            check_close(seen.at(p + "hook_resid_post"), rows(acts.at(p + "hook_resid_post"), 9, T));
+        }
+        check_close(seen.at("hook_final"), rows(acts.at("hook_final"), 9, T));
+        if (m.cfg().embedding_positional()) check_close(seen.at("hook_pos_embed"), rows(acts.at("hook_pos_embed"), 9, T));
+    }
+    // Edits at every step = the same edits on the whole pass: zeroing a head's z, scaling keys (what
+    // later tokens read from the cache) and editing the pattern.
+    {
+        Hooks edit;
+        edit.add("blocks.0.attn.hook_z", [](const std::string&, Tensor& z) {
+            const int64_t D = z.shape[2];
+            for (int64_t r = 0; r < z.shape[0]; ++r) std::fill(z.ptr() + r * z.shape[1] * D, z.ptr() + r * z.shape[1] * D + D, 0.f);
+        });
+        edit.add("blocks." + std::to_string(L - 1) + ".attn.hook_k", [](const std::string&, Tensor& k) {
+            for (float& x : k.data) x *= 1.5f;
+        });
+        edit.add("blocks.0.attn.hook_pattern", [](const std::string&, Tensor& P) {  // the first key's weight, doubled
+            const int64_t nk = P.shape[2];
+            for (int64_t r = 0; r < P.shape[0] * P.shape[1]; ++r) P.data[r * nk] *= 2.f;
+        });
+        const Tensor want = m.forward(t, &edit);
+        KVCache c;
+        std::vector<Tensor> parts{m.forward_cached(Tokens(t.begin(), t.begin() + 5), c, &edit)};
+        for (int64_t i = 5; i < T; ++i) parts.push_back(m.forward_cached({t[i]}, c, &edit));
+        check_close(stack_rows(parts), want);
+    }
+    // Another model's cache is refused; a failed call leaves the cache as it was.
+    {
+        KVCache c;
+        m.forward_cached(Tokens(t.begin(), t.begin() + 3), c);
+        const Model wider = random_model(tiny([](ModelConfig& cf) { cf.n_layers = 3; }), 1);
+        CHECK_THROWS(wider.forward_cached({1}, c));
+        Hooks bad;
+        bad.add("blocks.0.attn.hook_k", [](const std::string&, Tensor& k) { k = Tensor({1, 1, 1}); });
+        CHECK_THROWS(m.forward_cached({1, 2}, c, &bad));
+        CHECK(c.size() == 3);
+        check_close(m.forward_cached(Tokens(t.begin() + 3, t.end()), c), rows(full, 3, T));
+    }
+    if (m.cfg().positional == "learned") {  // positions past max_seq_len are refused, the cache unchanged
+        KVCache c;
+        m.forward_cached(seq(m.cfg().max_seq_len, 2), c);
+        CHECK_THROWS(m.forward_cached({1}, c));
+        CHECK(c.size() == m.cfg().max_seq_len);
+    }
+}
+
+// generate(): greedy = argmax of forward() step by step; stop tokens, max_new_tokens, on_token; hooks
+// apply at every step; sampling is reproducible from its seed and follows top_k / top_p.
+static void test_generate(const Model& m) {
+    const Tokens prompt = seq(5, 71);
+    GenerateOptions o;
+    o.max_new_tokens = 8;
+    const Tokens got = generate(m, prompt, o);
+    CHECK(got.size() == 8);
+    Tokens seqn = prompt;
+    for (int64_t step = 0; step < 8; ++step) {
+        const Tensor lg = m.forward(seqn);
+        const int64_t V = lg.shape[1];
+        const float* last = lg.ptr() + (lg.shape[0] - 1) * V;
+        // The cached pass's argmax may differ from the full pass's only where two logits nearly tie.
+        const int64_t want = std::max_element(last, last + V) - last;
+        CHECK(got[step] == want || std::fabs(last[got[step]] - last[want]) < 1e-4f);
+        seqn.push_back(got[step]);
+    }
+    // Stops at a stop token (returned) and when on_token says so.
+    o.stop_tokens = {got[2]};
+    const Tokens stopped = generate(m, prompt, o);
+    CHECK(!stopped.empty() && stopped.back() == got[2] && stopped.size() <= 3);
+    o.stop_tokens.clear();
+    int calls = 0;
+    o.on_token = [&](int64_t) { return ++calls < 4; };
+    CHECK(generate(m, prompt, o).size() == 4 && calls == 4);
+    o.on_token = nullptr;
+    o.max_new_tokens = 0;
+    CHECK(generate(m, prompt, o).empty());
+    o.max_new_tokens = 8;
+    // Hooks at every step: the same tokens as forward() with the hook, step by step.
+    Hooks zero;
+    zero.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { std::fill(a.data.begin(), a.data.end(), 0.f); });
+    const Tokens hooked = generate(m, prompt, o, &zero);
+    seqn = prompt;
+    for (int64_t step = 0; step < 8; ++step) {
+        const Tensor lg = m.forward(seqn, &zero);
+        const float* last = lg.ptr() + (lg.shape[0] - 1) * lg.shape[1];
+        const int64_t want = std::max_element(last, last + lg.shape[1]) - last;
+        CHECK(hooked[step] == want || std::fabs(last[hooked[step]] - last[want]) < 1e-4f);
+        seqn.push_back(hooked[step]);
+    }
+    // Sampling: the same seed gives the same tokens; others differ somewhere.
+    o.temperature = 1.0;
+    o.seed = 5;
+    const Tokens s1 = generate(m, prompt, o), s2 = generate(m, prompt, o);
+    CHECK(s1 == s2);
+    bool differs = false;
+    o.temperature = 1e3;  // nearly uniform, whatever the logits' scale (models without norms reach ~100)
+    const Tokens s3 = generate(m, prompt, o);
+    for (uint64_t seed = 6; seed < 12 && !differs; ++seed) {
+        o.seed = seed;
+        differs = generate(m, prompt, o) != s3;
+    }
+    CHECK(differs);
+    o.temperature = 1.0;
+    o.top_k = 1;  // top_k 1 is greedy
+    CHECK(generate(m, prompt, o) == got);
+    o.top_k = 0;
+    o.temperature = -1;
+    CHECK_THROWS(generate(m, prompt, o));
+    o.temperature = 1;
+    o.top_p = 0;
+    CHECK_THROWS(generate(m, prompt, o));
+    o.top_p = 1;
+    CHECK_THROWS(generate(m, {}, o));
+}
+
+// The sampler alone: frequencies follow softmax(logits / temperature), restricted by top_k and top_p;
+// NaN and -inf are never picked.
+static void test_sampler() {
+    const std::vector<float> logits = {1.f, 2.f, 0.f, -INFINITY, std::nanf(""), 1.5f};
+    auto freqs = [&](GenerateOptions o, int n) {
+        Sampler s(o);
+        std::vector<double> f(logits.size(), 0);
+        for (int i = 0; i < n; ++i) f[s(logits.data(), static_cast<int64_t>(logits.size()))] += 1.0 / n;
+        return f;
+    };
+    auto softmax = [&](std::vector<int> keep, double temp) {
+        std::vector<double> p(logits.size(), 0);
+        double z = 0;
+        for (int i : keep) z += std::exp(logits[i] / temp);
+        for (int i : keep) p[i] = std::exp(logits[i] / temp) / z;
+        return p;
+    };
+    const int n = 200000;
+    GenerateOptions o;
+    o.seed = 3;
+    for (double temp : {1.0, 0.5}) {
+        o.temperature = temp;
+        const std::vector<double> f = freqs(o, n), p = softmax({0, 1, 2, 5}, temp);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+    }
+    o.temperature = 1.0;
+    o.top_k = 2;  // tokens 1 and 5
+    {
+        const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+    }
+    o.top_k = 0;
+    o.top_p = 0.6;  // token 1 has 0.47 of the mass, with token 5 0.76 >= 0.6
+    {
+        const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+    }
+    o.top_p = 0.3;  // token 1 alone
+    CHECK_NEAR(freqs(o, 1000)[1], 1.0, 1e-9);
+    o.top_p = 1;
+    o.temperature = 0;
+    CHECK_NEAR(freqs(o, 10)[1], 1.0, 1e-9);
+    const std::vector<float> tie = {3.f, 5.f, 5.f};
+    Sampler greedy(o);
+    CHECK(greedy(tie.data(), 3) == 1);  // the lowest id among equal logits
+    const std::vector<float> none = {-INFINITY, std::nanf("")};
+    CHECK_THROWS(greedy(none.data(), 2));
+}
+
+#ifdef TFI_USE_ACCELERATE
+// forward_cached and generate on the GPU (macOS): GPU-only mode, where every cached step runs there,
+// and both mode with chunks of 2 rows or more on the GPU.
+static void test_gpu_forward_cached(const Model& m) {
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    set_device(Device::Gpu);
+    test_forward_cached(m);
+    test_generate(m);
+    set_device(Device::Both);
+    detail::set_gpu_min_rows(2);
+    test_forward_cached(m);
+    detail::set_gpu_min_rows(0);
+}
+#endif
+
 static const char* const kGroups[] = {"core", "analysis", "grad", "fp16", "gpu"};
 
 static int usage(const char* argv0) {
@@ -2833,7 +3131,11 @@ int main(int argc, char** argv) {
         if (kv.second.kv_heads() == kv.second.n_heads)
             run("analysis", "composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
         run("analysis", "circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
+        run("analysis", "KV cache: forward_cached = forward, hooks, copies: " + kv.first, [&] { test_forward_cached(m); });
+        run("analysis", "generate: greedy = argmax, stops, hooks, sampling: " + kv.first, [&] { test_generate(m); });
     }
+    run("core", "sampler: temperature, top_k, top_p", test_sampler);
+    run("fp16", "linear layers on 1-4 rows: direct from the weights, fp16 = rounded float32", test_linear_few_rows);
     run("fp16", "fp16 conversion", test_half_conversion);
     run("fp16", "fp16 weights: reads, linear, matmul", test_fp16_weight);
     run("fp16", "fp16 weights: loading converts as it reads", test_fp16_load);
@@ -2908,6 +3210,9 @@ int main(int argc, char** argv) {
         run("gpu", "capture hooks on the GPU next to editing hooks = CPU (macOS): " + kv.first,
             [&] { test_gpu_captures(random_model(kv.second, 56), 9); });
     run("gpu", "single passes in both mode with the default thresholds (macOS)", test_gpu_single_pass_defaults);
+    for (const auto& kv : gpu_block_configs())
+        run("gpu", "KV cache and generate on the GPU = forward (macOS): " + kv.first,
+            [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);
     });

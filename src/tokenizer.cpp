@@ -171,6 +171,7 @@ struct Tokenizer::Impl {
         U32String content;
         int64_t id;
         bool lstrip, rstrip, single_word, normalized;
+        bool special = false;
     };
     struct Piece {
         U32String text;
@@ -186,6 +187,42 @@ struct Tokenizer::Impl {
     std::optional<int64_t> unk;
     std::vector<Added> added;
     std::vector<int64_t> prefix, suffix;  // the post-processor's tokens around the text
+
+    // Decoding, worked out from how text is encoded (tokenizer.json's decoder isn't stored).
+    std::vector<std::string> id_text;  // each id's vocabulary entry or added token, UTF-8 ("" for unused ids)
+    std::vector<char> id_kind;         // 0 vocabulary, 1 added token, 2 special added token, -1 unused
+    bool byte_level = false;           // tokens spell bytes in GPT-2's alphabet
+    char32_t space_mark = 0;           // the character spaces became (SentencePiece's ▁), 0 for none
+    bool strip_space = false;          // encoding put a space_mark before the text: decoding removes it
+
+    void prepare_decoding() {
+        int64_t n = 0;
+        for (const auto& kv : vocab) n = std::max(n, kv.second + 1);
+        for (const Added& a : added) n = std::max(n, a.id + 1);
+        id_text.assign(static_cast<size_t>(n), std::string());
+        id_kind.assign(static_cast<size_t>(n), -1);
+        for (const auto& kv : vocab) {
+            id_text[kv.second] = kv.first;
+            id_kind[kv.second] = 0;
+        }
+        for (const Added& a : added) {
+            id_text[a.id] = utf8_encode(a.content);
+            id_kind[a.id] = a.special ? 2 : 1;
+        }
+        bool prepends = false;
+        for (const PreTokenizer& p : pre_tokenizers) {
+            if (p.kind == PreTokenizer::ByteLevel) byte_level = true;
+            if (p.kind == PreTokenizer::Metaspace) {
+                space_mark = p.replacement;
+                prepends = prepends || p.prepend_scheme != "never";
+            }
+        }
+        for (const Normalizer& nm : normalizers)  // Replace(" ", "▁"), and Prepend("▁") (Llama 2's)
+            if (nm.kind == Normalizer::Replace && nm.pattern.literal == U" " && nm.content.size() == 1) space_mark = nm.content[0];
+        for (const Normalizer& nm : normalizers)
+            if (nm.kind == Normalizer::Prepend && space_mark && nm.content == U32String(1, space_mark)) prepends = true;
+        strip_space = !byte_level && space_mark && prepends;
+    }
 
     void parse_normalizer(const json::Value& n) {
         const std::string type = n.at("type").as_string();
@@ -515,10 +552,55 @@ Tokenizer Tokenizer::from_json(const std::string& tokenizer_json) {
             seen.emplace(content, id);
             max_id = std::max(max_id, id);
             impl->added.push_back({utf8_decode(content), id, flag(e, "lstrip", false), flag(e, "rstrip", false),
-                                   flag(e, "single_word", false), flag(e, "normalized", false)});
+                                   flag(e, "single_word", false), flag(e, "normalized", false), flag(e, "special", false)});
         }
     }
+    impl->prepare_decoding();
     return Tokenizer(std::move(impl));
+}
+
+std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special_tokens) const {
+    const Impl& m = *impl_;
+    static const std::vector<int> byte_of = [] {  // GPT-2's alphabet back to bytes
+        std::vector<int> t(512, -1);
+        const std::vector<char32_t>& chars = byte_chars();
+        for (int b = 0; b < 256; ++b) t[chars[b]] = b;
+        return t;
+    }();
+    auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    const std::string mark = m.space_mark ? utf8_encode(U32String(1, m.space_mark)) : std::string();
+    std::string out;
+    for (int64_t id : ids) {
+        if (id < 0) throw std::out_of_range("token " + std::to_string(id) + " is negative");
+        // Ids with no token (a model's padded vocabulary rows) give nothing, as in Hugging Face.
+        if (id >= static_cast<int64_t>(m.id_kind.size()) || m.id_kind[id] < 0) continue;
+        const std::string& tok = m.id_text[id];
+        if (m.id_kind[id] == 2 && skip_special_tokens) continue;
+        if (m.id_kind[id] > 0) {  // added tokens are their text
+            out += tok;
+        } else if (m.byte_level) {
+            for (char32_t c : utf8_decode(tok)) {
+                if (c < byte_of.size() && byte_of[c] >= 0) out.push_back(static_cast<char>(byte_of[c]));
+                else out += utf8_encode(U32String(1, c));
+            }
+        } else if (m.byte_fallback && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>' && hex(tok[3]) >= 0 &&
+                   hex(tok[4]) >= 0) {  // <0xNN>: one byte
+            out.push_back(static_cast<char>(hex(tok[3]) * 16 + hex(tok[4])));
+        } else if (!mark.empty()) {
+            for (size_t i = 0; i < tok.size();) {
+                if (tok.compare(i, mark.size(), mark) == 0) {
+                    out.push_back(' ');
+                    i += mark.size();
+                } else {
+                    out.push_back(tok[i++]);
+                }
+            }
+        } else {
+            out += tok;
+        }
+    }
+    if (m.strip_space && !out.empty() && out[0] == ' ') out.erase(0, 1);
+    return out;
 }
 
 std::vector<int64_t> Tokenizer::encode(const std::string& text_utf8, bool add_special_tokens) const {

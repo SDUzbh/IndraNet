@@ -17,13 +17,16 @@ Build them once with ``make python`` (needs CMake and ``pip install nanobind``),
     tfi.direct_logit_attribution(model, tokens, pos=-1, target=model.tokenize(" Paris", False)[0])
     tfi.patch(model, clean, corrupt, "resid_pre", pos=-1, target=t, other=o, method="attribution")
 
+    new = tfi.generate(model, "The capital of France is", max_new_tokens=20)   # KV cache; hooks= apply
+    model.decode(new)                                                          # at every step
+
 Arrays come back as float32 numpy arrays (no copy of the engine's buffers); results of the analyses are
 dicts of arrays and lists. Engine calls release the GIL. The functions mirror include/tfi/analysis.h.
 """
 try:
     from ._tfi import (  # noqa: F401
-        Model, Tokenizer, composition_random_baseline, composition_scores, device, direct_logit_attribution,
-        gpu_fp16, head_ablation, head_scores, head_weights, lens_grid, logit_lens, logit_metric,
+        KVCache, Model, Tokenizer, composition_random_baseline, composition_scores, device, direct_logit_attribution,
+        generate, gpu_fp16, head_ablation, head_scores, head_weights, lens_grid, logit_lens, logit_metric,
         metric_gradients, next_token_loss, num_threads, ov_copying_scores, patch, read_metadata, set_device,
         set_gpu_fp16, set_num_threads,
     )
@@ -32,8 +35,8 @@ except ImportError as e:  # pragma: no cover - depends on the build
                       "(needs CMake and `pip install nanobind`)") from e
 
 __all__ = [
-    "Model", "Tokenizer", "composition_random_baseline", "composition_scores", "device",
-    "direct_logit_attribution", "gpu_fp16", "head_ablation", "head_scores", "head_weights", "lens_grid",
+    "KVCache", "Model", "Tokenizer", "composition_random_baseline", "composition_scores", "device",
+    "direct_logit_attribution", "generate", "gpu_fp16", "head_ablation", "head_scores", "head_weights", "lens_grid",
     "logit_lens", "logit_metric", "metric_gradients", "next_token_loss", "num_threads", "ov_copying_scores",
     "patch", "read_metadata", "set_device", "set_gpu_fp16", "set_num_threads",
 ]

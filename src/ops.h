@@ -97,6 +97,9 @@ struct RowBatch {
     Gpu* gpu = nullptr;  // macOS: if set, the blocks run on the GPU (Model::run_rows)
     bool fp16 = false;   // ... with fp16 multiply inputs (Gpu::linear, Gpu::Seq)
     bool whole = false;  // one whole sequence (a single pass, Model::forward_from): hook_pattern runs as there
+    // One segment continuing a cached sequence (Model::forward_cached): hook_pattern runs on its
+    // (H, len, start + len) pattern, on the CPU.
+    bool cached = false;
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());
