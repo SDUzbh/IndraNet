@@ -35,14 +35,24 @@ std::vector<float>& block_buffer(int64_t floats) {
 // the library's matrix multiply gains nothing. More rows use the library (fp16: converted blocks).
 constexpr int64_t kDirectRows = 4;
 
-// One weight value as float32: as stored, or converted from fp16 (exactly).
-inline float weight_value(float w) { return w; }
-inline float weight_value(uint16_t w) { return detail::half_to_float(w); }
+// sum[r] += x[r][k] * w[k] for k in [k0, in), one statement each for the multiply and the add (a
+// compiler may fuse a multiply-add within one). Both weight types' scalar steps go through this one
+// float32 function (fp16 values converted exactly first), so they are the same instructions whatever
+// the compiler makes of them: an fp16 model gives bit for bit what float32 weights holding the same
+// rounded values give.
+template <int R>
+void scalar_dot(const float* x, const float* w, int64_t in, int64_t k0, int64_t k1, float* sum) {
+    for (int64_t k = k0; k < k1; ++k)
+        for (int r = 0; r < R; ++r) {
+            const float p = x[r * in + k] * w[k - k0];
+            sum[r] += p;
+        }
+}
 
 // y[r * ldy + j] = x[r] . W[j] for R rows of x (stride in) and weight rows j0..j1-1 of W (float32 or
-// fp16, `in` columns), in float32, each weight row read once. fp16 weights take the same steps on
-// their (exact) float32 values, so an fp16 model gives bit for bit what float32 weights holding the
-// same rounded values give.
+// fp16, `in` columns), in float32, each weight row read once. On ARM 8 columns at a time with vector
+// multiply-adds, fp16 converted in registers; the rest (and everything elsewhere) through scalar_dot,
+// fp16 converted 64 values at a time.
 template <int R, typename WT>
 void direct_rows(const float* x, const WT* W, int64_t in, int64_t j0, int64_t j1, float* y, int64_t ldy) {
     for (int64_t j = j0; j < j1; ++j) {
@@ -71,14 +81,15 @@ void direct_rows(const float* x, const WT* W, int64_t in, int64_t j0, int64_t j1
 #else
         for (int r = 0; r < R; ++r) sum[r] = 0.f;
 #endif
-        for (; k < in; ++k) {
-            const float wk = weight_value(w[k]);
-            for (int r = 0; r < R; ++r) {
-                // Two statements: the compiler may fuse a multiply-add within one, and might do so for
-                // one weight type and not the other, which would break fp16 = rounded float32.
-                const float p = x[r * in + k] * wk;
-                sum[r] += p;
+        if constexpr (std::is_same_v<WT, uint16_t>) {
+            float buf[64];
+            for (; k < in; k += 64) {
+                const int64_t n = std::min<int64_t>(64, in - k);
+                detail::halves_to_floats(w + k, buf, n);
+                scalar_dot<R>(x, buf, in, k, k + n, sum);
             }
+        } else {
+            scalar_dot<R>(x, w + k, in, k, in, sum);
         }
         for (int r = 0; r < R; ++r) y[r * ldy + j] = sum[r];
     }
