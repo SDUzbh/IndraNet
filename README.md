@@ -11,13 +11,12 @@ does to what the model writes.
 
 The Python package [`indranet`](python/) supplies the models to study. It builds and trains them in
 PyTorch from a single config, with the same hook names as the engine, and exports them in one file.
-[`indranet_hf`](python/indranet_hf/) converts Hugging Face checkpoints. [`tfi`](python/tfi/) gives
-Python the engine itself (numpy in and out), and [`indranet_ui`](python/indranet_ui/) is a local web
-page on top of it for looking at a model: attention, the logit lens, attribution and patching.
+[`indranet_hf`](python/indranet_hf/) converts Hugging Face checkpoints, and [`tfi`](python/tfi/) gives
+Python the engine itself (numpy in and out).
 
 ```
 indranet (PyTorch)  --train-->  model  --export_model-->  model.safetensors  -->  indra (C++, tfi engine)
-Hugging Face checkpoint  --indranet_hf-->  model.safetensors  -->  tfi (Python bindings)  -->  indranet_ui (browser)
+Hugging Face checkpoint  --indranet_hf-->  model.safetensors  -->  tfi (Python bindings)
 ```
 
 | Path | What it is |
@@ -28,7 +27,6 @@ Hugging Face checkpoint  --indranet_hf-->  model.safetensors  -->  tfi (Python b
 | [python/](python/) | The `indranet` package: model building, training helpers, export, its tests |
 | [python/indranet_hf/](python/indranet_hf/) | The Hugging Face converter |
 | [python/tfi/](python/tfi/) | Python bindings for the engine (nanobind), built with `make python` |
-| [python/indranet_ui/](python/indranet_ui/) | The browser UI: `python -m indranet_ui model.safetensors` |
 | [examples/](examples/) | Two circuits trained in Python and reverse-engineered with `indra` |
 
 ## Build
@@ -377,26 +375,6 @@ The functions mirror the C++ API (`logit_lens`, `head_scores`, `patch`, `metric_
 Activations come back as numpy arrays that take over the engine's buffers, with no copy, and
 analysis results as dicts. Every engine call releases the GIL, so threads can run it side by side.
 
-## Browser UI
-
-```bash
-make python
-PYTHONPATH=python python3 -m indranet_ui model.safetensors --fp16 --open
-```
-
-This serves a page on `http://127.0.0.1:8765/`. Type a prompt on its landing page and look at the
-model. Give it several files or a folder to choose between models on the page. The results show:
-
-- a token strip, coloured by how surprising each token was, with the top predictions on hover;
-- every head's attention pattern, layer by layer, one enlarged with values on hover;
-- the logit lens at every position;
-- direct logit attribution as a layer × head map and the largest parts;
-- activation patching (exact, attribution or mixed), by layer and position or by head;
-- head scores (induction, previous-token, sink, ...), each head a click away from its pattern.
-
-It needs nothing beyond the bindings and numpy: Python's standard library serves the page and plain
-JavaScript draws it, with no build step. See [python/indranet_ui/](python/indranet_ui/).
-
 ## Correctness
 
 - **Golden tests** (`python/tests/test_golden.py`) export ~130 model configurations and
@@ -498,8 +476,8 @@ build/indra attn arith.safetensors --text "58291+76834=+521531" --layer 0
 
 ```bash
 make test       # C++ unit tests
-pytest          # Python tests, golden tests against PyTorch, the indra CLI, the bindings, the UI server
-                # and the examples (the bindings' and UI's tests build the module; skipped without nanobind)
+pytest          # Python tests, golden tests against PyTorch, the indra CLI, the bindings and the
+                # examples (the bindings' tests build the module; skipped without nanobind)
 ```
 
 The C++ unit tests are in five groups, so part of the suite can run on its own:
