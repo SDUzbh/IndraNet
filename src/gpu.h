@@ -218,6 +218,10 @@ class Gpu::Batch {
     std::unique_ptr<Impl> impl_;
 };
 
+// Gpu::Seq::run commits a command buffer every this many linear layers, so that the GPU starts on the
+// first while the CPU encodes the rest. For tests and tuning: 0 restores the default.
+int64_t commit_linears();
+void set_commit_linears(int64_t n);
 // Batched passes and linear layers with at least this many rows use the GPU (smaller ones are
 // faster on the CPU). GPU-only mode (Device::Gpu): 1.
 int64_t gpu_min_rows();

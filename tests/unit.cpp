@@ -3287,6 +3287,38 @@ static void test_gpu_forward_cached(const Model& m) {
 #endif
 
 #ifdef TFI_USE_ACCELERATE
+// Gpu::Seq::run commits its work in several command buffers (every few linear layers) so the GPU starts
+// while the rest is encoded: the same kernels in the same order, so bit for bit what one command buffer
+// gives, for cached decoding, a batch, batched patching passes and gradient passes.
+static void test_gpu_chunked_commits(const Model& m) {
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    auto everything = [&] {
+        std::vector<Tensor> out;
+        set_device(Device::Gpu);
+        KVCache c;
+        out.push_back(m.forward_cached(seq(9, 64), c));
+        for (int64_t t : {3, 7, 1}) out.push_back(m.forward_cached({t}, c));
+        KVBatch b(2);
+        for (const Tensor& t : m.forward_cached({seq(5, 65), seq(3, 66)}, b)) out.push_back(t);
+        for (const Tensor& t : m.forward_cached({Tokens{4}, Tokens{9}}, b)) out.push_back(t);
+        const Tokens clean = seq(8, 67), corrupt = seq(8, 68);
+        out.push_back(patch_residual(m, clean, corrupt, "resid_pre", 7, 1, 2).effect);
+        out.push_back(attribution_patch_residual(m, clean, corrupt, "resid_pre", 7, 1, 2).effect);
+        set_device(Device::Both);
+        return out;
+    };
+    detail::set_commit_linears(1);  // a command buffer per linear layer
+    const std::vector<Tensor> chunked = everything();
+    detail::set_commit_linears(int64_t(1) << 30);  // one command buffer
+    const std::vector<Tensor> whole = everything();
+    detail::set_commit_linears(0);
+    CHECK(chunked.size() == whole.size());
+    for (size_t i = 0; i < chunked.size() && i < whole.size(); ++i) CHECK(same_values(chunked[i], whole[i]));
+}
+
 // Random sequences of operations on KV caches whose positions live on the CPU, the GPU or both (GPU steps
 // append on the GPU only): GPU and CPU steps in chunks, truncation, copies, keys(), clearing; single caches
 // and batches. After every step the logits = the whole pass on the same history, keys() = its hook_k, and
@@ -3640,6 +3672,9 @@ int main(int argc, char** argv) {
         run("gpu", "KV cache and generate on the GPU = forward (macOS): " + kv.first,
             [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
     run("gpu", "KV cache on the GPU: long sequences, split-key attention = CPU (macOS)", test_gpu_forward_cached_long);
+    for (const auto& kv : gpu_block_configs())
+        run("gpu", "GPU work committed in chunks = one command buffer, bit for bit (macOS): " + kv.first,
+            [&] { test_gpu_chunked_commits(random_model(kv.second, 69)); });
     {
         uint64_t seed = 100;
         for (const auto& kv : gpu_block_configs())

@@ -1122,6 +1122,7 @@ struct Gpu::Seq::Impl {
     id<MTLBuffer> flag = nil;  // set by half_k when an input does not fit fp16
     id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
     size_t split_bytes = 0;
+    std::vector<id<MTLBuffer>> retired;  // replaced during an attempt: released once its command buffers finish
 
     // Encoding state of one attempt.
     id<MTLCommandBuffer> cmd = nil;
@@ -1416,7 +1417,7 @@ struct Gpu::Seq::Impl {
                 if (op.j < 0 && A.rows <= 8 && nsplit > 1) {
                     const size_t bytes = static_cast<size_t>(A.rows * A.H * nsplit * (A.D + 2)) * sizeof(float);
                     if (split_bytes < bytes) {
-                        if (split) g.release(split);
+                        if (split) retired.push_back(split);  // earlier command buffers of this attempt may still read it
                         split = g.acquire(bytes);
                         split_bytes = bytes;
                     }
@@ -1604,24 +1605,50 @@ struct Gpu::Seq::Impl {
     }
 
     // One attempt; true if fp16 was asked for and an input did not fit.
+    // One attempt; true if fp16 was asked for and an input did not fit. The work goes to the GPU in
+    // several command buffers, one committed every commit_linears() linear layers, so that the GPU runs
+    // the first while the CPU encodes the rest (encoding MPS's multiplies costs ~12 us each: a decode pass's
+    // 113 took ~1.4 ms, which the GPU otherwise waited out). One queue runs them in order; the attempt
+    // waits for all of them.
     bool attempt(bool fp16) {
         @autoreleasepool {
             *static_cast<uint32_t*>(flag.contents) = 0;
             cmd = [g.queue commandBuffer];
             half_valid.assign(slots.size(), false);
+            std::vector<id<MTLCommandBuffer>> sent;
+            auto wait_sent = [&] {
+                bool ok = true;
+                for (id<MTLCommandBuffer> c : sent) {
+                    [c waitUntilCompleted];
+                    ok = ok && c.status == MTLCommandBufferStatusCompleted;
+                }
+                for (id<MTLBuffer> b : retired) g.release(b);  // no command buffer reads them any more
+                retired.clear();
+                return ok;
+            };
+            const int64_t every = commit_linears();
             try {
-                for (const Op& op : ops) encode(op, fp16);
+                int64_t linears = 0;
+                for (const Op& op : ops) {
+                    encode(op, fp16);
+                    if ((op.kind == Op::Linear || op.kind == Op::LinearT) && ++linears % every == 0 && &op != &ops.back()) {
+                        end_compute();
+                        [cmd commit];
+                        sent.push_back(cmd);
+                        cmd = [g.queue commandBuffer];
+                    }
+                }
                 end_compute();
             } catch (...) {
                 end_compute();
                 cmd = nil;
+                wait_sent();  // what was committed still reads the slots
                 throw;
             }
             [cmd commit];
-            [cmd waitUntilCompleted];
-            const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
+            sent.push_back(cmd);
             cmd = nil;
-            if (!ok) throw std::runtime_error("GPU: a batched layer failed");
+            if (!wait_sent()) throw std::runtime_error("GPU: a batched layer failed");
             return fp16 && *static_cast<uint32_t*>(flag.contents) != 0;
         }
     }
@@ -1870,6 +1897,16 @@ void Gpu::Seq::run(bool fp16) {
     } clear{s.ops};
     if (s.attempt(fp16)) s.attempt(false);
 }
+
+namespace {
+std::atomic<int64_t> g_commit_linears{0};  // 0: the default
+}  // namespace
+
+int64_t commit_linears() {
+    const int64_t n = g_commit_linears.load();
+    return n > 0 ? n : 8;
+}
+void set_commit_linears(int64_t n) { g_commit_linears = n; }
 
 // --- Gpu::Batch -------------------------------------------------------------------------
 
