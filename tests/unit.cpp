@@ -3287,6 +3287,127 @@ static void test_gpu_forward_cached(const Model& m) {
 #endif
 
 #ifdef TFI_USE_ACCELERATE
+// Random sequences of operations on KV caches whose positions live on the CPU, the GPU or both (GPU steps
+// append on the GPU only): GPU and CPU steps in chunks, truncation, copies, keys(), clearing; single caches
+// and batches. After every step the logits = the whole pass on the same history, keys() = its hook_k, and
+// (set_check_kv) each cache's CPU and GPU copies agree wherever both are up to date.
+static void test_kv_random(const Model& m, uint64_t seed) {
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    detail::set_check_kv(true);
+    std::mt19937_64 rng(seed);
+    auto pick = [&](int64_t lo, int64_t hi) { return std::uniform_int_distribution<int64_t>(lo, hi)(rng); };
+    const int64_t V = m.cfg().vocab_size, L = m.cfg().n_layers;
+    auto reference = [&](const Tokens& t) {  // the whole pass on the CPU: logits and every layer's keys
+        set_device(Device::Cpu);
+        ActivationCache acts;
+        Tensor lg = m.run_with_cache(t, acts);
+        return std::make_pair(lg, acts);
+    };
+    // GPU against CPU, as check_close but with 1e-4 of the largest value: models without norms reach
+    // logits in the thousands over long sequences, where the two add in different orders (the first step,
+    // with no cache yet, already differs by ~1e-5 of the scale; long chunks by up to ~5e-5). A cache holding
+    // the wrong positions is off by the size of the values themselves.
+    auto near = [&](const Tensor& got, const Tensor& want) {
+        CHECK(got.shape == want.shape);
+        const float sc = max_abs(want);
+        for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i)
+            CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])) + 1e-4 * sc);
+    };
+    auto step = [&](const Tokens& history, int64_t n, bool gpu, auto&& run) {
+        Tokens add(static_cast<size_t>(n));
+        for (auto& x : add) x = pick(0, V - 1);
+        set_device(gpu ? Device::Gpu : Device::Cpu);
+        const Tensor got = run(add);
+        Tokens full = history;
+        full.insert(full.end(), add.begin(), add.end());
+        const Tensor want = reference(full).first;
+        near(got, rows(want, static_cast<int64_t>(history.size()), static_cast<int64_t>(full.size())));
+        return full;
+    };
+    // Histories stay under learned positions' limit (a step adds at most 4, a batch step 3).
+    int64_t limit = m.cfg().positional == "learned" ? m.cfg().max_seq_len - 4 : int64_t(1) << 30;
+    for (int64_t l = 0; l < L; ++l) {  // RoPE scalings whose frequencies change past original_max_position_embeddings
+        const auto& rs = m.layer_cfg(l).rope_scaling;
+        if (rs && (rs->type == "longrope" || rs->type == "dynamic")) limit = std::min(limit, rs->original_max_position_embeddings - 4);
+    }
+    // One cache.
+    const Model twin = m;  // the same model, another GPU context
+    KVCache cache;
+    Tokens history;
+    for (int op = 0; op < 40; ++op) {
+        if (static_cast<int64_t>(history.size()) > limit) {
+            cache.truncate(limit / 2);
+            history.resize(static_cast<size_t>(limit / 2));
+        }
+        const int64_t kind = history.empty() ? 0 : pick(0, 7);
+        if (kind <= 2) {  // a step of 1-4 tokens, on the GPU (twice as often) or the CPU
+            history = step(history, pick(1, 4), kind != 2, [&](const Tokens& add) { return m.forward_cached(add, cache); });
+        } else if (kind == 7) {  // a long chunk on the GPU: its buffers grow while it may hold the only copy of recent positions
+            if (limit > 1000) history = step(history, pick(150, 300), true, [&](const Tokens& add) { return m.forward_cached(add, cache); });
+        } else if (kind == 3) {
+            const int64_t n = pick(0, static_cast<int64_t>(history.size()));
+            cache.truncate(n);
+            history.resize(static_cast<size_t>(n));
+        } else if (kind == 4) {  // keys() brings the CPU side up to date
+            const auto acts = reference(history).second;
+            const int64_t l = pick(0, L - 1);
+            check_close(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+            check_close(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+        } else if (kind == 5) {  // continue on a copy (it has no GPU copy of its own yet)
+            cache = KVCache(cache);
+        } else if (pick(0, 1) == 0) {  // a step through a copy of the model, with a GPU context of its own: a new GPU copy
+            history = step(history, pick(1, 4), true, [&](const Tokens& add) { return twin.forward_cached(add, cache); });
+        } else if (pick(0, 3) == 0) {
+            cache.clear();
+            history.clear();
+        }
+        CHECK(cache.size() == static_cast<int64_t>(history.size()));
+    }
+    // A batch of three: random subsets of sequences, each a random chunk, on the GPU or the CPU.
+    KVBatch batch(3);
+    std::vector<Tokens> hist(3);
+    for (int op = 0; op < 25; ++op) {
+        bool full_up = false;
+        for (const Tokens& t : hist) full_up = full_up || static_cast<int64_t>(t.size()) > limit;
+        if (full_up) {  // a batch can't be truncated: start a new one
+            batch = KVBatch(3);
+            for (Tokens& t : hist) t.clear();
+        }
+        const int64_t kind = pick(0, 6);
+        if (kind <= 3 || kind == 6) {
+            const bool gpu = kind != 3;
+            const bool longer = kind == 6 && limit > 1000;  // one sequence's long chunk: every region grows
+            std::vector<Tokens> add(3);
+            for (int i = 0; i < 3; ++i)
+                if (pick(0, 3) != 0 || (longer && i == 0))
+                    for (int64_t k = longer && i == 0 ? pick(150, 300) : pick(1, 3); k > 0; --k) add[i].push_back(pick(0, V - 1));
+            set_device(gpu ? Device::Gpu : Device::Cpu);
+            const std::vector<Tensor> got = m.forward_cached(add, batch);
+            for (int i = 0; i < 3; ++i) {
+                if (add[i].empty()) continue;
+                Tokens full = hist[i];
+                full.insert(full.end(), add[i].begin(), add[i].end());
+                near(got[i], rows(reference(full).first, static_cast<int64_t>(hist[i].size()), static_cast<int64_t>(full.size())));
+                hist[i] = full;
+            }
+        } else if (kind == 4) {
+            const int i = static_cast<int>(pick(0, 2));
+            if (!hist[i].empty()) {
+                const auto acts = reference(hist[i]).second;
+                check_close(batch[i].keys(L - 1), acts.at("blocks." + std::to_string(L - 1) + ".attn.hook_k"));
+            }
+        } else {
+            batch = KVBatch(batch);  // a copy: keys and values on the CPU, no GPU copy
+        }
+        for (int i = 0; i < 3; ++i) CHECK(batch[i].size() == static_cast<int64_t>(hist[i].size()));
+    }
+    set_device(Device::Both);
+    detail::set_check_kv(false);
+}
+
 // GPU cached passes with fp16 multiplies are one submission for every layer; when an input overflows
 // fp16 the whole run repeats in fp32, so it must find its inputs intact (each layer writes its own
 // residual slot). Embeddings scaled past fp16's range on a model without norms (the linear layers read
@@ -3519,6 +3640,12 @@ int main(int argc, char** argv) {
         run("gpu", "KV cache and generate on the GPU = forward (macOS): " + kv.first,
             [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
     run("gpu", "KV cache on the GPU: long sequences, split-key attention = CPU (macOS)", test_gpu_forward_cached_long);
+    {
+        uint64_t seed = 100;
+        for (const auto& kv : gpu_block_configs())
+            run("gpu", "KV caches on CPU and GPU: random operations = whole passes, copies consistent (macOS): " + kv.first,
+                [&, s = seed++] { test_kv_random(random_model(kv.second, 63), s); });
+    }
     run("gpu", "KV cache on the GPU with fp16 multiplies: one run, its fp32 repeat finds the inputs intact (macOS)", test_gpu_fp16_cached_repeat);
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& kv : long_attention_configs()) test_gpu_single_pass(random_model(kv.second, 54), 48);

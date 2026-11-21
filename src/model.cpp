@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1066,18 +1067,110 @@ Tensor Model::run_from(int64_t layer, Tensor x, const Hooks* hooks, bool last_on
     return logits_from_final(f, rb.gpu ? &rb : nullptr);
 }
 
+KVCache::KVCache(const KVCache& o) {
+    o.sync_cpu();
+    k_ = o.k_;
+    v_ = o.v_;
+    len_ = cpu_len_ = o.len_;
+}
+
+KVCache& KVCache::operator=(const KVCache& o) {
+    if (this == &o) return *this;
+    o.sync_cpu();
+    k_ = o.k_;
+    v_ = o.v_;
+    len_ = cpu_len_ = o.len_;
+    gpu_.reset();
+    region_ = gpu_len_ = 0;
+    return *this;
+}
+
 void KVCache::clear() {
     k_.clear();
     v_.clear();
-    len_ = 0;
-    gpu_len_ = 0;  // the GPU's buffers stay, for the next sequence
+    len_ = cpu_len_ = gpu_len_ = 0;  // the GPU's buffers stay, for the next sequence
 }
 
 void KVCache::truncate(int64_t n) {
     if (n < 0 || n > len_) throw std::out_of_range("KVCache::truncate: " + std::to_string(n) + " is not in 0.." + std::to_string(len_));
-    if (n == 0) clear();
-    else len_ = n;  // later positions are overwritten as the sequence continues
-    gpu_len_ = std::min(gpu_len_, len_);
+    if (n == 0) return clear();
+    len_ = n;  // later positions are overwritten as the sequence continues, on either side
+    cpu_len_ = std::min(cpu_len_, n);
+    gpu_len_ = std::min(gpu_len_, n);
+}
+
+void KVCache::shapes(const std::vector<int64_t>& heads, const std::vector<int64_t>& dims) {
+    if (!k_.empty()) return;
+    for (size_t l = 0; l < heads.size(); ++l) {
+        k_.push_back(Tensor({heads[l], 0, dims[l]}));
+        v_.push_back(Tensor({heads[l], 0, dims[l]}));
+    }
+}
+
+void KVCache::reserve_cpu(int64_t n) const {
+    for (int pass = 0; pass < 2; ++pass)
+        for (Tensor& t : pass ? v_ : k_) {
+            const int64_t H = t.shape[0], cap = t.shape[1], D = t.shape[2];
+            if (n <= cap) continue;
+            // geometrically, with room after a prompt, so that appending one position at a time stays linear
+            const int64_t grown = std::max({n + std::max<int64_t>(16, n / 2), 2 * cap});
+            Tensor g({H, grown, D});
+            for (int64_t h = 0; h < H; ++h)
+                std::copy(t.ptr() + h * cap * D, t.ptr() + (h * cap + cpu_len_) * D, g.ptr() + h * grown * D);
+            t = std::move(g);
+        }
+}
+
+void KVCache::sync_cpu() const {
+    if (cpu_len_ >= len_) return;
+#ifdef TFI_USE_ACCELERATE
+    if (!gpu_ || gpu_len_ < len_) throw std::logic_error("KVCache: positions held on neither side");
+    reserve_cpu(len_);
+    const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
+    for (size_t l = 0; l < k_.size(); ++l) {
+        const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
+        const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l)));
+        const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l)));
+        for (int64_t h = 0; h < H; ++h) {
+            std::copy(gk + (h * Tp + base + cpu_len_) * D, gk + (h * Tp + base + len_) * D, k_[l].ptr() + (h * c + cpu_len_) * D);
+            std::copy(gv + (h * Tp + base + cpu_len_) * D, gv + (h * Tp + base + len_) * D, v_[l].ptr() + (h * c + cpu_len_) * D);
+        }
+    }
+    cpu_len_ = len_;
+#else
+    throw std::logic_error("KVCache: positions held on neither side");
+#endif
+}
+
+namespace {
+std::atomic<int> g_check_kv{-1};  // -1: TFI_CHECK_KV decides
+}  // namespace
+
+void detail::set_check_kv(bool on) { g_check_kv = on ? 1 : 0; }
+
+void KVCache::check() const {
+    if (g_check_kv.load() < 0) {
+        const char* e = std::getenv("TFI_CHECK_KV");
+        g_check_kv = e && *e && std::string(e) != "0" ? 1 : 0;
+    }
+    if (g_check_kv.load() == 0) return;
+    if (cpu_len_ > len_ || gpu_len_ > len_ || std::max(cpu_len_, gpu_len_) != len_)
+        throw std::logic_error("KVCache: up-to-date prefixes " + std::to_string(cpu_len_) + " (CPU), " + std::to_string(gpu_len_) +
+                               " (GPU) for " + std::to_string(len_) + " positions");
+#ifdef TFI_USE_ACCELERATE
+    const int64_t both = std::min(cpu_len_, gpu_len_);
+    if (!gpu_ || both == 0) return;
+    const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
+    for (size_t l = 0; l < k_.size(); ++l) {
+        const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
+        const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l)));
+        const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l)));
+        for (int64_t h = 0; h < H; ++h)
+            if (!std::equal(k_[l].ptr() + h * c * D, k_[l].ptr() + (h * c + both) * D, gk + (h * Tp + base) * D) ||
+                !std::equal(v_[l].ptr() + h * c * D, v_[l].ptr() + (h * c + both) * D, gv + (h * Tp + base) * D))
+                throw std::logic_error("KVCache: the CPU and GPU copies differ in layer " + std::to_string(l));
+    }
+#endif
 }
 
 namespace {
@@ -1093,33 +1186,34 @@ Tensor cache_prefix(const std::vector<Tensor>& t, int64_t layer, int64_t n) {
 }
 }  // namespace
 
-Tensor KVCache::keys(int64_t layer) const { return cache_prefix(k_, layer, len_); }
-Tensor KVCache::values(int64_t layer) const { return cache_prefix(v_, layer, len_); }
+Tensor KVCache::keys(int64_t layer) const {
+    sync_cpu();
+    return cache_prefix(k_, layer, len_);
+}
+Tensor KVCache::values(int64_t layer) const {
+    sync_cpu();
+    return cache_prefix(v_, layer, len_);
+}
 
 void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n) {
-    if (k_.empty()) {
-        k_.resize(k.size());
-        v_.resize(v.size());
-    }
+    if (cpu_len_ != len_) throw std::logic_error("KVCache::append: the CPU side is not up to date");
+    if (k_.empty())
+        for (size_t l = 0; l < k.size(); ++l) {
+            k_.push_back(Tensor({k[l].shape[0], 0, k[l].shape[2]}));
+            v_.push_back(Tensor({v[l].shape[0], 0, v[l].shape[2]}));
+        }
+    reserve_cpu(len_ + n);
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<Tensor>& dst = pass ? v_ : k_;
         const std::vector<Tensor>& src = pass ? v : k;
         for (size_t l = 0; l < src.size(); ++l) {
-            const int64_t H = src[l].shape[0], D = src[l].shape[2];
-            const int64_t cap = dst[l].empty() ? 0 : dst[l].shape[1];
-            if (len_ + n > cap) {  // grow geometrically, with room after a prompt, so appending one position at a time stays linear
-                const int64_t grown = std::max({len_ + n + std::max<int64_t>(16, (len_ + n) / 2), 2 * cap});
-                Tensor t({H, grown, D});
-                for (int64_t h = 0; h < H; ++h)
-                    std::copy(dst[l].ptr() + h * cap * D, dst[l].ptr() + (h * cap + len_) * D, t.ptr() + h * grown * D);
-                dst[l] = std::move(t);
-            }
-            const int64_t c = dst[l].shape[1];
+            const int64_t H = src[l].shape[0], D = src[l].shape[2], c = dst[l].shape[1];
             for (int64_t h = 0; h < H; ++h)
                 std::copy(src[l].ptr() + h * n * D, src[l].ptr() + (h + 1) * n * D, dst[l].ptr() + (h * c + len_) * D);
         }
     }
     len_ += n;
+    cpu_len_ = len_;
 }
 
 Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks, bool last_only) const {
@@ -1132,25 +1226,9 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
                  cache.k_[l].shape[2] == layer_cfgs_[l].head_dim();
         if (!ok) throw std::invalid_argument("forward_cached: the cache holds another model's keys and values");
     }
-    // The new positions' keys and values, as the pass leaves them after any hooks, appended at the end.
-    std::vector<Tensor> new_k(L), new_v(L);
-    std::map<std::string, Tensor*> slots;
-    for (int64_t l = 0; l < L; ++l) {
-        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
-        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
-    }
-    Hooks h;
-    if (hooks) h.extend(*hooks);
-    h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
-                  [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
-
     detail::RowBatch rb;
     rb.add(start, T);
     rb.cached = true;
-    for (int64_t l = 0; l < L && start; ++l) {
-        rb.prefix_k.push_back(&cache.k_[l]);
-        rb.prefix_v.push_back(&cache.v_[l]);
-    }
 #ifdef TFI_USE_ACCELERATE
     // The GPU, with the cache kept there (detail::GpuKV), for: the prompt when a single pass of it would
     // go to the GPU (its keys and values then go straight into the GPU's copy); later chunks of tokens big
@@ -1172,15 +1250,18 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
         }
     }
     if (g) {
-        if (!cache.gpu_ || cache.gpu_->gpu.get() != g) {  // first use, or another model's GPU
+        if (!cache.gpu_ || cache.gpu_->gpu.get() != g || cache.gpu_->regions != 1) {  // first use, or another model's GPU
+            cache.sync_cpu();  // the old GPU copy goes: the CPU must hold everything first
             auto kv = std::make_shared<detail::GpuKV>();
             kv->gpu = gpu_.gpu;
             kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
             cache.gpu_ = std::move(kv);
+            cache.region_ = 0;
             cache.gpu_len_ = 0;
         }
         detail::GpuKV& kv = *cache.gpu_;
-        if (start + T > kv.cap) {  // grow (losing the contents: uploaded again below), with room for what follows
+        if (start + T > kv.cap) {  // grow, which loses the buffers' contents: the CPU must hold everything first
+            cache.sync_cpu();
             kv.cap = std::max({start + T + std::max<int64_t>(256, (start + T) / 2), 2 * kv.cap});
             for (int64_t l = 0; l < L; ++l) {
                 const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim();
@@ -1189,7 +1270,8 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
             }
             cache.gpu_len_ = 0;
         }
-        // Positions the CPU added since (a CPU step, a copy, the buffers growing): up to the GPU.
+        // Positions only the CPU holds (CPU steps, a copy, the buffers growing): up to the GPU. The CPU
+        // holds them all whenever the GPU lacks any (the invariant).
         for (int64_t l = 0; l < L && cache.gpu_len_ < start; ++l) {
             const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
             const int64_t c = cache.k_[l].shape[1], from = cache.gpu_len_;
@@ -1206,12 +1288,32 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
         rb.kv = &kv;
     }
 #endif
+    const bool on_gpu = rb.kv != nullptr;  // the new positions go to the GPU's copy only
+    if (!on_gpu && start) {
+        cache.sync_cpu();
+        for (int64_t l = 0; l < L; ++l) {
+            rb.prefix_k.push_back(&cache.k_[l]);
+            rb.prefix_v.push_back(&cache.v_[l]);
+        }
+    }
+    // On the CPU: the new positions' keys and values, as the pass leaves them after any hooks, appended at the end.
+    std::vector<Tensor> new_k(L), new_v(L);
+    std::map<std::string, Tensor*> slots;
+    for (int64_t l = 0; l < L; ++l) {
+        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
+        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
+    }
+    Hooks h;
+    if (hooks) h.extend(*hooks);
+    if (!on_gpu)
+        h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
+                      [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
+
     Tensor logits;
-    const bool rb_kv_used = rb.kv != nullptr;  // the pass appends the new positions to the cache's GPU copy
-    if (start == 0 && !rb_kv_used) {
+    if (start == 0 && !on_gpu) {
         logits = run_from(0, embed(tokens, &h), &h, last_only);  // the CPU, or a whole pass on the GPU
-    } else if (rb_kv_used) {
-        // Layers, final norm and unembedding in one GPU submission.
+    } else if (on_gpu) {
+        // Layers, final norm and unembedding in one GPU submission; the keys and values appended there.
         run_rows(0, embed(tokens, &h, start), rb, &h, false, &logits, last_only);
         if (cfg_.final_logit_softcap) {
             const float cap = static_cast<float>(*cfg_.final_logit_softcap);
@@ -1224,13 +1326,23 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
         if (last_only) f = last_row(f);
         logits = logits_from_final(f);
     }
-    for (int64_t l = 0; l < L; ++l) {
-        const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
-        if (new_k[l].shape != want || new_v[l].shape != want)
-            throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
+    if (on_gpu) {
+        std::vector<int64_t> heads, dims;
+        for (int64_t l = 0; l < L; ++l) {
+            heads.push_back(layer_cfgs_[l].kv_heads());
+            dims.push_back(layer_cfgs_[l].head_dim());
+        }
+        cache.shapes(heads, dims);
+        cache.len_ = cache.gpu_len_ = start + T;  // the CPU side catches up only when something reads it
+    } else {
+        for (int64_t l = 0; l < L; ++l) {
+            const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
+            if (new_k[l].shape != want || new_v[l].shape != want)
+                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
+        }
+        cache.append(new_k, new_v, T);
     }
-    cache.append(new_k, new_v, T);
-    if (rb_kv_used) cache.gpu_len_ = start + T;  // the pass appended them on the GPU too
+    cache.check();
     return logits;
 }
 
@@ -1248,7 +1360,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     std::vector<int64_t> positions;
     for (int64_t i = 0; i < n_seq; ++i) {
         if (tokens[i].empty()) continue;
-        KVCache& c = kb.caches_[i];
+        const KVCache& c = kb.caches_[i];
         if (c.len_) {
             bool ok = static_cast<int64_t>(c.k_.size()) == L;
             for (int64_t l = 0; ok && l < L; ++l)
@@ -1258,13 +1370,6 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         const int64_t T = static_cast<int64_t>(tokens[i].size());
         seq_of.push_back(i);
         rb.add(c.len_, T);
-        std::vector<const Tensor*> pk, pv;
-        for (int64_t l = 0; l < L && c.len_; ++l) {
-            pk.push_back(&c.k_[l]);
-            pv.push_back(&c.v_[l]);
-        }
-        rb.seg_prefix_k.push_back(std::move(pk));
-        rb.seg_prefix_v.push_back(std::move(pv));
         all.insert(all.end(), tokens[i].begin(), tokens[i].end());
         for (int64_t t = 0; t < T; ++t) positions.push_back(c.len_ + t);
     }
@@ -1272,21 +1377,9 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     if (seq_of.empty()) return out;
     const int64_t S = static_cast<int64_t>(seq_of.size()), R = rb.rows();
 
-    // The new positions' keys and values, (Hkv, R, D) per layer, after any hooks: split per sequence at the end.
-    std::vector<Tensor> new_k(L), new_v(L);
-    std::map<std::string, Tensor*> slots;
-    for (int64_t l = 0; l < L; ++l) {
-        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
-        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
-    }
-    Hooks h;
-    if (hooks) h.extend(*hooks);
-    h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
-                  [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
-
 #ifdef TFI_USE_ACCELERATE
     // The GPU under forward_cached's rules (rows big enough, models large enough, GPU-only mode), with every
-    // sequence's keys and values kept there, a region each.
+    // sequence's keys and values kept there, a region each (each cache's GPU copy is its region).
     detail::Gpu* g = nullptr;
     if (use_gpu() && gpu_attention_fits(layer_cfgs_, 0)) {
         double block_weights = 0;
@@ -1295,32 +1388,42 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         if (detail::gpu_only() || R >= detail::gpu_min_rows() || block_weights >= kDecodeWeights) g = gpu();
     }
     if (g) {
-        if (!kb.gpu_ || kb.gpu_->gpu.get() != g || kb.gpu_->regions != n_seq) {
-            auto kv = std::make_shared<detail::GpuKV>();
-            kv->gpu = gpu_.gpu;
-            kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
-            kv->regions = n_seq;
-            kb.gpu_ = std::move(kv);
-            std::fill(kb.gpu_len_.begin(), kb.gpu_len_.end(), 0);
-        }
-        detail::GpuKV& kv = *kb.gpu_;
         int64_t need = 0;
         for (int64_t sg = 0; sg < S; ++sg) need = std::max(need, rb.start[sg] + rb.len[sg]);
-        if (need > kv.cap) {  // grow every region (losing the contents: uploaded again below)
-            kv.cap = std::max({need + std::max<int64_t>(256, need / 2), 2 * kv.cap});
-            for (int64_t l = 0; l < L; ++l) {
-                const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * n_seq * layer_cfgs_[l].head_dim();
-                kv.seq->reserve(detail::GpuKV::keys(l), n);
-                kv.seq->reserve(detail::GpuKV::values(l), n);
+        const bool fresh = !kb.gpu_ || kb.gpu_->gpu.get() != g || kb.gpu_->regions != n_seq;
+        if (fresh || need > kb.gpu_->cap) {
+            // A new or grown GPU copy loses what the old one held: every sequence's CPU side catches up first.
+            for (const KVCache& c : kb.caches_) c.sync_cpu();
+            if (fresh) {
+                auto kv = std::make_shared<detail::GpuKV>();
+                kv->gpu = gpu_.gpu;
+                kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
+                kv->regions = n_seq;
+                kb.gpu_ = std::move(kv);
             }
-            std::fill(kb.gpu_len_.begin(), kb.gpu_len_.end(), 0);
+            detail::GpuKV& kv = *kb.gpu_;
+            if (need > kv.cap) {
+                kv.cap = std::max({need + std::max<int64_t>(256, need / 2), 2 * kv.cap});
+                for (int64_t l = 0; l < L; ++l) {
+                    const int64_t n = layer_cfgs_[l].kv_heads() * kv.cap * n_seq * layer_cfgs_[l].head_dim();
+                    kv.seq->reserve(detail::GpuKV::keys(l), n);
+                    kv.seq->reserve(detail::GpuKV::values(l), n);
+                }
+            }
+            for (int64_t i = 0; i < n_seq; ++i) {
+                KVCache& c = kb.caches_[i];
+                c.gpu_ = kb.gpu_;
+                c.region_ = i;
+                c.gpu_len_ = 0;
+            }
         }
+        detail::GpuKV& kv = *kb.gpu_;
         const int64_t Tp = kv.cap * n_seq;
-        for (int64_t sg = 0; sg < S; ++sg) {  // positions the GPU's copy is missing, per sequence
-            const int64_t i = seq_of[sg], start = rb.start[sg], from = kb.gpu_len_[i];
-            const KVCache& c = kb.caches_[i];
-            for (int64_t l = 0; l < L && from < start; ++l) {
-                const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim(), cc = c.k_[l].shape[1];
+        for (int64_t sg = 0; sg < S; ++sg) {  // positions only the CPU holds, per sequence, up to its region
+            const int64_t i = seq_of[sg], start = rb.start[sg];
+            KVCache& c = kb.caches_[i];
+            for (int64_t l = 0; l < L && c.gpu_len_ < start; ++l) {
+                const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim(), cc = c.k_[l].shape[1], from = c.gpu_len_;
                 float* gk = kv.seq->data(detail::GpuKV::keys(l));
                 float* gv = kv.seq->data(detail::GpuKV::values(l));
                 for (int64_t hh = 0; hh < Hkv; ++hh) {
@@ -1329,7 +1432,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
                     std::copy(c.v_[l].ptr() + (hh * cc + from) * D, c.v_[l].ptr() + (hh * cc + start) * D, gv + (base + from) * D);
                 }
             }
-            kb.gpu_len_[i] = start;
+            c.gpu_len_ = start;
             rb.kbase.push_back(i * kv.cap);
         }
         rb.gpu = g;
@@ -1337,12 +1440,37 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         rb.kv = &kv;
     }
 #endif
+    const bool on_gpu = rb.kv != nullptr;  // the new positions go to the GPU's copy only
+    if (!on_gpu)
+        for (int64_t sg = 0; sg < S; ++sg) {  // each sequence's CPU side, up to date, as its prefix
+            const KVCache& c = kb.caches_[seq_of[sg]];
+            c.sync_cpu();
+            std::vector<const Tensor*> pk, pv;
+            for (int64_t l = 0; l < L && c.len_; ++l) {
+                pk.push_back(&c.k_[l]);
+                pv.push_back(&c.v_[l]);
+            }
+            rb.seg_prefix_k.push_back(std::move(pk));
+            rb.seg_prefix_v.push_back(std::move(pv));
+        }
+    // On the CPU: the new positions' keys and values, (Hkv, R, D) per layer, after any hooks, split per sequence at the end.
+    std::vector<Tensor> new_k(L), new_v(L);
+    std::map<std::string, Tensor*> slots;
+    for (int64_t l = 0; l < L; ++l) {
+        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
+        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
+    }
+    Hooks h;
+    if (hooks) h.extend(*hooks);
+    if (!on_gpu)
+        h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
+                      [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
+
     // Each sequence's rows of a (rows, width) tensor, (len, width).
     auto seg_rows = [&](const Tensor& t, int64_t sg, bool last) {
         const int64_t w = t.shape[1], r0 = rb.offset[sg] + (last ? rb.len[sg] - 1 : 0), n = last ? 1 : rb.len[sg];
         return Tensor({n, w}, std::vector<float>(t.ptr() + r0 * w, t.ptr() + (r0 + n) * w));
     };
-    const bool on_gpu = rb.kv != nullptr;
     Tensor x = embed_at(all, positions, &h);
     if (on_gpu) {
         Tensor logits;  // each sequence's last row, or every row
@@ -1355,33 +1483,42 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
             const int64_t V = logits.shape[1], r0 = last_only ? sg : rb.offset[sg], n = last_only ? 1 : rb.len[sg];
             out[seq_of[sg]] = Tensor({n, V}, std::vector<float>(logits.ptr() + r0 * V, logits.ptr() + (r0 + n) * V));
         }
+        std::vector<int64_t> heads, dims;
+        for (int64_t l = 0; l < L; ++l) {
+            heads.push_back(layer_cfgs_[l].kv_heads());
+            dims.push_back(layer_cfgs_[l].head_dim());
+        }
+        for (int64_t sg = 0; sg < S; ++sg) {  // appended on the GPU; the CPU side catches up only when something reads it
+            KVCache& c = kb.caches_[seq_of[sg]];
+            c.shapes(heads, dims);
+            c.len_ = c.gpu_len_ = rb.start[sg] + rb.len[sg];
+        }
     } else {
         x = run_rows(0, std::move(x), rb, &h);
         Tensor f = final_norm(x);
         hook(&h, "hook_final", f);
         for (int64_t sg = 0; sg < S; ++sg) out[seq_of[sg]] = logits_from_final(seg_rows(f, sg, last_only));
-    }
-    // Every sequence's new keys and values, appended to its cache.
-    for (int64_t l = 0; l < L; ++l) {
-        const Shape want{layer_cfgs_[l].kv_heads(), R, layer_cfgs_[l].head_dim()};
-        if (new_k[l].shape != want || new_v[l].shape != want)
-            throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
-    }
-    for (int64_t sg = 0; sg < S; ++sg) {
-        const int64_t i = seq_of[sg], n = rb.len[sg], off = rb.offset[sg];
-        std::vector<Tensor> k(L), v(L);
         for (int64_t l = 0; l < L; ++l) {
-            const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
-            k[l] = Tensor({Hkv, n, D});
-            v[l] = Tensor({Hkv, n, D});
-            for (int64_t hh = 0; hh < Hkv; ++hh) {
-                std::copy(new_k[l].ptr() + (hh * R + off) * D, new_k[l].ptr() + (hh * R + off + n) * D, k[l].ptr() + hh * n * D);
-                std::copy(new_v[l].ptr() + (hh * R + off) * D, new_v[l].ptr() + (hh * R + off + n) * D, v[l].ptr() + hh * n * D);
-            }
+            const Shape want{layer_cfgs_[l].kv_heads(), R, layer_cfgs_[l].head_dim()};
+            if (new_k[l].shape != want || new_v[l].shape != want)
+                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
         }
-        kb.caches_[i].append(k, v, n);
-        if (on_gpu) kb.gpu_len_[i] = rb.start[sg] + n;
+        for (int64_t sg = 0; sg < S; ++sg) {
+            const int64_t i = seq_of[sg], n = rb.len[sg], off = rb.offset[sg];
+            std::vector<Tensor> k(L), v(L);
+            for (int64_t l = 0; l < L; ++l) {
+                const int64_t Hkv = layer_cfgs_[l].kv_heads(), D = layer_cfgs_[l].head_dim();
+                k[l] = Tensor({Hkv, n, D});
+                v[l] = Tensor({Hkv, n, D});
+                for (int64_t hh = 0; hh < Hkv; ++hh) {
+                    std::copy(new_k[l].ptr() + (hh * R + off) * D, new_k[l].ptr() + (hh * R + off + n) * D, k[l].ptr() + hh * n * D);
+                    std::copy(new_v[l].ptr() + (hh * R + off) * D, new_v[l].ptr() + (hh * R + off + n) * D, v[l].ptr() + hh * n * D);
+                }
+            }
+            kb.caches_[i].append(k, v, n);
+        }
     }
+    for (int64_t sg = 0; sg < S; ++sg) kb.caches_[seq_of[sg]].check();
     return out;
 }
 

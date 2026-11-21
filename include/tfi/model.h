@@ -75,19 +75,20 @@ class Model;
 // The keys and values every layer computed for the positions of a sequence run so far (after qk_norm
 // and RoPE, as hook_k and hook_v see them), so that Model::forward_cached runs only new tokens. A copy
 // continues on its own: several continuations of one prompt can share its prefill.
+//
+// Two places may hold them: the CPU's tensors and (macOS, when steps run on the GPU) the GPU's buffers,
+// so that a sequence generated on the GPU isn't kept twice. Both are prefixes of the sequence, since a
+// cache only grows at its end or is truncated there: positions [0, cpu_len_) are up to date on the CPU,
+// [0, gpu_len_) on the GPU, and every position on at least one side (max(cpu_len_, gpu_len_) == size()).
+// GPU steps append on the GPU only; whatever reads the CPU side (a CPU step, keys() / values(), a copy, the
+// GPU's buffers growing) first brings it up to date. A cache is not safe to use from two threads at once,
+// keys() and values() included.
 class KVCache {
   public:
     KVCache() = default;
-    // A copy has the keys and values, not the GPU copy of them: it makes its own when it needs one.
-    KVCache(const KVCache& o) : k_(o.k_), v_(o.v_), len_(o.len_) {}
-    KVCache& operator=(const KVCache& o) {
-        k_ = o.k_;
-        v_ = o.v_;
-        len_ = o.len_;
-        gpu_.reset();
-        gpu_len_ = 0;
-        return *this;
-    }
+    // A copy has the keys and values (on the CPU), not the GPU copy of them: it makes its own when it needs one.
+    KVCache(const KVCache& o);
+    KVCache& operator=(const KVCache& o);
     KVCache(KVCache&&) = default;
     KVCache& operator=(KVCache&&) = default;
 
@@ -101,31 +102,45 @@ class KVCache {
 
   private:
     friend class Model;
-    // Per layer (Hkv, capacity, D), positions [0, len_) in use: room to grow without copying each step.
-    std::vector<Tensor> k_, v_;
+    friend class KVBatch;
+    // Per layer (Hkv, capacity, D): room to grow without copying each step. Mutable: reading the CPU side
+    // brings it up to date from the GPU first.
+    mutable std::vector<Tensor> k_, v_;
     int64_t len_ = 0;
-    // macOS: the same keys and values on the GPU, positions [0, gpu_len_) up to date (see forward_cached).
+    mutable int64_t cpu_len_ = 0;
+    // macOS: the GPU's copy (its region `region_` of the buffers: a KVBatch keeps every sequence's in one).
     std::shared_ptr<detail::GpuKV> gpu_;
+    int64_t region_ = 0;
     int64_t gpu_len_ = 0;
-    void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);
+    void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);  // on the CPU, which is up to date
+    void sync_cpu() const;                // [cpu_len_, size()) from the GPU
+    void reserve_cpu(int64_t n) const;    // CPU capacity for n positions, keeping [0, cpu_len_)
+    void shapes(const std::vector<int64_t>& heads, const std::vector<int64_t>& dims);  // per-layer shapes, if none yet
+    void check() const;                   // with TFI_CHECK_KV set: the invariant, and both sides equal where both hold
 };
 
 // Several sequences' KV caches, continued together by Model::forward_cached's batched form: each call
 // stacks the sequences given tokens into one pass, so the weights are read once for all of them. The
 // caches are read-only from outside (a sequence's history changes only through the batch, which keeps a
-// GPU copy of all of them in step).
+// GPU copy of all of them, a region each). A copy has the keys and values, not the GPU copy.
 class KVBatch {
   public:
-    explicit KVBatch(int64_t n = 0) : caches_(static_cast<size_t>(n)), gpu_len_(static_cast<size_t>(n), 0) {}
+    explicit KVBatch(int64_t n = 0) : caches_(static_cast<size_t>(n)) {}
+    KVBatch(const KVBatch& o) : caches_(o.caches_) {}
+    KVBatch& operator=(const KVBatch& o) {
+        caches_ = o.caches_;
+        gpu_.reset();
+        return *this;
+    }
+    KVBatch(KVBatch&&) = default;
+    KVBatch& operator=(KVBatch&&) = default;
     int64_t size() const { return static_cast<int64_t>(caches_.size()); }
     const KVCache& operator[](int64_t i) const { return caches_.at(static_cast<size_t>(i)); }
 
   private:
     friend class Model;
     std::vector<KVCache> caches_;
-    // macOS: every sequence's keys and values on the GPU, a region each; gpu_len_[i]: positions up to date.
-    std::shared_ptr<detail::GpuKV> gpu_;
-    std::vector<int64_t> gpu_len_;
+    std::shared_ptr<detail::GpuKV> gpu_;  // macOS: every sequence's keys and values on the GPU, a region each
 };
 
 class Model {

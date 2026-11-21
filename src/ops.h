@@ -69,6 +69,9 @@ AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& d
 // For tests: rows per batched pass (residual-stream patching; head patching, ablation and
 // reference means); 0 restores the defaults.
 void set_patch_batch_rows(int64_t residual, int64_t heads);
+// For tests: check every KV cache after each forward_cached step (KVCache::check: the up-to-date prefixes
+// of its CPU and GPU copies, and their values where both hold them), as TFI_CHECK_KV=1 does.
+void set_check_kv(bool on);
 // For tests (macOS): false runs a batched pass's GPU work one linear layer at a time, the residual
 // stream returning to the CPU after each, instead of keeping it on the GPU (Model::run_rows).
 void set_gpu_resident(bool on);
