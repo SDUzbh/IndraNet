@@ -2765,6 +2765,9 @@ static void test_gpu_wide_heads() {
 // float32 weights holding the same rounded values, bit for bit (on 1-4 rows); the same with one thread
 // or many.
 static void test_linear_few_rows() {
+#ifdef __VERSION__
+    std::printf("  DIAG compiler %s\n", __VERSION__);
+#endif
     std::mt19937_64 rng(5);
     std::normal_distribution<float> normal(0.f, 1.f);
     for (const auto& [in, out] : std::vector<std::pair<int64_t, int64_t>>{{16, 50}, {13, 7}, {2048, 300}, {5, 70000}}) {
@@ -2794,10 +2797,32 @@ static void test_linear_few_rows() {
                 CHECK(linear(x, w16, &b).data == linear(x, rounded, &b).data);  // 17: the library's blocks
                 // A row's output doesn't depend on the other rows (groups of 4 each run as 1-4 rows would).
                 for (const Weight* wp : {&w32, &w16}) {
-                    const Tensor all = linear(x, *wp, &b);
-                    for (int64_t r = 0; r < rows; ++r)
-                        CHECK(linear(tfi::rows(x, r, r + 1), *wp, &b).data ==
-                              std::vector<float>(all.ptr() + r * out, all.ptr() + (r + 1) * out));
+                    const Tensor all = linear(x, *wp, &b), nob = linear(x, *wp);
+                    const Tensor dense = wp->to_tensor();
+                    int64_t bad = 0, bad_nob = 0, shown = 0;
+                    for (int64_t r = 0; r < rows; ++r) {
+                        const Tensor one = linear(tfi::rows(x, r, r + 1), *wp, &b), one_nob = linear(tfi::rows(x, r, r + 1), *wp);
+                        for (int64_t j = 0; j < out; ++j) {
+                            bad_nob += one_nob.data[j] != nob.data[r * out + j];
+                            if (one.data[j] == all.data[r * out + j]) continue;
+                            ++bad;
+                            if (shown++ < 3) {
+                                float seq = b.f32().data[j] * 0.f, acc = 0.f;  // plain sequential float sum
+                                for (int64_t k = 0; k < in; ++k) {
+                                    const float p = x.data[r * in + k] * dense.data[j * in + k];
+                                    acc += p;
+                                }
+                                seq = acc;
+                                std::printf("  DIAG in %lld out %lld rows %lld %s r %lld j %lld: alone %a group %a | no bias alone %a group %a | sequential %a\n",
+                                            (long long)in, (long long)out, (long long)rows, wp == &w32 ? "f32" : "f16", (long long)r, (long long)j,
+                                            one.data[j], all.data[r * out + j], one_nob.data[j], nob.data[r * out + j], seq);
+                            }
+                        }
+                    }
+                    if (bad || bad_nob)
+                        std::printf("  DIAG in %lld out %lld rows %lld %s: %lld differ with bias, %lld without, of %lld\n", (long long)in, (long long)out,
+                                    (long long)rows, wp == &w32 ? "f32" : "f16", (long long)bad, (long long)bad_nob, (long long)(rows * out));
+                    CHECK(bad == 0);
                 }
             }
             set_num_threads(1);
