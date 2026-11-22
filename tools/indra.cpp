@@ -84,8 +84,9 @@ Precision
                                significant digits (relative error up to 5e-4); patch / ablate /
                                circuits also give the GPU's multiplies fp16 inputs, which is faster.
                                Errors around 1e-3 on the patching metric (fine for gaps of 1 or
-                               more) and around 1e-4 on ablation's loss increases. Arithmetic stays
-                               float32.
+                               more) and around 1e-4 on ablation's loss increases. generate also
+                               keeps its KV cache in fp16: half the memory, keys and values rounded
+                               like the weights. Arithmetic stays float32.
                                A file written with export_model(..., dtype="float16") already
                                holds fp16 weights: --fp16 loads them as they are, --fp32 widens them.
 )";

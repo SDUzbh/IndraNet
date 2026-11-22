@@ -178,11 +178,20 @@ kernel void copy_k(device const float* x [[buffer(0)]], device float* y [[buffer
 
 // rows of keys or values (rows, heads * D) into a cache (heads, cap, D) at positions start, start + 1, ...
 struct KvArgs { uint rows, heads, D, cap, start; };
-kernel void kv_append_k(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]], constant KvArgs& a [[buffer(2)]],
-                        uint i [[thread_position_in_grid]]) {
+template <typename PT>
+kernel void kv_append_kt(device const float* src [[buffer(0)]], device PT* dst [[buffer(1)]], constant KvArgs& a [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
     if (i >= a.rows * a.heads * a.D) return;
     const uint d = i % a.D, t = i / a.D, g = t % a.heads, r = t / a.heads;
-    dst[(ulong(g) * a.cap + a.start + r) * a.D + d] = src[i];
+    dst[(ulong(g) * a.cap + a.start + r) * a.D + d] = PT(src[i]);
+}
+template [[host_name("kv_append_k")]] kernel decltype(kv_append_kt<float>) kv_append_kt<float>;
+template [[host_name("kv_append_k_h")]] kernel decltype(kv_append_kt<half>) kv_append_kt<half>;
+
+// x = x rounded to fp16 (clamped to its finite range), in place: what a KV cache kept in fp16 will hold,
+// before attention reads it, so that every position's keys and values are the same rounded values.
+kernel void round_half_k(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) x[i] = float(half(clamp(x[i], -65504.0f, 65504.0f)));
 }
 
 struct BiasArgs { uint n, cols; };
@@ -253,12 +262,11 @@ kernel void rope_pass_k(device const float* x [[buffer(0)]], device float* y [[b
 // Causal attention, one threadgroup per (row, head): the row's allowed keys in tiles of 1024 with a
 // running softmax (max m, sum l), the weighted values accumulated per dimension (at most 4 per thread).
 struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
-kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
-                   device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
-                   device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                   device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
-                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+// The attention kernels read earlier positions' keys and values (pk, pv) as PT: float, or half for a KV
+// cache kept in fp16 (the _h variants). Written once, instantiated for both.
+#define ATTN_K_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* z [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]
+template <typename PT>
+kernel void attn_kt(ATTN_K_PARAMS(PT)) {
     threadgroup float qs[512];
     threadgroup float ss[1024];
     threadgroup float part[32];
@@ -276,9 +284,14 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
         float cmax = -INFINITY;
         for (uint jj = tid; jj < n; jj += tg) {
             const uint j = c0 + jj;
-            device const float* kr = j < start ? pk + (ulong(g) * a.Tp + kb + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
             float s = 0.f;
-            for (uint d = 0; d < D; ++d) s += qs[d] * kr[d];
+            if (j < start) {
+                device const PT* kr = pk + (ulong(g) * a.Tp + kb + j) * D;
+                for (uint d = 0; d < D; ++d) s += qs[d] * float(kr[d]);
+            } else {
+                device const float* kr = k + (ulong(off + j - start) * a.Hkv + g) * D;
+                for (uint d = 0; d < D; ++d) s += qs[d] * kr[d];
+            }
             s *= a.scale;
             if (a.cap != 0.f) s = a.cap * vtanh(s / a.cap);
             if (slope != 0.f) s += -slope * float(pos - j);
@@ -300,8 +313,7 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
             float s = acc[t] * keep;
             for (uint jj = 0; jj < n; ++jj) {
                 const uint j = c0 + jj;
-                device const float* vr = j < start ? pv + (ulong(g) * a.Tp + kb + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
-                s += ss[jj] * vr[d];
+                s += ss[jj] * (j < start ? float(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
             }
             acc[t] = s;
         }
@@ -313,19 +325,17 @@ kernel void attn_k(device const float* q [[buffer(0)]], device const float* k [[
     for (uint d = tid; d < D; d += tg, ++t) zr[d] = acc[t] / l;
     if (a.has_lse != 0 && tid == 0) lse[ulong(r) * a.H + h] = m + log(l);
 }
+template [[host_name("attn_k")]] kernel void attn_kt<float>(ATTN_K_PARAMS(float));
+template [[host_name("attn_k_h")]] kernel void attn_kt<half>(ATTN_K_PARAMS(half));
 
 // Split-key attention for few rows over many keys (a generated token's pass): the row's allowed keys
 // in chunks of kSplitKeys, one threadgroup per (row, head, chunk), each writing its chunk's max m, sum
 // l and weighted values (D) to `part`; attn_combine_k merges each (row, head)'s chunks into z. The same
 // scores, masks and softmax as attn_k, so many threadgroups share a long context instead of one.
 constant uint kSplitKeys = 256;
-kernel void attn_split_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
-                         device float* part [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
-                         device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                         constant uint& nsplit [[buffer(9)]], device const uint* kbase [[buffer(10)]],
-                         uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                         uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                         uint nsg [[simdgroups_per_threadgroup]]) {
+#define ATTN_SPLIT_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* part [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], constant uint& nsplit [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]
+template <typename PT>
+kernel void attn_split_kt(ATTN_SPLIT_PARAMS(PT)) {
     threadgroup float qs[512];
     threadgroup float ss[kSplitKeys];
     threadgroup float red[32];
@@ -350,9 +360,14 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
     float cmax = -INFINITY;
     for (uint jj = tid; jj < n; jj += tg) {
         const uint j = c0 + jj;
-        device const float* kr = j < start ? pk + (ulong(g) * a.Tp + kb + j) * D : k + (ulong(off + j - start) * a.Hkv + g) * D;
         float sc = 0.f;
-        for (uint d = 0; d < D; ++d) sc += qs[d] * kr[d];
+        if (j < start) {
+            device const PT* kr = pk + (ulong(g) * a.Tp + kb + j) * D;
+            for (uint d = 0; d < D; ++d) sc += qs[d] * float(kr[d]);
+        } else {
+            device const float* kr = k + (ulong(off + j - start) * a.Hkv + g) * D;
+            for (uint d = 0; d < D; ++d) sc += qs[d] * kr[d];
+        }
         sc *= a.scale;
         if (a.cap != 0.f) sc = a.cap * vtanh(sc / a.cap);
         if (slope != 0.f) sc += -slope * float(pos - j);
@@ -371,8 +386,7 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
         float acc = 0.f;
         for (uint jj = 0; jj < n; ++jj) {
             const uint j = c0 + jj;
-            device const float* vr = j < start ? pv + (ulong(g) * a.Tp + kb + j) * D : v + (ulong(off + j - start) * a.Hkv + g) * D;
-            acc += ss[jj] * vr[d];
+            acc += ss[jj] * (j < start ? float(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
         }
         out[2 + d] = acc;
     }
@@ -381,6 +395,8 @@ kernel void attn_split_k(device const float* q [[buffer(0)]], device const float
         out[1] = lsum;
     }
 }
+template [[host_name("attn_split_k")]] kernel void attn_split_kt<float>(ATTN_SPLIT_PARAMS(float));
+template [[host_name("attn_split_k_h")]] kernel void attn_split_kt<half>(ATTN_SPLIT_PARAMS(half));
 
 // attn_split_k's chunks of one (row, head) per threadgroup: rescaled to the largest max, summed, into z.
 kernel void attn_combine_k(device const float* part [[buffer(0)]], device float* z [[buffer(1)]], constant AttnArgs& a [[buffer(2)]],
@@ -587,11 +603,9 @@ kernel void attn_bwd_dkv_k(device const float* q [[buffer(0)]], device const flo
 #define AQ 32
 #define AK 16
 #define AD 128
-kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
-                       device float* z [[buffer(3)]], device const float* pk [[buffer(4)]], device const float* pv [[buffer(5)]],
-                       device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]],
-                       device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]],
-                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+#define ATTN_MMA_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* z [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+template <typename PT>
+kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
     threadgroup float sh[AQ * AD];          // the block's queries, then each tile's keys and values
     threadgroup float* Ks = sh;
     threadgroup float* Vs = sh + AK * AD;
@@ -627,8 +641,8 @@ kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* 
             float kv = 0.f, vv = 0.f;
             if (j <= last) {
                 const ulong src = j < start ? (ulong(g) * a.Tp + kb + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
-                kv = j < start ? pk[src] : k[src];
-                vv = j < start ? pv[src] : v[src];
+                kv = j < start ? float(pk[src]) : k[src];
+                vv = j < start ? float(pv[src]) : v[src];
             }
             Ks[e] = kv;
             Vs[e] = vv;
@@ -690,6 +704,8 @@ kernel void attn_mma_k(device const float* q [[buffer(0)]], device const float* 
     }
     if (a.has_lse != 0 && fn == 0) lse[ulong(off + qi) * a.H + h] = m + log(l);
 }
+template [[host_name("attn_mma_k")]] kernel void attn_mma_kt<float>(ATTN_MMA_PARAMS(float));
+template [[host_name("attn_mma_k_h")]] kernel void attn_mma_kt<half>(ATTN_MMA_PARAMS(half));
 
 // One threadgroup per block: the sum of squares of a bm x bn block of a matrix with row stride ld.
 struct BlockArgs { uint ld, bm, bn, nbc; };
@@ -922,6 +938,8 @@ struct Gpu::Impl {
     // Gpu::Seq's kernels, compiled on first use.
     std::once_flag kernels_once;
     id<MTLComputePipelineState> kv_append_k, attn_split_k, attn_combine_k;
+    // ... with earlier positions' keys and values in fp16 (a KV cache kept in fp16), and the rounding to it
+    id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, attn_mma_k_h, round_half_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
         block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
 
@@ -946,6 +964,8 @@ struct Gpu::Impl {
                 add_k = make("add_k");
                 copy_k = make("copy_k");
                 kv_append_k = make("kv_append_k");
+                kv_append_k_h = make("kv_append_k_h");
+                round_half_k = make("round_half_k");
                 bias_k = make("bias_k");
                 half_k = make("half_k");
                 norm_k = make("norm_k");
@@ -959,6 +979,9 @@ struct Gpu::Impl {
                 attn_k = make("attn_k");
                 attn_mma_k = make("attn_mma_k");
                 attn_split_k = make("attn_split_k");
+                attn_k_h = make("attn_k_h");
+                attn_mma_k_h = make("attn_mma_k_h");
+                attn_split_k_h = make("attn_split_k_h");
                 attn_combine_k = make("attn_combine_k");
                 attn_delta_k = make("attn_delta_k");
                 attn_bwd_dq_k = make("attn_bwd_dq_k");
@@ -1098,7 +1121,7 @@ struct Gpu::Seq::Impl {
         int64_t floats = 0;
     };
     struct Op {
-        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply, KvAppend } kind;
+        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply, KvAppend, RoundHalf } kind;
         int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0, j = -1;
         int kb = -1;                     // Attention: each row's start in pk / pv (uint), or none
         int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
@@ -1348,15 +1371,26 @@ struct Gpu::Seq::Impl {
                 dispatch(op.kind == Op::Act ? g.act_k : g.glu_k, op.n);
                 break;
             }
-            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start
+            case Op::RoundHalf: {
+                need(op.a, op.n);
+                if (op.n == 0) break;
+                const uint32_t cnt = u32(op.n);
+                id<MTLComputeCommandEncoder> e = compute();
+                [e setComputePipelineState:g.round_half_k];
+                [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                [e setBytes:&cnt length:sizeof cnt atIndex:1];
+                dispatch(g.round_half_k, op.n);
+                break;
+            }
+            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, inverse = an fp16 cache
                 const int64_t n = op.rows * op.heads * op.D;
                 need(op.a, op.offset + n);
-                need(op.c, op.heads * op.n * op.D);
+                need(op.c, op.inverse ? (op.heads * op.n * op.D + 1) / 2 : op.heads * op.n * op.D);  // inverse: an fp16 cache
                 if (op.rot + op.rows > op.n) throw std::logic_error("Gpu::Seq: kv_append past the cache's capacity");
                 if (n == 0) break;
                 const KvArgs args{u32(op.rows), u32(op.heads), u32(op.D), u32(op.n), u32(op.rot)};
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:g.kv_append_k];
+                [e setComputePipelineState:op.inverse ? g.kv_append_k_h : g.kv_append_k];
                 [e setBuffer:slot(op.a).buf offset:static_cast<NSUInteger>(op.offset) * sizeof(float) atIndex:0];
                 [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
                 [e setBytes:&args length:sizeof args atIndex:2];
@@ -1401,8 +1435,9 @@ struct Gpu::Seq::Impl {
                 need(op.b, A.rows * A.Hkv * A.D);
                 need(op.d, A.rows * A.Hkv * A.D);
                 need(op.c, A.rows * A.H * A.D);
-                need(op.e, std::max<int64_t>(A.Hkv * A.Tp * A.D, 1));
-                need(op.f, std::max<int64_t>(A.Hkv * A.Tp * A.D, 1));
+                const int64_t prefix = A.half_prefix ? (A.Hkv * A.Tp * A.D + 1) / 2 : A.Hkv * A.Tp * A.D;  // in floats
+                need(op.e, std::max<int64_t>(prefix, 1));
+                need(op.f, std::max<int64_t>(prefix, 1));
                 need(op.g, 4 * A.rows);
                 if (A.has_slopes) need(op.h, A.H);
                 if (op.j >= 0) need(op.j, A.rows * A.H);
@@ -1423,7 +1458,7 @@ struct Gpu::Seq::Impl {
                     }
                     const uint32_t ns = u32(nsplit);
                     id<MTLComputeCommandEncoder> e = compute();
-                    [e setComputePipelineState:g.attn_split_k];
+                    [e setComputePipelineState:A.half_prefix ? g.attn_split_k_h : g.attn_split_k];
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                     [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
                     [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
@@ -1450,7 +1485,7 @@ struct Gpu::Seq::Impl {
                 const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
                 if (tiled) need(op.i, 4 * A.blocks);
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:tiled ? g.attn_mma_k : g.attn_k];
+                [e setComputePipelineState:tiled ? (A.half_prefix ? g.attn_mma_k_h : g.attn_mma_k) : (A.half_prefix ? g.attn_k_h : g.attn_k)];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                 [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
                 [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
@@ -1600,7 +1635,7 @@ struct Gpu::Seq::Impl {
             half_valid[op.d] = false;
             half_valid[op.e] = false;
         } else {
-            half_valid[op.kind == Op::Act || op.kind == Op::Glu ? op.a : op.c] = false;
+            half_valid[op.kind == Op::Act || op.kind == Op::Glu || op.kind == Op::RoundHalf ? op.a : op.c] = false;
         }
     }
 
@@ -1768,10 +1803,19 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row) {
+void Gpu::Seq::round_half(int x, int64_t n) {
+    Impl::Op op{Impl::Op::RoundHalf};
+    op.a = x;
+    op.n = n;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row,
+                         bool half) {
     if (src == dst) throw std::invalid_argument("Gpu::Seq: kv_append into the slot it reads");
     if (src_row < 0) throw std::invalid_argument("Gpu::Seq: negative kv_append row");
     Impl::Op op{Impl::Op::KvAppend};
+    op.inverse = half;
     op.offset = src_row * heads * D;
     op.a = src;
     op.c = dst;

@@ -82,7 +82,11 @@ class Gpu::Seq {
     void copy(int x, int y, int64_t n, int64_t x_offset = 0, int64_t y_offset = 0);  // y[y_offset..][0, n) = x[x_offset..][0, n)
     // A KV cache's new positions: rows src_row.. of `src` (rows, heads * D) into `dst` (heads, cap, D), as
     // positions start .. start + rows - 1 (start + rows <= cap).
-    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row = 0);
+    // With half, dst holds fp16 values (2 per float of the slot), each rounded as it is written.
+    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row = 0,
+                   bool half = false);
+    // x[0, n) rounded to fp16 values (clamped to fp16's finite range), in place.
+    void round_half(int x, int64_t n);
     // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
     // norm()'s input gradient given its input x and output gradient dy (as grad.cpp's norm_backward);
     // dpre = dpost * act'(pre); and for a GLU, post = act(pre) * up: dpre = dpost * up * act'(pre),
@@ -110,6 +114,7 @@ class Gpu::Seq {
         float scale, cap;
         bool has_slopes;
         int64_t blocks = 0;
+        bool half_prefix = false;  // pk / pv hold fp16 values (a KV cache kept in fp16), 2 per float of the slot
     };
     // lse >= 0: also each (row, head)'s log of the sum of exp(score) into that slot (rows, H), for
     // attention_backward.
@@ -157,6 +162,7 @@ struct GpuKV {
     std::unique_ptr<Gpu::Seq> seq;
     int64_t cap = 0;                    // positions each sequence's region of a layer's slots holds
     int64_t regions = 1;                // sequences (a KVBatch's), region r at positions r * cap ..
+    bool half = false;                  // keys and values held as fp16 (a model with fp16 weights), 2 per float of a slot
     static int keys(int64_t layer) { return kSlot0 + 5 * static_cast<int>(layer); }
     static int values(int64_t layer) { return keys(layer) + 1; }
     static int inv_freq(int64_t layer) { return keys(layer) + 2; }

@@ -3030,6 +3030,72 @@ static void test_generate_batch(const Model& m) {
     CHECK(generate_batch(m, {}, o).empty());
 }
 
+// Hooks rounding every layer's keys and values to fp16 values (clamped to fp16's range): what a model with
+// fp16 weights stores in its KV cache, as a whole pass's reference.
+static Hooks round_kv_to_half(const Model& m) {
+    Hooks h;
+    for (int64_t l = 0; l < m.cfg().n_layers; ++l)
+        for (const char* n : {".attn.hook_k", ".attn.hook_v"})
+            h.add("blocks." + std::to_string(l) + n, [](const std::string&, Tensor& a) {
+                for (float& v : a.data) v = detail::half_to_float(detail::float_to_half(std::clamp(v, -65504.f, 65504.f)));
+            });
+    return h;
+}
+
+// With fp16 weights the KV cache holds fp16 values: cached decoding (in chunks, and a batch) = the whole pass
+// with keys and values rounded to fp16, up to an fp16 step where the two round differently; keys() are
+// fp16 values; overflow is clamped, not infinite; a float32 model can't continue the cache, nor the reverse.
+static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
+    const Hooks round = round_kv_to_half(m16);
+    const Tokens t = seq(12, 74);
+    ActivationCache acts;
+    const Tensor want = m16.run_with_cache(t, acts, nullptr, &round);
+    auto close = [](const Tensor& got, const Tensor& w) {  // an fp16 step of difference in a key moves logits by ~1e-3
+        CHECK(got.shape == w.shape);
+        const float sc = max_abs(w);
+        for (int64_t i = 0; i < got.numel() && got.shape == w.shape; ++i)
+            CHECK_NEAR(got.data[i], w.data[i], 2e-3 * std::max(1.f, std::fabs(w.data[i])) + 1e-4 * sc);
+    };
+    KVCache cache;
+    std::vector<Tensor> parts{m16.forward_cached(Tokens(t.begin(), t.begin() + 6), cache)};
+    for (int64_t i : {6, 7}) parts.push_back(m16.forward_cached({t[i]}, cache));
+    parts.push_back(m16.forward_cached(Tokens(t.begin() + 8, t.end()), cache));
+    close(stack_rows(parts), want);
+    for (int64_t l = 0; l < m16.cfg().n_layers; ++l) {
+        const Tensor k = cache.keys(l);
+        close(k, acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+        bool exact = true;  // every stored value an fp16 one
+        for (float v : k.data) exact = exact && detail::half_to_float(detail::float_to_half(v)) == v;
+        CHECK(exact);
+    }
+    KVBatch batch(2);
+    const std::vector<Tensor> two = m16.forward_cached({Tokens(t.begin(), t.begin() + 5), Tokens(t.begin(), t.begin() + 9)}, batch);
+    close(two[0], rows(want, 0, 5));
+    close(two[1], rows(want, 0, 9));
+    // overflow: keys pushed past fp16's range are clamped to it, not infinite, and each step's own rows are
+    // rounded (so clamped) before attention reads them, as the earlier positions are: = the whole pass that
+    // pushes them, then rounds. (Not rounding a step's rows first would make it attend to ~1e6, not 65504.)
+    Hooks huge;
+    huge.add("blocks.0.attn.hook_k", [](const std::string&, Tensor& a) { for (float& v : a.data) v *= 1e6f; });
+    Hooks huge_then_round;
+    huge_then_round.extend(huge).extend(round);
+    const Tensor want_big = m16.forward(t, &huge_then_round);
+    KVCache big;
+    std::vector<Tensor> big_parts{m16.forward_cached(Tokens(t.begin(), t.begin() + 4), big, &huge)};
+    for (int64_t i : {4, 5, 6}) big_parts.push_back(m16.forward_cached({t[i]}, big, &huge));
+    close(stack_rows(big_parts), rows(want_big, 0, 7));
+    bool finite = true;
+    for (float v : big.keys(0).data) finite = finite && std::isfinite(v) && std::fabs(v) <= 65504.f;
+    CHECK(finite);
+    // precisions don't mix
+    const Model m32 = random_model(cfg, 42);
+    CHECK_THROWS(m32.forward_cached({1}, cache));
+    KVCache c32;
+    m32.forward_cached({1, 2}, c32);
+    CHECK_THROWS(m16.forward_cached({3}, c32));
+    CHECK_THROWS(m32.forward_cached({Tokens{1}, Tokens{}}, batch));
+}
+
 // generate(): greedy = argmax of forward() step by step; stop tokens, max_new_tokens, on_token; hooks
 // apply at every step; sampling is reproducible from its seed and follows top_k / top_p.
 static void test_generate(const Model& m) {
@@ -3332,10 +3398,19 @@ static void test_kv_random(const Model& m, uint64_t seed) {
     std::mt19937_64 rng(seed);
     auto pick = [&](int64_t lo, int64_t hi) { return std::uniform_int_distribution<int64_t>(lo, hi)(rng); };
     const int64_t V = m.cfg().vocab_size, L = m.cfg().n_layers;
+    // fp16 weights: the cache holds fp16 keys and values, so the reference rounds them too. Over long chunks
+    // many keys sit near an fp16 rounding boundary, and the GPU (whose keys differ from the CPU's in the last
+    // float32 bits) rounds some to the neighbouring fp16 value: ~1e-3 of a key, which a squared activation
+    // (glu relu2) amplifies to up to ~8e-3 of the logits' scale; with every step on the CPU nothing passes
+    // 1e-3. A cache holding the wrong positions is off by the size of the values; test_fp16_kv checks the
+    // rounding point exactly (clamped keys), and set_check_kv the CPU and GPU copies bit for bit.
+    const bool half = m.weight_format() == WeightFormat::fp16;
+    const Hooks round = round_kv_to_half(m);
+    const double rel = half ? 2e-3 : 1e-4, of_scale = half ? 1e-2 : 1e-4;
     auto reference = [&](const Tokens& t) {  // the whole pass on the CPU: logits and every layer's keys
         set_device(Device::Cpu);
         ActivationCache acts;
-        Tensor lg = m.run_with_cache(t, acts);
+        Tensor lg = m.run_with_cache(t, acts, nullptr, half ? &round : nullptr);
         return std::make_pair(lg, acts);
     };
     // GPU against CPU, as check_close but with 1e-4 of the largest value: models without norms reach
@@ -3346,7 +3421,7 @@ static void test_kv_random(const Model& m, uint64_t seed) {
         CHECK(got.shape == want.shape);
         const float sc = max_abs(want);
         for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i)
-            CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])) + 1e-4 * sc);
+            CHECK_NEAR(got.data[i], want.data[i], rel * std::max(1.f, std::fabs(want.data[i])) + of_scale * sc);
     };
     auto step = [&](const Tokens& history, int64_t n, bool gpu, auto&& run) {
         Tokens add(static_cast<size_t>(n));
@@ -3386,8 +3461,8 @@ static void test_kv_random(const Model& m, uint64_t seed) {
         } else if (kind == 4) {  // keys() brings the CPU side up to date
             const auto acts = reference(history).second;
             const int64_t l = pick(0, L - 1);
-            check_close(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
-            check_close(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+            near(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+            near(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
         } else if (kind == 5) {  // continue on a copy (it has no GPU copy of its own yet)
             cache = KVCache(cache);
         } else if (pick(0, 1) == 0) {  // a step through a copy of the model, with a GPU context of its own: a new GPU copy
@@ -3429,7 +3504,7 @@ static void test_kv_random(const Model& m, uint64_t seed) {
             const int i = static_cast<int>(pick(0, 2));
             if (!hist[i].empty()) {
                 const auto acts = reference(hist[i]).second;
-                check_close(batch[i].keys(L - 1), acts.at("blocks." + std::to_string(L - 1) + ".attn.hook_k"));
+                near(batch[i].keys(L - 1), acts.at("blocks." + std::to_string(L - 1) + ".attn.hook_k"));
             }
         } else {
             batch = KVBatch(batch);  // a copy: keys and values on the CPU, no GPU copy
@@ -3600,6 +3675,11 @@ int main(int argc, char** argv) {
     for (const auto& kv : configs()) {
         const Model m16 = random_model(kv.second, 42, WeightFormat::fp16);
         run("fp16", "fp16 weights = float32 with rounded weights: " + kv.first, [&] { test_fp16_model(m16); });
+        run("fp16", "fp16 weights: KV cache in fp16 = whole pass with rounded keys and values: " + kv.first, [&] {
+            set_device(Device::Cpu);
+            test_fp16_kv(m16, kv.second);
+            set_device(Device::Both);
+        });
         run("fp16", "fp16 weights: lens, DLA, patching, optimized = naive: " + kv.first, [&] {
             test_logit_lens(m16);
             test_dla(m16);
@@ -3673,13 +3753,28 @@ int main(int argc, char** argv) {
             [&] { test_gpu_forward_cached(random_model(kv.second, 57)); });
     run("gpu", "KV cache on the GPU: long sequences, split-key attention = CPU (macOS)", test_gpu_forward_cached_long);
     for (const auto& kv : gpu_block_configs())
+        run("gpu", "KV cache in fp16 on the GPU = whole pass with rounded keys and values (macOS): " + kv.first, [&] {
+            const Model m16 = random_model(kv.second, 42, WeightFormat::fp16);
+            if (!m16.gpu()) return;
+            for (const Device dev : {Device::Gpu, Device::Both}) {
+                set_device(dev);
+                detail::set_gpu_min_rows(2);
+                test_fp16_kv(m16, kv.second);
+                detail::set_gpu_min_rows(0);
+            }
+            set_device(Device::Both);
+        });
+    for (const auto& kv : gpu_block_configs())
         run("gpu", "GPU work committed in chunks = one command buffer, bit for bit (macOS): " + kv.first,
             [&] { test_gpu_chunked_commits(random_model(kv.second, 69)); });
     {
         uint64_t seed = 100;
         for (const auto& kv : gpu_block_configs())
             run("gpu", "KV caches on CPU and GPU: random operations = whole passes, copies consistent (macOS): " + kv.first,
-                [&, s = seed++] { test_kv_random(random_model(kv.second, 63), s); });
+                [&, s = seed++] {
+                    test_kv_random(random_model(kv.second, 63), s);
+                    test_kv_random(random_model(kv.second, 63, WeightFormat::fp16), s + 1000);  // the cache in fp16
+                });
     }
     run("gpu", "KV cache on the GPU with fp16 multiplies: one run, its fp32 repeat finds the inputs intact (macOS)", test_gpu_fp16_cached_repeat);
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
