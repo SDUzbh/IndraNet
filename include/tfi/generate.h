@@ -70,7 +70,8 @@ struct GenerateOptions {
     double temperature = 0;  // 0: greedy, the most likely token (the lowest id among equal ones)
     int64_t top_k = 0;       // sample from the k most likely tokens only; 0: all
     double top_p = 1;        // ... from the fewest most likely tokens whose probabilities reach top_p
-    uint64_t seed = 0;       // the same seed, model, prompt and options give the same tokens
+    uint64_t seed = 0;       // the same seed, model, prompt and options give the same tokens, on every platform
+                             // (as far as the logits are the same: Sampler's arithmetic is)
     std::vector<int64_t> stop_tokens;  // stop after generating one of these (it is returned)
     bool stop_at_eos = true;           // ... or one of the model's eos_tokens()
     // Called with each new token as it is chosen; returning false stops after it.
@@ -80,7 +81,11 @@ struct GenerateOptions {
 };
 
 // Picks the next token from a row of logits by GenerateOptions' rules: temperature, then top_k, then
-// top_p. Logits that are NaN or -inf are never picked.
+// top_p. Logits that are NaN or -inf are never picked. Each candidate's weight is exp((logit - max) /
+// temperature) in float (detail::exp_weights: the same bits on every platform); top_k keeps the k largest
+// logits and top_p the fewest most likely tokens whose weights reach top_p of the total (lower ids first
+// among equal ones), both found in linear time without sorting; the pick is then drawn from the kept
+// tokens in id order, with one uniform number from the generator's top 53 bits.
 class Sampler {
   public:
     explicit Sampler(const GenerateOptions& options);
@@ -92,13 +97,18 @@ class Sampler {
     int64_t draw(const std::vector<double>& w);  // index i with probability w[i] / sum(w)
 
   private:
-    // Fills candidates_ and returns how many of them (the first) can be picked, most likely first where
-    // that matters; 0 when the pick is `best` alone (greedy, top_k 1, or an infinite logit).
-    size_t candidates(const float* logits, int64_t n, int64_t& best);
+    // The tokens that can be picked, lowest id first: their weights in w_ and ids in ids_ (empty: every
+    // token, w_ then holding one weight per id), and in `total` the weights' sum. False when the pick is
+    // `best` alone (greedy, top_k 1, or an infinite logit).
+    bool select(const float* logits, int64_t n, int64_t& best, double& total);
+    int64_t id(size_t j) const { return ids_.empty() ? static_cast<int64_t>(j) : ids_[j]; }
     double temperature_, top_p_;
     int64_t top_k_;
     std::mt19937_64 rng_;
-    std::vector<std::pair<double, int64_t>> candidates_;
+    std::vector<float> w_, gathered_;
+    std::vector<int64_t> ids_, sel_;
+    std::vector<uint32_t> keys_;
+    std::vector<double> hist_;
 };
 
 // New tokens continuing `prompt` (not including it), at most max_new_tokens. The prompt runs in one

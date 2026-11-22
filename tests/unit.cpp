@@ -3291,21 +3291,23 @@ static void test_generate_speculative(const Model& m, const Model& other) {
     o.speculative.draft_tokens = 3;
     o.speculative.draft = &other;
     generate(m, prompt, o, &half, &t1);
+    // Tolerances as test_generate_trace's: on the GPU a step of several rows multiplies differently from
+    // one of a single row, and models without norms have logits near 100.
     CHECK(t0.size() == t1.size());
     for (size_t i = 0; i < t0.size() && i < t1.size(); ++i) {
         const TraceStep &a = t0[i], &b = t1[i];
         CHECK(a.token == b.token && a.position == b.position && a.top_tokens == b.top_tokens);
-        CHECK_NEAR(a.prob, b.prob, 1e-5);
+        CHECK_NEAR(a.prob, b.prob, 1e-4);
         CHECK(a.lens.size() == b.lens.size());
-        for (size_t j = 0; j < a.lens.size() && j < b.lens.size(); ++j) CHECK_NEAR(a.lens[j].target_prob, b.lens[j].target_prob, 1e-5);
+        for (size_t j = 0; j < a.lens.size() && j < b.lens.size(); ++j) CHECK_NEAR(a.lens[j].target_prob, b.lens[j].target_prob, 1e-4);
         CHECK(a.dla.labels == b.dla.labels);
         for (size_t j = 0; j < a.dla.values.size() && j < b.dla.values.size(); ++j)
-            CHECK_NEAR(a.dla.values[j], b.dla.values[j], 1e-4 * std::max(1.f, std::fabs(a.dla.values[j])));
+            CHECK_NEAR(a.dla.values[j], b.dla.values[j], 1e-3 * std::max(1.f, std::fabs(a.dla.values[j])));
         CHECK(a.attention.size() == b.attention.size());
         for (size_t j = 0; j < a.attention.size() && j < b.attention.size(); ++j) {
             CHECK(a.attention[j].head == b.attention[j].head && a.attention[j].positions == b.attention[j].positions);
             for (size_t q = 0; q < a.attention[j].weights.size() && q < b.attention[j].weights.size(); ++q)
-                CHECK_NEAR(a.attention[j].weights[q], b.attention[j].weights[q], 1e-5);
+                CHECK_NEAR(a.attention[j].weights[q], b.attention[j].weights[q], 1e-4);
         }
     }
     o.trace = {};
@@ -3431,7 +3433,7 @@ static void test_sampler() {
         const std::vector<double> f = freqs(o, n), p = softmax({0, 1, 2, 5}, temp);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
         const std::vector<double> d = dist(o);
-        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-6);  // float weights
     }
     o.temperature = 1.0;
     o.top_k = 2;  // tokens 1 and 5
@@ -3439,7 +3441,7 @@ static void test_sampler() {
         const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
         const std::vector<double> d = dist(o);
-        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-6);  // float weights
     }
     o.top_k = 0;
     o.top_p = 0.6;  // token 1 has 0.47 of the mass, with token 5 0.76 >= 0.6
@@ -3447,7 +3449,7 @@ static void test_sampler() {
         const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
         const std::vector<double> d = dist(o);
-        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-6);  // float weights
     }
     o.top_p = 0.3;  // token 1 alone
     CHECK_NEAR(freqs(o, 1000)[1], 1.0, 1e-9);
@@ -3469,55 +3471,126 @@ static void test_sampler() {
     const std::vector<float> none = {-INFINITY, std::nanf("")};
     CHECK_THROWS(greedy(none.data(), 2));
 
-    // The sampler only sorts the tokens that can be in the nucleus: it picks exactly what sorting
-    // every token would, on a vocabulary-sized row, pick for pick from the same seed.
+    // The sampler finds top_k and the nucleus without sorting: it picks exactly what sorting every token
+    // would, on a vocabulary-sized row (peaked and flat), pick for pick from the same seed. The rule: the k
+    // largest logits (lower id first among equal ones), then the fewest most likely of those whose weights
+    // reach top_p of their total, then a draw over the kept tokens in id order.
     std::mt19937_64 gen(9);
-    std::normal_distribution<float> normal(0.f, 3.f);
-    std::vector<float> row(20000);
-    for (float& v : row) v = normal(gen);
-    for (const double top_p : {0.5, 0.9, 0.99})
-        for (const int64_t top_k : {int64_t(0), int64_t(50)})
-            for (const double temp : {0.7, 1.5}) {
-                GenerateOptions so;
-                so.temperature = temp;
-                so.top_p = top_p;
-                so.top_k = top_k;
-                so.seed = 11;
-                Sampler fast(so);
-                std::mt19937_64 rng(11);
-                for (int pick = 0; pick < 300; ++pick) {
-                    std::vector<std::pair<double, int64_t>> c;  // the full sort
-                    const float top = *std::max_element(row.begin(), row.end());
+    for (const float spread : {3.f, 0.3f}) {
+        std::normal_distribution<float> normal(0.f, spread);
+        std::vector<float> row(20000);
+        for (float& v : row) v = normal(gen);
+        for (int64_t i = 0; i < 20000; i += 97) row[static_cast<size_t>(i)] = row[static_cast<size_t>(i + 1)];  // equal logits
+        row[5] = -INFINITY;
+        row[6] = std::nanf("");
+        const float top = *std::max_element(row.begin(), row.end(), [](float x, float y) { return std::isnan(y) ? false : std::isnan(x) || x < y; });
+        for (const double top_p : {0.5, 0.9, 0.99, 1.0})
+            for (const int64_t top_k : {int64_t(0), int64_t(50), int64_t(5000)})
+                for (const double temp : {0.7, 1.5}) {
+                    GenerateOptions so;
+                    so.temperature = temp;
+                    so.top_p = top_p;
+                    so.top_k = top_k;
+                    so.seed = 11;
+                    Sampler fast(so);
+                    std::mt19937_64 rng(11);
+                    std::vector<int64_t> by_logit;  // usable tokens, largest logit first
+                    for (int64_t i = 0; i < 20000; ++i)
+                        if (!std::isnan(row[static_cast<size_t>(i)]) && row[static_cast<size_t>(i)] != -INFINITY) by_logit.push_back(i);
+                    std::stable_sort(by_logit.begin(), by_logit.end(), [&](int64_t x, int64_t y) { return row[static_cast<size_t>(x)] > row[static_cast<size_t>(y)]; });
+                    if (top_k && static_cast<size_t>(top_k) < by_logit.size()) by_logit.resize(static_cast<size_t>(top_k));
+                    const float scale = static_cast<float>(1.0 / temp);
+                    std::vector<std::pair<float, int64_t>> c;  // (weight, id), most likely first
                     double mass = 0;
-                    for (int64_t i = 0; i < static_cast<int64_t>(row.size()); ++i) c.push_back({std::exp((row[i] - double(top)) / temp), i});
-                    std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-                    size_t keep = top_k ? static_cast<size_t>(top_k) : c.size();
-                    if (top_k) {
-                        for (size_t i = 0; i < keep; ++i) mass += c[i].first;
-                    } else {
-                        for (int64_t i = 0; i < static_cast<int64_t>(row.size()); ++i) mass += std::exp((row[i] - double(top)) / temp);
+                    for (int64_t i : by_logit) {
+                        const float d = row[static_cast<size_t>(i)] - top;
+                        c.push_back({detail::exp_weight(d * scale), i});
+                        mass += c.back().first;
                     }
-                    double sum = 0;
-                    size_t n = 0;
-                    while (n < keep) {
-                        sum += c[n++].first;
-                        if (sum >= top_p * mass) break;
-                    }
-                    double total = 0;
-                    for (size_t i = 0; i < n; ++i) total += c[i].first;
-                    const double u = static_cast<double>(rng() >> 11) * 0x1.0p-53 * total;
-                    int64_t want = c[n - 1].second;
-                    double acc = 0;
-                    for (size_t i = 0; i < n; ++i) {
-                        acc += c[i].first;
-                        if (u < acc) {
-                            want = c[i].second;
-                            break;
+                    std::stable_sort(c.begin(), c.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+                    size_t n = c.size();
+                    if (top_p < 1) {
+                        double sum = 0;
+                        for (n = 0; n < c.size();) {
+                            sum += c[n++].first;
+                            if (sum >= top_p * mass) break;
                         }
                     }
-                    CHECK(fast(row.data(), static_cast<int64_t>(row.size())) == want);
+                    std::vector<std::pair<int64_t, float>> kept;  // id order
+                    for (size_t i = 0; i < n; ++i) kept.push_back({c[i].second, c[i].first});
+                    std::sort(kept.begin(), kept.end());
+                    for (int pick = 0; pick < 100; ++pick) {
+                        double total = 0;
+                        for (const auto& k : kept) total += k.second;
+                        const double u = static_cast<double>(rng() >> 11) * 0x1.0p-53 * total;
+                        int64_t want = kept.back().first;
+                        double acc = 0;
+                        for (const auto& k : kept) {
+                            acc += k.second;
+                            if (u < acc) {
+                                want = k.first;
+                                break;
+                            }
+                        }
+                        CHECK(fast(row.data(), static_cast<int64_t>(row.size())) == want);
+                    }
                 }
-            }
+    }
+    // Cuts at equal keys and at a bucket's edge: which tokens distribution() keeps.
+    auto kept_ids = [](const std::vector<float>& lg, int64_t k, double p) {
+        GenerateOptions so;
+        so.temperature = 1;
+        so.top_k = k;
+        so.top_p = p;
+        std::vector<double> d;
+        Sampler(so).distribution(lg.data(), static_cast<int64_t>(lg.size()), d);
+        std::vector<int64_t> ids;
+        for (size_t i = 0; i < d.size(); ++i)
+            if (d[i] > 0) ids.push_back(static_cast<int64_t>(i));
+        return ids;
+    };
+    const std::vector<float> flat(10, 1.f);  // equal logits: lower ids first
+    CHECK((kept_ids(flat, 3, 1) == std::vector<int64_t>{0, 1, 2}));
+    CHECK((kept_ids(flat, 0, 0.25) == std::vector<int64_t>{0, 1, 2}));  // 0.3 is the first total reaching 0.25
+    CHECK((kept_ids(flat, 6, 0.5) == std::vector<int64_t>{0, 1, 2}));   // half of the top 6
+    CHECK((kept_ids({-0.f, 0.f, 0.f, -1.f}, 2, 1) == std::vector<int64_t>{0, 1}));  // -0 = +0
+    // Each logit in a bucket of its own: the count is reached exactly at a bucket's end.
+    CHECK((kept_ids({1.f, 16.f, 2.f, 8.f, 4.f}, 2, 1) == std::vector<int64_t>{1, 3}));
+    CHECK((kept_ids({1.f, 16.f, 2.f, 8.f, 4.f}, 3, 1) == std::vector<int64_t>{1, 3, 4}));
+    // exp_weight = exp to fp32 precision over its range, 0 below -87, for NaN and -inf; exp_weights (vector
+    // and scalar parts) gives exp_weight's bits exactly.
+    float worst = 0;
+    for (float x = -87.f; x <= 0.f; x += 0.0137f) {
+        const double want = std::exp(static_cast<double>(x));
+        worst = std::max(worst, static_cast<float>(std::fabs(detail::exp_weight(x) - want) / want));
+    }
+    CHECK(worst < 3e-7f);
+    CHECK(detail::exp_weight(0.f) == 1.f && detail::exp_weight(-0.f) == 1.f);
+    CHECK(detail::exp_weight(-87.5f) == 0.f && detail::exp_weight(-INFINITY) == 0.f && detail::exp_weight(std::nanf("")) == 0.f);
+    std::vector<float> xs = {0.f, -1e-30f, -0.5f, -87.f, -86.99f, -87.01f, -INFINITY, std::nanf(""), -3.25f, -10.f, -50.f};
+    for (int i = 0; i < 1000; ++i) xs.push_back(-90.f * static_cast<float>(i) / 1000.f);
+    std::vector<float> ws(xs.size());
+    detail::exp_weights(xs.data(), static_cast<int64_t>(xs.size()), 0.f, 1.f, ws.data());
+    for (size_t i = 0; i < xs.size(); ++i) {
+        const float d = xs[i] - 0.f;
+        CHECK(ws[i] == detail::exp_weight(d * 1.f));
+    }
+    // The same picks on every platform: weights and draws use only exactly specified arithmetic (the logits
+    // here come from the generator's raw output, not a library distribution).
+    {
+        std::mt19937_64 g(21);
+        std::vector<float> lg(1000);
+        for (float& v : lg) v = static_cast<float>(static_cast<double>(g() >> 40) * 0x1.0p-24 * 12.0 - 6.0);
+        GenerateOptions go;
+        go.temperature = 0.9;
+        go.top_k = 200;
+        go.top_p = 0.95;
+        go.seed = 4;
+        Sampler gs(go);
+        std::vector<int64_t> picks;
+        for (int i = 0; i < 12; ++i) picks.push_back(gs(lg.data(), 1000));
+        CHECK((picks == std::vector<int64_t>{762, 411, 537, 56, 470, 52, 831, 37, 704, 751, 618, 408}));
+    }
 }
 
 #ifdef TFI_USE_ACCELERATE

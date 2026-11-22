@@ -136,6 +136,10 @@ build/indra generate llama.safetensors --text "The capital of France is" --max-n
 build/indra generate llama.safetensors --text "Once upon a time" --temperature 0.8 --top-p 0.9 --seed 1
 ```
 
+A seed picks the same tokens on every platform, given the same logits: the sampler's weights and
+draws use only exactly specified arithmetic, and it finds `--top-k` and `--top-p` in linear time
+rather than by sorting the vocabulary.
+
 `--trace` adds a table: for each new token, its probability and the alternatives, the first
 logit-lens stage where it was the top prediction, and the largest parts of its logit (direct logit
 attribution), all from the pass that chose it.
