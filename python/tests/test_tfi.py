@@ -420,3 +420,47 @@ def test_generate_batch(tfi, tmp_path):
         assert [s["prob"] for s in t] == pytest.approx([s["prob"] for s in one], rel=1e-4)
     with pytest.raises(ValueError, match="one per prompt"):
         tfi.generate_batch(m, prompts, hooks=[None])
+
+
+def test_generate_speculative(tfi, tmp_path):
+    """speculate=K: greedy output = plain greedy whoever proposes (prompt lookup, another model, the model
+    itself), with hooks and the trace too; stats counts the steps; sampling keeps the model's distribution."""
+    _, path = exported(tmp_path, n_kv_heads=2)
+    m = tfi.Model.load(str(path))
+    torch.manual_seed(1)
+    other_path = tmp_path / "draft.safetensors"
+    export_model(DecoderLM(tiny(d_model=16, n_layers=1)).eval(), other_path)
+    draft = tfi.Model.load(str(other_path))
+    plain = tfi.generate(m, TOKENS, max_new_tokens=12)
+    for k in (1, 4):
+        for d in (None, draft, m):
+            stats = {}
+            assert tfi.generate(m, TOKENS, max_new_tokens=12, speculate=k, draft=d, stats=stats) == plain
+            assert stats["steps"] + stats["accepted"] == 12 and stats["accepted"] <= stats["drafted"]
+            if d is m:
+                assert stats["accepted"] == stats["drafted"]
+    assert tfi.generate(m, TOKENS, max_new_tokens=12, speculate=3, ngram=1) == plain
+
+    def half(a, name):
+        a *= 0.5
+    hooks = {"blocks.0.hook_attn_out": half}
+    assert tfi.generate(m, TOKENS, max_new_tokens=8, hooks=hooks, speculate=3, draft=m) == \
+        tfi.generate(m, TOKENS, max_new_tokens=8, hooks=hooks)
+    new, steps = tfi.generate(m, TOKENS, max_new_tokens=6, trace=True, speculate=3, draft=draft)
+    new0, steps0 = tfi.generate(m, TOKENS, max_new_tokens=6, trace=True)
+    assert new == new0 and [s["position"] for s in steps] == [s["position"] for s in steps0]
+    assert [s["prob"] for s in steps] == pytest.approx([s["prob"] for s in steps0], rel=1e-4)
+    for s, s0 in zip(steps, steps0):
+        np.testing.assert_allclose(s["lens"]["prob"], s0["lens"]["prob"], rtol=1e-4, atol=1e-6)
+    # Sampling: the first token's frequencies over seeds follow the model's distribution.
+    p = torch.softmax(torch.tensor(m.forward(TOKENS)[-1], dtype=torch.float64) / 2.0, 0).numpy()
+    n = 3000
+    for d in (None, draft):
+        counts = np.zeros(V)
+        for seed in range(n):
+            counts[tfi.generate(m, TOKENS, max_new_tokens=2, temperature=2.0, seed=seed, speculate=2, draft=d)[0]] += 1
+        assert np.all(np.abs(counts / n - p) <= 5 * np.sqrt(p * (1 - p) / n) + 1e-3)
+    with pytest.raises(ValueError, match="draft needs speculate"):
+        tfi.generate(m, TOKENS, draft=draft)
+    with pytest.raises(ValueError, match="ngram"):
+        tfi.generate(m, TOKENS, speculate=2, ngram=0)

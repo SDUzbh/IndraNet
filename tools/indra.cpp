@@ -53,12 +53,18 @@ Commands
   generate   continue the input, one token at a time           --tokens [--max-new 64] [--temperature 0]
                                                                [--top-k 0] [--top-p 1] [--seed 0]
                                                                [--stop ID,...] [--no-eos] [--trace]
+                                                               [--speculate K [--draft FILE] [--ngram 3]]
              greedy by default; --temperature T samples instead, from the --top-k K most likely tokens
              and the fewest whose probabilities reach --top-p P. Stops at the model's end-of-text tokens
              (converted models) unless --no-eos, at --stop tokens, or after --max-new tokens. Prints the
              text as it is generated (token ids for models without a vocabulary). A KV cache keeps each
              step to the new token. --trace then shows each new token's probability and alternatives, the
-             first logit-lens stage where it was the top prediction, and the largest parts of its logit
+             first logit-lens stage where it was the top prediction, and the largest parts of its logit.
+             --speculate K: speculative decoding, each step proposing up to K tokens that the model
+             checks in one pass. They come from --draft FILE, a smaller model with the same tokenizer,
+             or else from earlier in the text (the tokens after the last occurrence of the last
+             --ngram tokens). Only the speed changes: greedy output is the same (up to rounding),
+             sampled output has the same distribution
 
 Token input
   --tokens 5,17,3,...          explicit token ids
@@ -635,6 +641,23 @@ std::string pad(std::string s, size_t width) {
     return s;
 }
 
+// Ids [0, n) of both vocabularies whose text differs (a draft model's tokenizer against the model's).
+int64_t vocabulary_differences(const Model& m, const Model& d) {
+    const int64_t n = std::min(m.cfg().vocab_size, d.cfg().vocab_size);
+    if (m.has_tokenizer() != d.has_tokenizer() || m.vocab().empty() != d.vocab().empty()) return n;
+    if (!m.has_tokenizer() && m.vocab().empty()) return 0;  // plain ids
+    auto text = [](const Model& x, int64_t id) {
+        try {
+            return x.decode({id});
+        } catch (const std::exception&) {
+            return std::string("\x01none");  // e.g. padding rows past the tokenizer's ids
+        }
+    };
+    int64_t diff = 0;
+    for (int64_t i = 0; i < n; ++i) diff += text(m, i) != text(d, i);
+    return diff;
+}
+
 int cmd_generate(const Args& a, const Model& m) {
     const Tokens prompt = input_tokens(a, m);
     GenerateOptions o;
@@ -645,6 +668,22 @@ int cmd_generate(const Args& a, const Model& m) {
     o.seed = static_cast<uint64_t>(a.get_int("seed", 0));
     if (a.has("stop")) o.stop_tokens = parse_tokens(a.get("stop"));
     o.stop_at_eos = !a.has("no-eos");
+    std::optional<Model> draft;
+    SpeculativeStats stats;
+    if (a.has("draft") && !a.has("speculate")) throw std::invalid_argument("--draft needs --speculate K");
+    if (a.has("speculate")) {
+        o.speculative.draft_tokens = a.get_int("speculate", 0);
+        if (o.speculative.draft_tokens < 1) throw std::invalid_argument("--speculate K needs K >= 1");
+        o.speculative.ngram = a.get_int("ngram", 3);
+        o.speculative.stats = &stats;
+        if (a.has("draft")) {
+            draft.emplace(Model::load(a.get("draft"), m.weight_format()));
+            o.speculative.draft = &*draft;
+            if (const int64_t diff = vocabulary_differences(m, *draft))
+                std::fprintf(stderr, "note: the draft's tokenizer differs from the model's at %lld token ids: its proposals will be "
+                             "rejected more often (the output is unaffected)\n", static_cast<long long>(diff));
+        }
+    }
     for (int64_t id : o.stop_tokens)
         if (id < 0 || id >= m.cfg().vocab_size) throw std::invalid_argument("--stop token " + std::to_string(id) + " is outside the vocabulary");
     const bool text = m.has_tokenizer() || !m.vocab().empty();
@@ -718,6 +757,10 @@ int cmd_generate(const Args& a, const Model& m) {
     }
     std::fflush(stdout);
     std::fprintf(stderr, "%zu new token%s\n", out.size(), out.size() == 1 ? "" : "s");
+    if (a.has("speculate"))
+        std::fprintf(stderr, "speculative: %lld steps for %zu tokens; %lld of %lld proposed tokens accepted\n",
+                     static_cast<long long>(stats.steps), out.size(), static_cast<long long>(stats.accepted),
+                     static_cast<long long>(stats.drafted));
     return 0;
 }
 

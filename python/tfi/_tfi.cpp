@@ -397,7 +397,8 @@ NB_MODULE(_tfi, mod) {
     mod.def("generate", [](const Model& m, nb::object prompt, int64_t max_new_tokens, double temperature, int64_t top_k,
                            double top_p, uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos,
                            std::optional<nb::dict> hooks, nb::object on_token, std::optional<nb::dict> captures, bool trace,
-                           int64_t trace_top_k, bool trace_lens, bool trace_dla, int64_t trace_attention) -> nb::object {
+                           int64_t trace_top_k, bool trace_lens, bool trace_dla, int64_t trace_attention, int64_t speculate,
+                           const Model* draft, int64_t ngram, std::optional<nb::dict> stats) -> nb::object {
         Tokens tokens;
         if (nb::isinstance<nb::str>(prompt)) {
             const std::string text = nb::cast<std::string>(prompt);
@@ -418,6 +419,12 @@ NB_MODULE(_tfi, mod) {
         o.trace.lens = trace_lens;
         o.trace.dla = trace_dla;
         o.trace.attention_top = trace_attention;
+        if (draft && speculate == 0) throw std::invalid_argument("draft needs speculate > 0");
+        SpeculativeStats st;
+        o.speculative.draft_tokens = speculate;
+        o.speculative.draft = draft;
+        o.speculative.ngram = ngram;
+        o.speculative.stats = &st;
         if (!on_token.is_none()) {
             if (!PyCallable_Check(on_token.ptr())) throw std::invalid_argument("on_token is not callable");
             nb::handle fn = on_token;  // borrowed: on_token outlives the call
@@ -434,20 +441,30 @@ NB_MODULE(_tfi, mod) {
             nb::gil_scoped_release release;
             out = generate(m, tokens, o, h ? &*h : nullptr, trace ? &steps : nullptr);
         }
+        if (stats) {
+            (*stats)["steps"] = st.steps;
+            (*stats)["drafted"] = st.drafted;
+            (*stats)["accepted"] = st.accepted;
+        }
         if (!trace) return nb::cast(out);
         nb::list list = trace_list(steps, o.trace);
         return nb::make_tuple(out, list);
     }, "model"_a, "prompt"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0, "top_k"_a = 0, "top_p"_a = 1.0, "seed"_a = 0,
        "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(), "on_token"_a = nb::none(),
        "captures"_a = nb::none(), "trace"_a = false, "trace_top_k"_a = 5, "trace_lens"_a = true, "trace_dla"_a = true,
-       "trace_attention"_a = 0,
+       "trace_attention"_a = 0, "speculate"_a = 0, "draft"_a.none() = nb::none(), "ngram"_a = 3, "stats"_a = nb::none(),
        "New token ids continuing prompt (token ids, or text for the model's tokenizer), with a KV cache. Greedy at "
        "temperature 0; otherwise sampled from the top_k most likely and the fewest reaching top_p, reproducibly from "
        "seed. Stops at stop_tokens, the model's eos_tokens (unless stop_at_eos is False), or when on_token(token) "
        "returns False. hooks (editing) and captures (reading only) apply at every step: the prompt's pass, then each "
        "new token's. With trace, returns (tokens, steps): per new token a dict of its probability, the top tokens, "
        "and (trace_lens) the logit lens at its position, (trace_dla) direct logit attribution of its logit, "
-       "(trace_attention > 0) each head's most attended positions.");
+       "(trace_attention > 0) each head's most attended positions. speculate=K: speculative decoding, each step "
+       "proposing up to K tokens that the model checks in one pass, from draft (a smaller model with the same "
+       "tokenizer) or else from earlier in the text (the tokens after the last occurrence of the last ngram tokens). "
+       "Only the speed changes: greedy output is the same up to rounding, sampled output has the same distribution "
+       "(not the same tokens for a seed). hooks then also see proposals the model rejects. A stats dict receives "
+       "steps, drafted and accepted.");
 
     mod.def("generate_batch", [](const Model& m, nb::list prompts, int64_t max_new_tokens, double temperature, int64_t top_k,
                                  double top_p, uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos, nb::object hooks,

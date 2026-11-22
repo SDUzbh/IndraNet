@@ -34,6 +34,12 @@ std::vector<float>& block_buffer(int64_t floats) {
 // (a generated token) converting fp16 weights to float32 first would cost more than the multiply, and
 // the library's matrix multiply gains nothing. More rows use the library (fp16: converted blocks).
 constexpr int64_t kDirectRows = 4;
+// ... and up to this many rows (a speculative step, a short prompt), groups of kDirectRows rows each read
+// the weights in turn, chunk by chunk, so that a chunk read from memory for the first group is still in
+// the cache for the others. Each row's sums are the same instructions whatever the group, so a row's
+// output doesn't depend on how many rows the call has. Measured on an M5 Pro (8192x2048, 16 rows): 0.98 ms
+// against the library's 1.44 on float32 weights, 0.69 against 2.4 on fp16 (converted blocks).
+constexpr int64_t kDirectMaxRows = 16;
 
 // sum[r] += x[r][k] * w[k] for k in [k0, in), one statement each for the multiply and the add (a
 // compiler may fuse a multiply-add within one). Both weight types' scalar steps go through this one
@@ -158,15 +164,17 @@ void run_row_chunks(int64_t total, int64_t in, F&& rows) {
     rows(0, total);
 }
 
-// Several weights reading the same x rows (1..kDirectRows): their rows taken as one range, so that a
+// Several weights reading the same x rows (1..kDirectMaxRows): their rows taken as one range, so that a
 // single run_row_chunks (one wake of the threads) covers them all. y[i] receives W[i]'s output.
 void linear_direct_many(const float* x, int64_t n_rows, const std::vector<const Weight*>& Ws, const std::vector<float*>& y) {
     std::vector<int64_t> first(Ws.size() + 1, 0);
     for (size_t i = 0; i < Ws.size(); ++i) first[i + 1] = first[i] + Ws[i]->shape[0];
-    run_row_chunks(first.back(), Ws.empty() ? 1 : Ws[0]->shape[1], [&](int64_t a, int64_t b) {
+    const int64_t in = Ws.empty() ? 1 : Ws[0]->shape[1];
+    run_row_chunks(first.back(), in, [&](int64_t a, int64_t b) {
         for (size_t i = 0; i < Ws.size(); ++i) {
-            const int64_t lo = std::max(a, first[i]), hi = std::min(b, first[i + 1]);
-            if (lo < hi) direct_range(x, n_rows, *Ws[i], lo - first[i], hi - first[i], y[i], Ws[i]->shape[0]);
+            const int64_t lo = std::max(a, first[i]), hi = std::min(b, first[i + 1]), out = Ws[i]->shape[0];
+            for (int64_t r = 0; lo < hi && r < n_rows; r += kDirectRows)
+                direct_range(x + r * in, std::min(kDirectRows, n_rows - r), *Ws[i], lo - first[i], hi - first[i], y[i] + r * out, out);
         }
     });
 }
@@ -316,7 +324,7 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
     Tensor y(std::move(s));
     const int64_t n_rows = in ? x.numel() / in : 0;
     if (n_rows && out) {
-        if (n_rows <= kDirectRows) {
+        if (n_rows <= kDirectMaxRows) {
             linear_direct_many(x.ptr(), n_rows, {&W}, {y.ptr()});
         } else if (!W.is_fp16()) {
             detail::gemm(/*trans_b=*/true, n_rows, out, in, x.ptr(), in, W.f32_data(), in, y.ptr(), out);
@@ -342,7 +350,7 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
 std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws, const std::vector<const Weight*>& bs) {
     if (!bs.empty() && bs.size() != Ws.size()) throw std::invalid_argument("linear_many: one bias (or null) per weight");
     const int64_t in = x.size(-1), n_rows = in ? x.numel() / in : 0;
-    bool direct = n_rows >= 1 && n_rows <= kDirectRows && Ws.size() > 1;
+    bool direct = n_rows >= 1 && n_rows <= kDirectMaxRows && Ws.size() > 1;
     for (const Weight* W : Ws) direct = direct && W->dim() == 2 && W->shape[1] == in && W->shape[0] > 0;
     std::vector<Tensor> out;
     if (!direct) {  // separate calls (they check the shapes)

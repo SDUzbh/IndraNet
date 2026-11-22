@@ -102,7 +102,7 @@ python -m indranet_hf path/to/checkpoint model.safetensors    # or a Hub repo id
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
 | `tokenize` | – | Token ids for text, as the model's tokenizer gives them (reads no weights) |
-| `generate` | – | Continues the input, printing the text as it comes: greedy, or sampled with `--temperature`, `--top-k`, `--top-p` and `--seed` |
+| `generate` | – | Continues the input, printing the text as it comes: greedy, or sampled with `--temperature`, `--top-k`, `--top-p` and `--seed`; `--speculate K` for speculative decoding |
 
 Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice. Or
 pass `--text "..."` (`--clean-text` / `--corrupt-text` for `patch`):
@@ -152,6 +152,26 @@ it (a CPU step, `keys()`, a copy), so a long context isn't held twice. With `--f
 the cache holds fp16 keys and values too: half its memory, rounded like the weights; float32 models
 keep it exact. It stops at the model's end-of-text tokens (stored for
 converted models; `--no-eos` ignores them), at `--stop` ids, or after `--max-new` tokens.
+
+`--speculate K` turns on speculative decoding. Each step proposes up to K tokens, and the model
+checks them all in one pass, which costs about as much as one token since its weights are read once.
+It keeps the tokens it agrees with, plus one of its own. The proposals come from `--draft FILE`, a
+smaller model with the same tokenizer (Llama 3.2 1B for Llama 3.1 8B, Qwen2.5 0.5B for the larger
+Qwen2.5 models). Without a draft they come from earlier in the text: the tokens that followed the last
+occurrence of the last `--ngram` tokens (3 by default). That costs nothing and pays off where the
+output repeats the input: editing, summarizing, quoting, code. Steps propose fewer tokens after a
+rejection, so on text that doesn't repeat it costs almost nothing.
+
+The proposals only change the speed. Greedy output is the same as without speculation, up to
+rounding: the checking pass computes several rows at once. Sampled output has the same distribution,
+by the standard acceptance rule, though not the same tokens for a given seed. Hooks also run on
+proposals that are then rejected; those rows are dropped from the cache and the trace, and because
+attention is causal the kept rows are what they would be without speculation.
+
+```
+build/indra generate llama.safetensors --text "$(cat prompt.txt)" --speculate 8
+build/indra generate llama8b.safetensors --text "Once upon a time" --speculate 4 --draft llama1b.safetensors
+```
 
 ## Walkthrough: the 2-layer induction circuit
 
@@ -342,6 +362,9 @@ Tokens more = generate(m, t, opt, &hooks);                   // hooks apply at e
 std::vector<TraceStep> trace;                                // per new token: prob, logit lens, DLA, attention
 generate(m, t, opt, nullptr, &trace);                        // (opt.trace says which)
 std::vector<Tokens> both = generate_batch(m, {t, t}, opt, {nullptr, &hooks});  // baseline and intervention, one pass a step
+opt.speculative.draft_tokens = 8;                            // speculative decoding: prompt lookup,
+opt.speculative.draft = &small;                              // or a draft model with the same tokenizer
+Tokens fast = generate(m, t, opt);
 std::string text = m.decode(more);
 
 const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
@@ -387,6 +410,8 @@ keep = lambda a, name: print(name, a.shape)                        # captures on
 tfi.generate(m, t, max_new_tokens=5, captures={"blocks.10.hook_resid_post": keep})
 base, edited = tfi.generate_batch(m, [t, t], max_new_tokens=20,     # several at once; hooks per sequence
                                   hooks=[None, {"blocks.15.attn.hook_z": knock_out}])
+stats = {}
+tfi.generate(m, t, max_new_tokens=200, speculate=8, stats=stats)   # speculative (draft=small for a model)
 cache = tfi.KVCache()                      # step by step: forward_cached runs only the new tokens
 logits = m.forward_cached(t, cache)
 logits = m.forward_cached([mary], cache)   # (1, vocab); hooks see the new rows

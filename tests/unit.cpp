@@ -883,7 +883,11 @@ static void test_fp16_weight() {
     CHECK_THROWS(w32.f32());  // 2-D: read with rows(), cols(), to_tensor()
     const Weight w32copy = w32;
     CHECK(w32copy.data() == w32.data());
-    CHECK(linear(x, w32, &bw).data == linear(x, W, &b).data);
+    {  // the library's multiply from 17 rows (fewer: direct_rows, checked by test_linear_few_rows)
+        Tensor x17({17, 200});
+        for (int64_t i = 0; i < x17.numel(); ++i) x17.data[i] = x.data[i % x.numel()] * (1 + 0.01f * float(i / x.numel()));
+        CHECK(linear(x17, w32, &bw).data == linear(x17, W, &b).data);
+    }
     CHECK(matmul(A, w32).data == matmul(A, W).data);
     CHECK(Weight(Tensor({0, 4})).to_tensor().shape == Shape({0, 4}));
     CHECK_THROWS(Weight::fp16(b));  // only 2-D weights are stored in fp16
@@ -2771,7 +2775,7 @@ static void test_linear_few_rows() {
         const Weight w32(W), w16 = Weight::fp16(W);
         const Weight rounded(w16.to_tensor());  // float32 weights holding fp16's values
         const Weight b(bias);
-        for (int64_t rows = 1; rows <= 5; ++rows) {
+        for (int64_t rows : {1, 2, 3, 4, 5, 8, 9, 16, 17}) {
             Tensor x({rows, in});
             for (float& v : x.data) v = normal(rng);
             for (const Weight* wp : {&w32, &rounded}) {
@@ -2786,7 +2790,16 @@ static void test_linear_few_rows() {
                     }
                 CHECK(worst < 1e-5f * std::sqrt(float(in)));
             }
-            if (rows <= 4) CHECK(linear(x, w16, &b).data == linear(x, rounded, &b).data);  // 5: the library's blocks
+            if (rows <= 16) {
+                CHECK(linear(x, w16, &b).data == linear(x, rounded, &b).data);  // 17: the library's blocks
+                // A row's output doesn't depend on the other rows (groups of 4 each run as 1-4 rows would).
+                for (const Weight* wp : {&w32, &w16}) {
+                    const Tensor all = linear(x, *wp, &b);
+                    for (int64_t r = 0; r < rows; ++r)
+                        CHECK(linear(tfi::rows(x, r, r + 1), *wp, &b).data ==
+                              std::vector<float>(all.ptr() + r * out, all.ptr() + (r + 1) * out));
+                }
+            }
             set_num_threads(1);
             const Tensor one = linear(x, w16, &b);
             set_num_threads(0);
@@ -3231,6 +3244,163 @@ static void test_generate_trace(const Model& m) {
     }
 }
 
+// Speculative decoding: greedy output = plain greedy's whatever proposes (prompt lookup, another model,
+// the model itself), with hooks too; the trace = plain generation's; the counts; the position limit.
+static void test_generate_speculative(const Model& m, const Model& other) {
+    Tokens prompt = seq(6, 81);
+    prompt.insert(prompt.end(), prompt.begin(), prompt.end());  // repeated: prompt lookup finds matches
+    GenerateOptions o;
+    o.max_new_tokens = 14;
+    o.stop_at_eos = false;
+    const Tokens plain = generate(m, prompt, o);
+    SpeculativeStats st;
+    o.speculative.stats = &st;
+    for (int64_t k : {1, 3, 8}) {
+        o.speculative.draft_tokens = k;
+        for (const Model* d : {static_cast<const Model*>(nullptr), &other, &m}) {
+            o.speculative.draft = d;
+            CHECK(generate(m, prompt, o) == plain);
+            // Each step gives the proposals it keeps and one token of the model's.
+            CHECK(st.steps >= 1 && st.accepted <= st.drafted && st.steps + st.accepted == static_cast<int64_t>(plain.size()));
+            if (d == &m)  // its own draft: every proposal kept, k + 1 tokens a step
+                CHECK(st.accepted == st.drafted && st.steps == (14 + k) / (k + 1));
+        }
+    }
+    o.speculative.draft = nullptr;
+    o.speculative.ngram = 1;
+    CHECK(generate(m, prompt, o) == plain);
+    o.speculative.ngram = 3;
+    // Hooks: the tokens of plain generation with the same hooks (the draft runs without them).
+    Hooks half;
+    half.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { for (float& v : a.data) v *= 0.5f; });
+    o.speculative.draft_tokens = 0;
+    const Tokens plain_hooked = generate(m, prompt, o, &half);
+    o.speculative.draft_tokens = 3;
+    for (const Model* d : {static_cast<const Model*>(nullptr), &m}) {
+        o.speculative.draft = d;
+        CHECK(generate(m, prompt, o, &half) == plain_hooked);
+    }
+    // The trace: plain generation's steps, rejected proposals left out.
+    const bool post = m.cfg().norm_position == "post";
+    o.trace.top_k = 3;
+    o.trace.attention_top = 2;
+    o.trace.dla = !post;
+    std::vector<TraceStep> t0, t1;
+    o.speculative.draft_tokens = 0;
+    generate(m, prompt, o, &half, &t0);
+    o.speculative.draft_tokens = 3;
+    o.speculative.draft = &other;
+    generate(m, prompt, o, &half, &t1);
+    CHECK(t0.size() == t1.size());
+    for (size_t i = 0; i < t0.size() && i < t1.size(); ++i) {
+        const TraceStep &a = t0[i], &b = t1[i];
+        CHECK(a.token == b.token && a.position == b.position && a.top_tokens == b.top_tokens);
+        CHECK_NEAR(a.prob, b.prob, 1e-5);
+        CHECK(a.lens.size() == b.lens.size());
+        for (size_t j = 0; j < a.lens.size() && j < b.lens.size(); ++j) CHECK_NEAR(a.lens[j].target_prob, b.lens[j].target_prob, 1e-5);
+        CHECK(a.dla.labels == b.dla.labels);
+        for (size_t j = 0; j < a.dla.values.size() && j < b.dla.values.size(); ++j)
+            CHECK_NEAR(a.dla.values[j], b.dla.values[j], 1e-4 * std::max(1.f, std::fabs(a.dla.values[j])));
+        CHECK(a.attention.size() == b.attention.size());
+        for (size_t j = 0; j < a.attention.size() && j < b.attention.size(); ++j) {
+            CHECK(a.attention[j].head == b.attention[j].head && a.attention[j].positions == b.attention[j].positions);
+            for (size_t q = 0; q < a.attention[j].weights.size() && q < b.attention[j].weights.size(); ++q)
+                CHECK_NEAR(a.attention[j].weights[q], b.attention[j].weights[q], 1e-5);
+        }
+    }
+    o.trace = {};
+    o.speculative.draft = nullptr;
+    // Learned positions: as far as plain generation goes (proposals stop at the last position), no further.
+    if (m.cfg().positional == "learned") {
+        const int64_t most = m.cfg().max_seq_len - static_cast<int64_t>(prompt.size()) + 1;  // the last from position max - 1
+        int64_t got = 0;
+        o.max_new_tokens = 100;  // stopped by on_token instead, so proposals aren't already limited by max_new_tokens
+        o.on_token = [&](int64_t) { return ++got < most; };
+        o.speculative.draft_tokens = 0;
+        const Tokens longest = generate(m, prompt, o);
+        CHECK(static_cast<int64_t>(longest.size()) == most);
+        o.speculative.draft_tokens = 8;
+        for (const Model* d : {static_cast<const Model*>(nullptr), &other}) {
+            o.speculative.draft = d;
+            got = 0;
+            CHECK(generate(m, prompt, o) == longest);
+        }
+        o.on_token = nullptr;
+        o.max_new_tokens = most + 1;
+        CHECK_THROWS(generate(m, prompt, o));
+        o.speculative.draft_tokens = 0;
+        CHECK_THROWS(generate(m, prompt, o));
+        o.max_new_tokens = 14;
+    }
+    // Stops at a stop token and when on_token says so, mid-step.
+    o.speculative.draft = &m;
+    o.speculative.draft_tokens = 8;
+    o.stop_tokens = {plain[4]};
+    const Tokens stopped = generate(m, prompt, o);
+    CHECK(!stopped.empty() && stopped.back() == plain[4] && stopped.size() <= 5);
+    o.stop_tokens.clear();
+    int calls = 0;
+    o.on_token = [&](int64_t) { return ++calls < 3; };
+    CHECK(generate(m, prompt, o).size() == 3 && calls == 3);
+    o.on_token = nullptr;
+    o.max_new_tokens = 0;
+    CHECK(generate(m, prompt, o).empty() && st.steps == 0);
+    o.max_new_tokens = 1;
+    CHECK(generate(m, prompt, o) == Tokens{plain[0]});
+    CHECK_THROWS(generate_batch(m, {prompt}, o));
+    o.speculative.draft_tokens = -1;
+    CHECK_THROWS(generate(m, prompt, o));
+    o.speculative.draft_tokens = 2;
+    o.speculative.ngram = 0;
+    CHECK_THROWS(generate(m, prompt, o));
+}
+
+// Speculative sampling draws from the model's distribution: the joint frequencies of two new tokens, over
+// many seeds, against the exact probabilities (forward passes, Sampler::distribution), for prompt lookup and
+// a draft model of another distribution (and another vocabulary size), with temperature, top_k and top_p.
+static void test_speculative_sampling() {
+    const ModelConfig c = tiny([](ModelConfig& x) { x.vocab_size = 5; });
+    const ModelConfig c6 = tiny([](ModelConfig& x) { x.vocab_size = 6; });
+    const Model m = random_model(c, 3), draft = random_model(c6, 4);
+    const Tokens prompt = {1, 2, 3, 1, 2};  // prompt lookup proposes 3, 1, 2, ...
+    const int n = 4000;
+    for (int setting = 0; setting < 2; ++setting) {
+        GenerateOptions o;
+        o.max_new_tokens = 2;
+        o.stop_at_eos = false;
+        o.temperature = setting ? 1.0 : 3.0;
+        o.top_k = setting ? 4 : 0;
+        o.top_p = setting ? 0.9 : 1.0;
+        std::vector<double> want(25, 0), p1, p2;
+        Sampler exact(o);
+        const Tensor l1 = m.forward(prompt);
+        exact.distribution(l1.ptr() + (l1.shape[0] - 1) * 5, 5, p1);
+        for (int64_t a = 0; a < 5; ++a) {
+            Tokens t = prompt;
+            t.push_back(a);
+            const Tensor l2 = m.forward(t);
+            exact.distribution(l2.ptr() + (l2.shape[0] - 1) * 5, 5, p2);
+            for (int64_t b = 0; b < 5; ++b) want[a * 5 + b] = p1[a] * p2[b];
+        }
+        for (const Model* d : {static_cast<const Model*>(nullptr), &draft}) {
+            o.speculative.draft = d;
+            o.speculative.draft_tokens = 2;
+            SpeculativeStats st;
+            o.speculative.stats = &st;
+            std::vector<double> got(25, 0);
+            int64_t rejected = 0;
+            for (int i = 0; i < n; ++i) {
+                o.seed = static_cast<uint64_t>(i);
+                const Tokens t = generate(m, prompt, o);
+                got[t[0] * 5 + t[1]] += 1.0 / n;
+                rejected += st.drafted - st.accepted;
+            }
+            CHECK(rejected > n / 10);  // the rejection branch ran
+            for (size_t j = 0; j < 25; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
+        }
+    }
+}
+
 // The sampler alone: frequencies follow softmax(logits / temperature), restricted by top_k and top_p;
 // NaN and -inf are never picked.
 static void test_sampler() {
@@ -3240,6 +3410,11 @@ static void test_sampler() {
         std::vector<double> f(logits.size(), 0);
         for (int i = 0; i < n; ++i) f[s(logits.data(), static_cast<int64_t>(logits.size()))] += 1.0 / n;
         return f;
+    };
+    auto dist = [&](GenerateOptions o) {  // what speculative decoding's acceptance rule uses
+        std::vector<double> d;
+        Sampler(o).distribution(logits.data(), static_cast<int64_t>(logits.size()), d);
+        return d;
     };
     auto softmax = [&](std::vector<int> keep, double temp) {
         std::vector<double> p(logits.size(), 0);
@@ -3255,24 +3430,39 @@ static void test_sampler() {
         o.temperature = temp;
         const std::vector<double> f = freqs(o, n), p = softmax({0, 1, 2, 5}, temp);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+        const std::vector<double> d = dist(o);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
     }
     o.temperature = 1.0;
     o.top_k = 2;  // tokens 1 and 5
     {
         const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+        const std::vector<double> d = dist(o);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
     }
     o.top_k = 0;
     o.top_p = 0.6;  // token 1 has 0.47 of the mass, with token 5 0.76 >= 0.6
     {
         const std::vector<double> f = freqs(o, n), p = softmax({1, 5}, 1.0);
         for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(f[i], p[i], 0.005);
+        const std::vector<double> d = dist(o);
+        for (size_t i = 0; i < f.size(); ++i) CHECK_NEAR(d[i], p[i], 1e-12);
     }
     o.top_p = 0.3;  // token 1 alone
     CHECK_NEAR(freqs(o, 1000)[1], 1.0, 1e-9);
     o.top_p = 1;
     o.temperature = 0;
     CHECK_NEAR(freqs(o, 10)[1], 1.0, 1e-9);
+    CHECK((dist(o) == std::vector<double>{0, 1, 0, 0, 0, 0}));  // greedy: one-hot
+    {  // draw: index i with probability w[i] / sum(w), never a zero weight
+        Sampler s(o);
+        const std::vector<double> w = {0.5, 0, 1.5, 2};
+        std::vector<double> f(4, 0);
+        for (int i = 0; i < n; ++i) f[static_cast<size_t>(s.draw(w))] += 1.0 / n;
+        for (size_t i = 0; i < 4; ++i) CHECK_NEAR(f[i], w[i] / 4, 0.005);
+        CHECK_THROWS(s.draw({0, 0}));
+    }
     const std::vector<float> tie = {3.f, 5.f, 5.f};
     Sampler greedy(o);
     CHECK(greedy(tie.data(), 3) == 1);  // the lowest id among equal logits
@@ -3344,6 +3534,7 @@ static void test_gpu_forward_cached(const Model& m) {
     test_generate(m);
     test_generate_trace(m);
     test_generate_batch(m);
+    test_generate_speculative(m, random_model(m.cfg(), 43));  // steps of several rows, rolled back on the GPU
     set_device(Device::Both);
     detail::set_gpu_min_rows(2);
     test_forward_cached(m);
@@ -3666,9 +3857,13 @@ int main(int argc, char** argv) {
         run("analysis", "generate_batch = generate on each, per-sequence hooks, traces: " + kv.first, [&] { test_generate_batch(m); });
         run("analysis", "generate: greedy = argmax, stops, hooks, sampling: " + kv.first, [&] { test_generate(m); });
         run("analysis", "generate's trace = full-pass analyses at each step: " + kv.first, [&] { test_generate_trace(m); });
+        run("analysis", "speculative decoding: greedy = plain greedy, hooks, trace, limits: " + kv.first, [&] {
+            test_generate_speculative(m, random_model(kv.second, 43));
+        });
     }
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
-    run("fp16", "linear layers on 1-4 rows: direct from the weights, fp16 = rounded float32", test_linear_few_rows);
+    run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);
+    run("fp16", "linear layers on 1-16 rows: direct from the weights, fp16 = rounded float32, rows independent", test_linear_few_rows);
     run("fp16", "fp16 conversion", test_half_conversion);
     run("fp16", "fp16 weights: reads, linear, matmul", test_fp16_weight);
     run("fp16", "fp16 weights: loading converts as it reads", test_fp16_load);
@@ -3762,6 +3957,8 @@ int main(int argc, char** argv) {
                 test_fp16_kv(m16, kv.second);
                 detail::set_gpu_min_rows(0);
             }
+            set_device(Device::Gpu);  // speculative steps on the fp16 cache, rolled back on the GPU
+            test_generate_speculative(m16, random_model(kv.second, 43, WeightFormat::fp16));
             set_device(Device::Both);
         });
     for (const auto& kv : gpu_block_configs())

@@ -39,6 +39,32 @@ struct TraceStep {
     std::vector<Attention> attention;  // every head, with TraceOptions::attention_top
 };
 
+// Speculative decoding (GenerateOptions::speculative): each step proposes a few tokens cheaply, then the
+// model checks them all in one pass (its weights read once, as for a single token) and keeps those it
+// agrees with, plus one token of its own. The draft only changes the speed, never what is generated:
+// greedy decoding gives the tokens it gives without speculation (up to rounding, since the checking pass
+// computes several rows at once), and sampling draws from the same distribution by the standard
+// acceptance rule (Leviathan et al. 2023, Chen et al. 2023), though not the same tokens for a given seed.
+struct SpeculativeStats {
+    int64_t steps = 0;     // checking passes of the model
+    int64_t drafted = 0;   // tokens proposed
+    int64_t accepted = 0;  // ... and kept
+};
+
+struct SpeculativeOptions {
+    // The most tokens proposed per step; 0: no speculation. Steps propose fewer after a rejection (down
+    // to 1) and more after a step that kept them all, so text the draft can't predict costs little.
+    int64_t draft_tokens = 0;
+    // Who proposes them: `draft`, a smaller model with the same tokenizer (e.g. Llama 3.2 1B for Llama
+    // 3.1 8B), sampling with the same options. Or, without one, prompt lookup: the tokens that followed
+    // the most recent earlier occurrence of the text's last `ngram` tokens (or fewer, down to 1). Prompt
+    // lookup costs nothing and helps where the output repeats the text before it (editing, summarizing,
+    // quoting, code); elsewhere steps without a match are plain steps.
+    const Model* draft = nullptr;
+    int64_t ngram = 3;
+    SpeculativeStats* stats = nullptr;  // if set, receives the counts
+};
+
 struct GenerateOptions {
     int64_t max_new_tokens = 32;
     double temperature = 0;  // 0: greedy, the most likely token (the lowest id among equal ones)
@@ -50,6 +76,7 @@ struct GenerateOptions {
     // Called with each new token as it is chosen; returning false stops after it.
     std::function<bool(int64_t token)> on_token;
     TraceOptions trace;  // what generate() records when given a trace to fill
+    SpeculativeOptions speculative;  // generate() only
 };
 
 // Picks the next token from a row of logits by GenerateOptions' rules: temperature, then top_k, then
@@ -58,8 +85,16 @@ class Sampler {
   public:
     explicit Sampler(const GenerateOptions& options);
     int64_t operator()(const float* logits, int64_t n);
+    // The distribution operator() samples from, over all n tokens: zero outside the candidates, one-hot
+    // when it would pick the most likely token (greedy). For speculative decoding's acceptance rule.
+    void distribution(const float* logits, int64_t n, std::vector<double>& p);
+    double uniform();                            // in [0, 1), from the generator's top 53 bits
+    int64_t draw(const std::vector<double>& w);  // index i with probability w[i] / sum(w)
 
   private:
+    // Fills candidates_ and returns how many of them (the first) can be picked, most likely first where
+    // that matters; 0 when the pick is `best` alone (greedy, top_k 1, or an infinite logit).
+    size_t candidates(const float* logits, int64_t n, int64_t& best);
     double temperature_, top_p_;
     int64_t top_k_;
     std::mt19937_64 rng_;
@@ -73,6 +108,10 @@ class Sampler {
 // With `trace`, it also receives a TraceStep per new token (options.trace says what each holds), before
 // on_token is called for that token. Activations are recorded after `hooks` ran: the trace shows what
 // the model computed, interventions included.
+// With options.speculative.draft_tokens, steps are speculative (see SpeculativeOptions): the prompt but
+// its last token runs in one pass, then each step runs the last token with the proposed ones, so hooks
+// see those rows, proposals the model then rejects included. Rejected rows are dropped from the cache and
+// the trace, and since attention is causal the kept rows are what they would be without speculation.
 Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
                 const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
 
@@ -81,7 +120,7 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
 // read once for all of them. A sequence that stops sits the later steps out. hooks (empty, or one per
 // sequence, each may be null) apply to their sequence only: each sees its own rows of every activation
 // (hook_pattern is not available). traces: one per sequence, as generate()'s trace (attention_top must
-// be 0). options.on_token is not used: give generate() one sequence to follow it token by token.
+// be 0). options.on_token and options.speculative are not used: give generate() one sequence for them.
 std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts, const GenerateOptions& options = {},
                                    const std::vector<const Hooks*>& hooks = {},
                                    std::vector<std::vector<TraceStep>>* traces = nullptr);
