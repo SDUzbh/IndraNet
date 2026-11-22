@@ -21,8 +21,8 @@ float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t ot
 float next_token_loss(const Tensor& logits, const Tokens& tokens);
 
 // Patching, ablation and head_means run their independent forward passes on this many threads.
-// The default (n = 0) is the TFI_THREADS environment variable, else every core. Results are the
-// same for any thread count.
+// The default (n = 0) is the TFI_THREADS environment variable (read at first use), else every core.
+// Results are the same for any thread count.
 void set_num_threads(int n);
 int num_threads();
 
@@ -33,7 +33,8 @@ int num_threads();
 //   Cpu: everything on the CPU;
 //   Gpu: the GPU for everything it can run, whatever the size, and never the CPU instead: setting it
 //     throws if there is no Metal GPU (or not macOS), and GPU work that keeps failing is an error.
-// Until set_device is called, the TFI_NO_GPU environment variable (any value but 0) selects Cpu.
+// Until set_device is called, the TFI_NO_GPU environment variable (any value but 0; read at first use)
+// selects Cpu.
 enum class Device { Cpu, Both, Gpu };
 void set_device(Device device);
 Device device();

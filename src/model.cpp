@@ -67,6 +67,20 @@ void hook(const Hooks* hooks, const std::string& name, Tensor& act) {
 
 std::string layer_prefix(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
 
+// A block's hook points, in the order of Model::hook_names_.
+enum HookPoint { kHookResidPre, kHookAttnIn, kHookAttnOut, kHookMlpIn, kHookMlpOut, kHookResidMid, kHookResidPost, kHookQ, kHookK, kHookV, kHookPattern,
+                 kHookZ, kHookPre, kHookPost, kHookPoints };
+constexpr const char* kHookSuffix[kHookPoints] = {"hook_resid_pre",   "hook_attn_in",      "hook_attn_out", "hook_mlp_in",
+                                                  "hook_mlp_out",     "hook_resid_mid",    "hook_resid_post", "attn.hook_q",
+                                                  "attn.hook_k",      "attn.hook_v",       "attn.hook_pattern", "attn.hook_z",
+                                                  "mlp.hook_pre",     "mlp.hook_post"};
+// A block's parameters, in the order of Model::param_names_.
+enum Param { kParamQ, kParamK, kParamV, kParamO, kParamUp, kParamGate, kParamDown, kParamLn1, kParamLn1Post, kParamLn2, kParamLn2Post,
+             kParamQNorm, kParamKNorm, kParams };
+constexpr const char* kParamPrefix[kParams] = {"attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.up",
+                                               "mlp.gate",    "mlp.down",    "ln1",         "ln1_post",    "ln2",
+                                               "ln2_post",    "attn.q_norm", "attn.k_norm"};
+
 // M_PI and friends are POSIX extensions that strict -std=c++17 builds (e.g. glibc) do not define.
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSqrtHalf = 0.70710678118654752440;
@@ -348,6 +362,13 @@ Model::Model(ModelConfig cfg, std::map<std::string, Weight> weights, WeightForma
 void Model::check_shapes() {
     cfg_.validate();
     for (int64_t i = 0; i < cfg_.n_layers; ++i) layer_cfgs_.push_back(cfg_.layer_config(i));
+    for (int64_t i = 0; i < cfg_.n_layers; ++i)
+        for (const char* suffix : kHookSuffix) hook_names_.push_back(layer_prefix(i) + suffix);
+    for (int64_t i = 0; i < cfg_.n_layers; ++i)
+        for (const char* param : kParamPrefix) {
+            param_names_.push_back(layer_prefix(i) + param + ".weight");
+            param_names_.push_back(layer_prefix(i) + param + ".bias");
+        }
     // Every weight the forward pass reads must exist with the shape the config implies (as
     // indranet's modules create them); nothing is read unchecked later.
     auto expect = [&](const std::string& name, const Shape& s) {
@@ -627,12 +648,25 @@ std::vector<std::string> Model::hook_names() const {
     return names;
 }
 
+const std::string& Model::hook_name(int64_t layer, int point) const {
+    return hook_names_[static_cast<size_t>(layer * kHookPoints + point)];
+}
+
+const std::string& Model::param_name(int64_t layer, int param, bool bias) const {
+    return param_names_[static_cast<size_t>((layer * kParams + param) * 2 + (bias ? 1 : 0))];
+}
+
 Tensor Model::norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const {
     if (c.norm == "none") return x;
-    const Tensor& w = weight(prefix + ".weight").f32();
-    const Weight* b = weight_or_null(prefix + ".bias");
+    return norm_named(prefix + ".weight", prefix + ".bias", c, x);
+}
+
+Tensor Model::norm_named(const std::string& weight_name, const std::string& bias_name, const ModelConfig& c, const Tensor& x) const {
+    if (c.norm == "none") return x;
+    const Tensor& w = weight(weight_name).f32();
+    const Weight* b = weight_or_null(bias_name);
     const int64_t d = x.size(-1), n = x.numel() / d;
-    if (w.numel() != d) throw std::runtime_error(prefix + ".weight does not match the normalized size");
+    if (w.numel() != d) throw std::runtime_error(weight_name + " does not match the normalized size");
     const float eps = static_cast<float>(c.norm_eps);
     Tensor y(x.shape);
     const float* wp = w.ptr();
@@ -686,10 +720,11 @@ Tensor Model::positional_embedding_at(const std::vector<int64_t>& positions) con
 
 namespace {
 
-// linear() with the weight `prefix`.weight (and .bias if present); on the GPU for large batches.
-Tensor project(const Model& m, const Tensor& x, const std::string& prefix, const detail::RowBatch* batch) {
-    const Weight& W = m.weight(prefix + ".weight");
-    const Weight* b = m.weight_or_null(prefix + ".bias");
+// linear() with the weight named `weight_name` (and the bias `bias_name` if present); on the GPU for large batches.
+Tensor project(const Model& m, const Tensor& x, const std::string& weight_name, const std::string& bias_name,
+               const detail::RowBatch* batch) {
+    const Weight& W = m.weight(weight_name);
+    const Weight* b = m.weight_or_null(bias_name);
 #ifdef TFI_USE_ACCELERATE
     if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows())
         return batch->gpu->linear(x, W, b, batch->fp16);
@@ -700,12 +735,14 @@ Tensor project(const Model& m, const Tensor& x, const std::string& prefix, const
 }
 
 // project() for several weights that read the same x; on the GPU they share one submission.
-std::vector<Tensor> project_many(const Model& m, const Tensor& x, const std::vector<std::string>& prefixes,
+// (weight, bias) names: each pair as project()'s.
+std::vector<Tensor> project_many(const Model& m, const Tensor& x,
+                                 std::initializer_list<std::pair<const std::string*, const std::string*>> names,
                                  const detail::RowBatch* batch) {
     std::vector<const Weight*> Ws, bs;
-    for (const std::string& p : prefixes) {
-        Ws.push_back(&m.weight(p + ".weight"));
-        bs.push_back(m.weight_or_null(p + ".bias"));
+    for (const auto& [w, b] : names) {
+        Ws.push_back(&m.weight(*w));
+        bs.push_back(m.weight_or_null(*b));
     }
 #ifdef TFI_USE_ACCELERATE
     if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows())
@@ -775,10 +812,10 @@ struct HeadAttention {
 }  // namespace
 
 Tensor Model::attention(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const {
-    const std::string p = layer_prefix(layer) + "attn.";
-    std::vector<Tensor> qkv = project_many(*this, x, {p + "q_proj", p + "k_proj", p + "v_proj"}, batch);
+    auto names = [&](int param) { return std::make_pair(&param_name(layer, param), &param_name(layer, param, true)); };
+    std::vector<Tensor> qkv = project_many(*this, x, {names(kParamQ), names(kParamK), names(kParamV)}, batch);
     Tensor z = attend(layer, std::move(qkv[0]), std::move(qkv[1]), std::move(qkv[2]), hooks, batch);
-    return project(*this, z, p + "o_proj", batch);
+    return project(*this, z, param_name(layer, kParamO), param_name(layer, kParamO, true), batch);
 }
 
 Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks* hooks,
@@ -795,7 +832,6 @@ Tensor Model::attend(int64_t layer, Tensor q2, Tensor k2, Tensor v2, const Hooks
 void Model::attend_into(int64_t layer, const float* q2, const float* k2, const float* v2, int64_t T, const Hooks* hooks,
                         const detail::RowBatch* batch, float* z_out) const {
     const ModelConfig& c = layer_cfgs_[layer];
-    const std::string p = layer_prefix(layer) + "attn.";
     const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv;
     if (batch && batch->whole) batch = nullptr;  // one whole sequence: as a single pass, hook_pattern included
 
@@ -805,8 +841,8 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
     if (c.qk_norm) {
         ModelConfig qc = c;
         if (qc.norm == "none") qc.norm = "rmsnorm";
-        q = norm(p + "q_norm", qc, q);
-        k = norm(p + "k_norm", qc, k);
+        q = norm_named(param_name(layer, kParamQNorm), param_name(layer, kParamQNorm, true), qc, q);
+        k = norm_named(param_name(layer, kParamKNorm), param_name(layer, kParamKNorm, true), qc, k);
     }
     if (c.positional == "rope") {
         std::vector<int64_t> positions;
@@ -816,19 +852,19 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         apply_rope_(q, c, false, batch ? &positions : nullptr);
         apply_rope_(k, c, false, batch ? &positions : nullptr);
     }
-    hook(hooks, p + "hook_q", q);
-    hook(hooks, p + "hook_k", k);
-    hook(hooks, p + "hook_v", v);
+    hook(hooks, hook_name(layer, kHookQ), q);
+    hook(hooks, hook_name(layer, kHookK), k);
+    hook(hooks, hook_name(layer, kHookV), v);
     // Attention reads T rows of each: a hook that resized one would make it read past the end.
     if (q.shape != Shape{H, T, D} || k.shape != Shape{Hkv, T, D} || v.shape != Shape{Hkv, T, D})
-        throw std::runtime_error(p + "hook_q / hook_k / hook_v: a hook changed the activation's shape");
+        throw std::runtime_error(layer_prefix(layer) + "attn.hook_q / hook_k / hook_v: a hook changed the activation's shape");
 
     const std::vector<float> slopes = c.positional == "alibi" ? alibi_slopes(H) : std::vector<float>();
     HeadAttention ha{D, static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D))),
                      c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f, 0.f,
                      c.sliding_window ? *c.sliding_window : 0};
     // z goes straight to z_out, unless a hook needs it as a tensor first.
-    const bool hook_z = hooks && hooks->matches(p + "hook_z");
+    const bool hook_z = hooks && hooks->matches(hook_name(layer, kHookZ));
     Tensor zt = hook_z ? Tensor({T, H, D}) : Tensor();
     float* z = hook_z ? zt.ptr() : z_out;
     if (!batch) {
@@ -838,7 +874,7 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
             const float* kh = k.ptr() + (h / rep) * T * D;
             ha.pattern(q.ptr() + h * T * D, T, 0, nullptr, kh, pattern.ptr() + h * T * T, T);
         }
-        hook(hooks, p + "hook_pattern", pattern);
+        hook(hooks, hook_name(layer, kHookPattern), pattern);
         for (int64_t h = 0; h < H; ++h) {
             const float* vh = v.ptr() + (h / rep) * T * D;
             ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z + h * D, H * D);
@@ -852,7 +888,7 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         const Tensor* pk = first ? batch->prefix_k.at(layer) : nullptr;
         const Tensor* pv = first ? batch->prefix_v.at(layer) : nullptr;
         const int64_t Tp = pk ? pk->shape[1] : 0;
-        const bool want = hooks && hooks->matches(p + "hook_pattern");
+        const bool want = hooks && hooks->matches(hook_name(layer, kHookPattern));
         Tensor pattern = want ? Tensor({H, T, nk}) : Tensor();
         std::vector<float> group_probs(want ? 0 : static_cast<size_t>(GR * nk)), out(static_cast<size_t>(GR * D));
         auto probs_of = [&](int64_t g) { return want ? pattern.ptr() + g * GR * nk : group_probs.data(); };
@@ -872,8 +908,8 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         };
         if (want) {
             for (int64_t g = 0; g < Hkv; ++g) score(g);
-            hook(hooks, p + "hook_pattern", pattern);
-            if (pattern.numel() != H * T * nk) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
+            hook(hooks, hook_name(layer, kHookPattern), pattern);
+            if (pattern.numel() != H * T * nk) throw std::runtime_error(hook_name(layer, kHookPattern) + ": a hook changed the activation's size");
             for (int64_t g = 0; g < Hkv; ++g) apply(g);
         } else {
             for (int64_t g = 0; g < Hkv; ++g) {
@@ -900,69 +936,69 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         }
     }
     if (hook_z) {
-        hook(hooks, p + "hook_z", zt);
-        if (zt.numel() != T * H * D) throw std::runtime_error(p + "hook_z changed the activation's size");
+        hook(hooks, hook_name(layer, kHookZ), zt);
+        if (zt.numel() != T * H * D) throw std::runtime_error(hook_name(layer, kHookZ) + " changed the activation's size");
         std::copy(zt.ptr(), zt.ptr() + T * H * D, z_out);
     }
 }
 
 Tensor Model::mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const {
     const ModelConfig& c = layer_cfgs_[layer];
-    const std::string p = layer_prefix(layer) + "mlp.";
     const std::string act = c.mlp_activation();
     Tensor post;
     if (c.mlp == "mlp") {
-        Tensor pre = project(*this, x, p + "up", batch);
-        hook(hooks, p + "hook_pre", pre);
+        Tensor pre = project(*this, x, param_name(layer, kParamUp), param_name(layer, kParamUp, true), batch);
+        hook(hooks, hook_name(layer, kHookPre), pre);
         post = std::move(pre);
         activate_(post, act);
     } else {  // glu, swiglu, geglu: down(act(gate(x)) * up(x))
-        std::vector<Tensor> gate_up = project_many(*this, x, {p + "gate", p + "up"}, batch);
-        hook(hooks, p + "hook_pre", gate_up[0]);
+        auto names = [&](int param) { return std::make_pair(&param_name(layer, param), &param_name(layer, param, true)); };
+        std::vector<Tensor> gate_up = project_many(*this, x, {names(kParamGate), names(kParamUp)}, batch);
+        hook(hooks, hook_name(layer, kHookPre), gate_up[0]);
         post = std::move(gate_up[0]);
         activate_(post, act);
         post = mul(post, gate_up[1]);
     }
-    hook(hooks, p + "hook_post", post);
-    return project(*this, post, p + "down", batch);
+    hook(hooks, hook_name(layer, kHookPost), post);
+    return project(*this, post, param_name(layer, kParamDown), param_name(layer, kParamDown, true), batch);
 }
 
 Tensor Model::block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch) const {
     const ModelConfig& c = layer_cfgs_[layer];
-    const std::string p = layer_prefix(layer);
+    auto norm_ = [&](int param, const Tensor& t) { return norm_named(param_name(layer, param), param_name(layer, param, true), c, t); };
     const bool post = c.norm_position == "post", sandwich = c.norm_position == "sandwich";
-    hook(hooks, p + "hook_resid_pre", x);
+    hook(hooks, hook_name(layer, kHookResidPre), x);
 
-    Tensor attn_in = post ? x : norm(p + "ln1", c, x);
-    hook(hooks, p + "hook_attn_in", attn_in);
+    Tensor attn_in = post ? x : norm_(kParamLn1, x);
+    hook(hooks, hook_name(layer, kHookAttnIn), attn_in);
     Tensor attn_out = attention(layer, attn_in, hooks, batch);
-    if (sandwich) attn_out = norm(p + "ln1_post", c, attn_out);
-    hook(hooks, p + "hook_attn_out", attn_out);
+    if (sandwich) attn_out = norm_(kParamLn1Post, attn_out);
+    hook(hooks, hook_name(layer, kHookAttnOut), attn_out);
 
     auto run_mlp = [&](Tensor mlp_in) {
-        hook(hooks, p + "hook_mlp_in", mlp_in);
+        hook(hooks, hook_name(layer, kHookMlpIn), mlp_in);
         Tensor out = mlp(layer, mlp_in, hooks, batch);
-        if (sandwich) out = norm(p + "ln2_post", c, out);
-        hook(hooks, p + "hook_mlp_out", out);
+        if (sandwich) out = norm_(kParamLn2Post, out);
+        hook(hooks, hook_name(layer, kHookMlpOut), out);
         return out;
     };
 
     if (c.parallel_residual) {
         Tensor mid = add(x, attn_out);
-        hook(hooks, p + "hook_resid_mid", mid);
-        Tensor out = c.has_mlp() ? add(mid, run_mlp(norm(p + "ln2", c, x))) : mid;
-        hook(hooks, p + "hook_resid_post", out);
+        hook(hooks, hook_name(layer, kHookResidMid), mid);
+        Tensor out = c.has_mlp() ? add(mid, run_mlp(norm_(kParamLn2, x))) : mid;
+        hook(hooks, hook_name(layer, kHookResidPost), out);
         return out;
     }
 
     add_(x, attn_out);
-    if (post) x = norm(p + "ln1", c, x);
-    hook(hooks, p + "hook_resid_mid", x);
+    if (post) x = norm_(kParamLn1, x);
+    hook(hooks, hook_name(layer, kHookResidMid), x);
     if (c.has_mlp()) {
-        add_(x, run_mlp(post ? x : norm(p + "ln2", c, x)));
-        if (post) x = norm(p + "ln2", c, x);
+        add_(x, run_mlp(post ? x : norm_(kParamLn2, x)));
+        if (post) x = norm_(kParamLn2, x);
     }
-    hook(hooks, p + "hook_resid_post", x);
+    hook(hooks, hook_name(layer, kHookResidPost), x);
     return x;
 }
 
@@ -1074,13 +1110,29 @@ void round_to_half_(Tensor& t) {
     for (float& v : t.data) v = detail::half_to_float(detail::float_to_half(std::clamp(v, -65504.f, 65504.f)));
 }
 // A hook rounding every layer's hook_k and hook_v so (on the CPU, after the caller's hooks).
-void add_kv_rounding(Hooks& h, int64_t layers) {
-    auto names = std::make_shared<std::set<std::string>>();
-    for (int64_t l = 0; l < layers; ++l) {
-        names->insert(layer_prefix(l) + "attn.hook_k");
-        names->insert(layer_prefix(l) + "attn.hook_v");
+// Which layer's keys or values a hook point name is ("blocks.<l>.attn.hook_k" / "hook_v"), read from the
+// name without building strings (every pass of a cached step asks at each hook point); layer -1: neither.
+struct KVHook {
+    int64_t layer = -1;
+    bool value = false;
+};
+KVHook kv_hook(const std::string& n) {
+    static constexpr char kHead[] = "blocks.", kTail[] = ".attn.hook_";
+    constexpr size_t head = sizeof kHead - 1, tail = sizeof kTail - 1;
+    if (n.size() < head + 1 + tail + 1 || (n.back() != 'k' && n.back() != 'v')) return {};
+    const size_t digits_end = n.size() - 1 - tail;
+    if (n.compare(0, head, kHead) != 0 || n.compare(digits_end, tail, kTail) != 0) return {};
+    int64_t layer = 0;
+    for (size_t i = head; i < digits_end; ++i) {
+        if (n[i] < '0' || n[i] > '9' || layer > (int64_t(1) << 40)) return {};
+        layer = layer * 10 + (n[i] - '0');
     }
-    h.add_filter([names](const std::string& n) { return names->count(n) > 0; }, [](const std::string&, Tensor& a) { round_to_half_(a); });
+    return {layer, n.back() == 'v'};
+}
+
+void add_kv_rounding(Hooks& h, int64_t layers) {
+    h.add_filter([layers](const std::string& n) { const int64_t l = kv_hook(n).layer; return l >= 0 && l < layers; },
+                 [](const std::string&, Tensor& a) { round_to_half_(a); });
 }
 #ifdef TFI_USE_ACCELERATE
 // Floats a KV slot needs for n values: n, or for fp16 values half that.
@@ -1352,17 +1404,16 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     }
     // On the CPU: the new positions' keys and values, as the pass leaves them after any hooks, appended at the end.
     std::vector<Tensor> new_k(L), new_v(L);
-    std::map<std::string, Tensor*> slots;
-    for (int64_t l = 0; l < L; ++l) {
-        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
-        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
-    }
+    auto slot = [&](const std::string& n) -> Tensor* {
+        const KVHook kv = kv_hook(n);
+        return kv.layer < 0 || kv.layer >= L ? nullptr : kv.value ? &new_v[kv.layer] : &new_k[kv.layer];
+    };
     Hooks h;
     if (hooks) h.extend(*hooks);
     if (half && !on_gpu) add_kv_rounding(h, L);  // (the GPU's pass rounds them itself)
     if (!on_gpu)
-        h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
-                      [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
+        h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
+                      [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
 
     Tensor logits;
     if (start == 0 && !on_gpu) {
@@ -1513,17 +1564,16 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         }
     // On the CPU: the new positions' keys and values, (Hkv, R, D) per layer, after any hooks, split per sequence at the end.
     std::vector<Tensor> new_k(L), new_v(L);
-    std::map<std::string, Tensor*> slots;
-    for (int64_t l = 0; l < L; ++l) {
-        slots[layer_prefix(l) + "attn.hook_k"] = &new_k[l];
-        slots[layer_prefix(l) + "attn.hook_v"] = &new_v[l];
-    }
+    auto slot = [&](const std::string& n) -> Tensor* {
+        const KVHook kv = kv_hook(n);
+        return kv.layer < 0 || kv.layer >= L ? nullptr : kv.value ? &new_v[kv.layer] : &new_k[kv.layer];
+    };
     Hooks h;
     if (hooks) h.extend(*hooks);
     if (half && !on_gpu) add_kv_rounding(h, L);  // (the GPU's pass rounds them itself)
     if (!on_gpu)
-        h.add_capture([&slots](const std::string& n) { return slots.count(n) > 0; },
-                      [&slots](const std::string& n, Tensor& act) { *slots.at(n) = act; });
+        h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
+                      [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
 
     // Each sequence's rows of a (rows, width) tensor, (len, width).
     auto seg_rows = [&](const Tensor& t, int64_t sg, bool last) {
@@ -2296,7 +2346,7 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                     s.attention_pattern(q, k, kLse, shape.has_slopes ? kSlopes : kLse, kPattern, shape);
                     gb.run();
                     Tensor P({H, R, R}, std::vector<float>(s.data(kPattern), s.data(kPattern) + H * R * R));
-                    hook(hooks, p + "hook_pattern", P);
+                    hook(hooks, hook_name(l, kHookPattern), P);
                     if (P.numel() != H * R * R) throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
                     std::copy(P.ptr(), P.ptr() + P.numel(), s.data(kPattern));
                     s.attention_apply(kPattern, v, kZ, shape);

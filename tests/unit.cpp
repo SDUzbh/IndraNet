@@ -431,63 +431,129 @@ static void check_close(const Tensor& got, const Tensor& want) {
 // patched position on, and on macOS GPU linear layers. Every batch size, with the GPU off and on,
 // must agree with naive patching, and the thread count must never change a result.
 // Batched reference means and ablation agree with one plain forward pass per reference and per head.
-static void check_ablation_matches_naive(const Model& m, const Tokens& t) {
-    const int64_t T = static_cast<int64_t>(t.size());
-    for (const std::vector<Tokens>& refs : std::vector<std::vector<Tokens>>{
-             {seq(T, 61), seq(T, 62), seq(T, 63)},  // one mean per position
-             {seq(T, 61), seq(4, 62), seq(T + 2, 63)}}) {  // other lengths: one pooled mean
-        const HeadMeans means = head_means(m, refs, T);
+// The reference sets ablation is checked with: equal lengths (a mean per position), then mixed lengths
+// (one pooled mean).
+static std::vector<std::vector<Tokens>> ablation_reference_sets(int64_t T) {
+    return {{seq(T, 61), seq(T, 62), seq(T, 63)}, {seq(T, 61), seq(4, 62), seq(T + 2, 63)}};
+}
+
+// Naive head means and ablation for one reference set: the means summed from each reference's own
+// pass, and (per-position means only) each head's loss increase from a whole forward pass with it ablated.
+struct NaiveAblation {
+    HeadMeans means;
+    std::map<int, Tensor> loss;  // per Ablation mode: (L, max heads); empty for pooled means
+    float base = 0;
+};
+
+static std::vector<NaiveAblation> naive_ablation(const Model& m, const Tokens& t) {
+    const int64_t T = static_cast<int64_t>(t.size()), L = m.cfg().n_layers;
+    std::vector<NaiveAblation> out;
+    for (const std::vector<Tokens>& refs : ablation_reference_sets(T)) {
+        bool per_position = true;
+        for (const Tokens& r : refs) per_position = per_position && static_cast<int64_t>(r.size()) == T;
+        NaiveAblation na;
         double count = 0;
-        std::vector<Tensor> naive;
-        for (int64_t l = 0; l < m.cfg().n_layers; ++l) naive.emplace_back(means.layers[l].shape);
         for (const Tokens& r : refs) {
             ActivationCache c;
             m.run_with_cache(r, c, [](const std::string& n) { return n.find("attn.hook_z") != std::string::npos; });
-            for (int64_t l = 0; l < m.cfg().n_layers; ++l) {
+            for (int64_t l = 0; l < L; ++l) {
                 const Tensor& z = c.at("blocks." + std::to_string(l) + ".attn.hook_z");
                 const int64_t row = z.numel() / z.shape[0];
-                for (int64_t p = 0; p < z.shape[0]; ++p)
-                    for (int64_t e = 0; e < row; ++e)
-                        naive[l].data[(means.per_position() ? p : 0) * row + e] += z.data[p * row + e];
-            }
-            count += means.per_position() ? 1.0 : static_cast<double>(r.size());
-        }
-        for (int64_t l = 0; l < m.cfg().n_layers; ++l) {
-            for (float& v : naive[l].data) v = static_cast<float>(v / count);
-            CHECK(max_abs_diff(means.layers[l], naive[l]) <= 1e-5f * std::max(1.f, max_abs(naive[l])));
-        }
-        if (!means.per_position()) continue;
-        const float base = next_token_loss(m.forward(t), t);
-        for (Ablation mode : {Ablation::Zero, Ablation::Mean}) {
-            const Tensor got = head_ablation(m, t, mode, refs);
-            for (int64_t l = 0; l < m.cfg().n_layers; ++l)
-                for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h) {
-                    const Hooks hk = ablate_head(m, l, h, mode, mode == Ablation::Mean ? &means : nullptr);
-                    // float rounding grows with the loss (models without norms reach losses in the hundreds)
-                    CHECK_NEAR(got.at({l, h}), next_token_loss(m.forward(t, &hk), t) - base, 1e-5 * std::max(1.f, std::fabs(base)));
+                if (static_cast<int64_t>(na.means.layers.size()) <= l) {  // hook_z's shape, one row or one per position
+                    Shape shape = z.shape;
+                    shape[0] = per_position ? T : 1;
+                    na.means.layers.emplace_back(shape);
                 }
+                for (int64_t p = 0; p < z.shape[0]; ++p)
+                    for (int64_t e = 0; e < row; ++e) na.means.layers[l].data[(per_position ? p : 0) * row + e] += z.data[p * row + e];
+            }
+            count += per_position ? 1.0 : static_cast<double>(r.size());
+        }
+        for (Tensor& layer : na.means.layers)
+            for (float& v : layer.data) v = static_cast<float>(v / count);
+        if (per_position) {
+            na.base = next_token_loss(m.forward(t), t);
+            for (Ablation mode : {Ablation::Zero, Ablation::Mean}) {
+                Tensor loss({L, m.max_heads()}, NAN);
+                for (int64_t l = 0; l < L; ++l)
+                    for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h) {
+                        const Hooks hk = ablate_head(m, l, h, mode, mode == Ablation::Mean ? &na.means : nullptr);
+                        loss.at({l, h}) = next_token_loss(m.forward(t, &hk), t) - na.base;
+                    }
+                na.loss[static_cast<int>(mode)] = std::move(loss);
+            }
+        }
+        out.push_back(std::move(na));
+    }
+    return out;
+}
+
+// head_means and head_ablation (batched, possibly on the GPU) against the naive results.
+static void check_ablation_matches_naive(const Model& m, const Tokens& t, const std::vector<NaiveAblation>& naive) {
+    const std::vector<std::vector<Tokens>> sets = ablation_reference_sets(static_cast<int64_t>(t.size()));
+    for (size_t i = 0; i < sets.size() && i < naive.size(); ++i) {
+        const HeadMeans means = head_means(m, sets[i], static_cast<int64_t>(t.size()));
+        const NaiveAblation& na = naive[i];
+        CHECK(means.layers.size() == na.means.layers.size());
+        for (size_t l = 0; l < means.layers.size() && l < na.means.layers.size(); ++l)
+            CHECK(max_abs_diff(means.layers[l], na.means.layers[l]) <= 1e-5f * std::max(1.f, max_abs(na.means.layers[l])));
+        if (!means.per_position()) continue;
+        for (Ablation mode : {Ablation::Zero, Ablation::Mean}) {
+            const Tensor got = head_ablation(m, t, mode, sets[i]);
+            const Tensor& want = na.loss.at(static_cast<int>(mode));
+            for (int64_t l = 0; l < m.cfg().n_layers; ++l)
+                for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h)
+                    // float rounding grows with the loss (models without norms reach losses in the hundreds)
+                    CHECK_NEAR(got.at({l, h}), want.at({l, h}), 1e-5 * std::max(1.f, std::fabs(na.base)));
         }
     }
 }
 
-static void test_optimized_patching_matches_naive(const Model& m) {
-    // forward_from reproduces forward exactly from any layer's cached input.
-    const Tokens t = seq(9, 51);
-    ActivationCache cache;
-    const Tensor full = m.run_with_cache(t, cache);
-    for (int64_t l = 0; l <= m.cfg().n_layers; ++l) {
-        const Tensor start = l < m.cfg().n_layers ? cache.at("blocks." + std::to_string(l) + ".hook_resid_pre")
-                                                  : cache.at("blocks." + std::to_string(l - 1) + ".hook_resid_post");
-        CHECK(max_abs_diff(m.forward_from(l, start), full) == 0.f);
+// The naive results test_optimized_patching_matches_naive compares with, computed once per model on the
+// CPU: they don't depend on the batch sizes, threads or device the optimized paths are tried with.
+struct NaiveRefs {
+    std::map<std::pair<int64_t, std::string>, Tensor> residual;  // (pos, site)
+    std::map<std::pair<int64_t, int64_t>, Tensor> heads;         // (pos, other)
+    std::vector<NaiveAblation> ablation;
+};
+
+static NaiveRefs naive_refs(const Model& m, const Tokens& t, const Tokens& corrupt) {
+    const Device before = device();
+    set_device(Device::Cpu);
+    NaiveRefs r;
+    for (int64_t pos : {8, 3}) {
+        for (const std::string site : {"resid_pre", "resid_mid", "attn_out", "mlp_out", "resid_post"})
+            r.residual[{pos, site}] = naive_patch(m, t, corrupt, site, pos, 1, 2);
+        for (int64_t other : {2, -1}) r.heads[{pos, other}] = naive_patch_heads(m, t, corrupt, pos, 1, other);
     }
-    CHECK_THROWS(m.forward_from(-1, cache.at("blocks.0.hook_resid_pre")));
-    CHECK_THROWS(m.forward_from(0, Tensor({9, m.cfg().d_model + 1})));
+    r.ablation = naive_ablation(m, t);
+    set_device(before);
+    return r;
+}
+
+// cpu_parts false leaves out what doesn't involve the GPU (forward_from, the CPU's batched passes), for
+// callers that already ran it on the same model and only change a GPU setting.
+static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts = true) {
+    const Tokens t = seq(9, 51);
+    if (cpu_parts) {  // forward_from reproduces forward exactly from any layer's cached input
+        ActivationCache cache;
+        const Tensor full = m.run_with_cache(t, cache);
+        for (int64_t l = 0; l <= m.cfg().n_layers; ++l) {
+            const Tensor start = l < m.cfg().n_layers ? cache.at("blocks." + std::to_string(l) + ".hook_resid_pre")
+                                                      : cache.at("blocks." + std::to_string(l - 1) + ".hook_resid_post");
+            CHECK(max_abs_diff(m.forward_from(l, start), full) == 0.f);
+        }
+        CHECK_THROWS(m.forward_from(-1, cache.at("blocks.0.hook_resid_pre")));
+        CHECK_THROWS(m.forward_from(0, Tensor({9, m.cfg().d_model + 1})));
+    }
 
     Tokens corrupt = t;
     corrupt[2] = (corrupt[2] + 5) % m.cfg().vocab_size;
     corrupt[6] = (corrupt[6] + 9) % m.cfg().vocab_size;
     const int64_t last = m.cfg().n_layers - 1;
-    std::vector<bool> gpu_modes = {false};
+    const NaiveRefs naive = naive_refs(m, t, corrupt);
+    std::vector<bool> gpu_modes;
+    if (cpu_parts) gpu_modes.push_back(false);
 #ifdef TFI_USE_ACCELERATE
     if (m.gpu()) gpu_modes.push_back(true);
 #endif
@@ -503,15 +569,15 @@ static void test_optimized_patching_matches_naive(const Model& m) {
             for (int64_t pos : {8, 3}) {
                 for (const std::string site : {"resid_pre", "resid_mid", "attn_out", "mlp_out", "resid_post"}) {
                     const PatchResult r = patch_residual(m, t, corrupt, site, pos, 1, 2);
-                    check_close(r.effect, naive_patch(m, t, corrupt, site, pos, 1, 2));
+                    check_close(r.effect, naive.residual.at({pos, site}));
                     // After the last layer's attention, earlier positions cannot reach `pos`: exactly 0.
                     if (site != "resid_pre" && !std::isnan(r.effect.at({last, 0})))
                         for (int64_t q = 0; q < pos; ++q) CHECK(r.effect.at({last, q}) == 0.f);
                 }
-                check_close(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive_patch_heads(m, t, corrupt, pos, 1, 2));
-                check_close(patch_heads(m, t, corrupt, pos, 1, -1).effect, naive_patch_heads(m, t, corrupt, pos, 1, -1));
+                check_close(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive.heads.at({pos, 2}));
+                check_close(patch_heads(m, t, corrupt, pos, 1, -1).effect, naive.heads.at({pos, -1}));
             }
-            check_ablation_matches_naive(m, t);
+            check_ablation_matches_naive(m, t, naive.ablation);
         }
         // The thread count never changes a result.
         detail::set_patch_batch_rows(5, 9);
@@ -568,8 +634,8 @@ static void test_optimized_patching_matches_naive(const Model& m) {
         };
         for (int64_t pos : {8, 3}) {
             for (const std::string site : {"resid_pre", "attn_out", "mlp_out"})
-                check_fp16(patch_residual(m, t, corrupt, site, pos, 1, 2).effect, naive_patch(m, t, corrupt, site, pos, 1, 2));
-            check_fp16(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive_patch_heads(m, t, corrupt, pos, 1, 2));
+                check_fp16(patch_residual(m, t, corrupt, site, pos, 1, 2).effect, naive.residual.at({pos, site}));
+            check_fp16(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive.heads.at({pos, 2}));
         }
         set_num_threads(1);
         const Tensor f1 = patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect;
@@ -3177,6 +3243,31 @@ static void test_generate(const Model& m) {
     CHECK_THROWS(generate(m, {}, o));
 }
 
+// Two-digit layers: the cached pass recognizes each layer's keys and values by their hook names
+// ("blocks.11.attn.hook_k"), in float32 and with the fp16 cache's rounding.
+static void test_forward_cached_many_layers() {
+    const ModelConfig c = tiny([](ModelConfig& x) { x.n_layers = 12; });
+    const Model m = random_model(c, 61);
+    const Tokens t = seq(9, 62);
+    const Tensor full = m.forward(t);
+    KVCache cache;
+    std::vector<Tensor> parts{m.forward_cached(Tokens(t.begin(), t.begin() + 5), cache)};
+    for (size_t i = 5; i < t.size(); ++i) parts.push_back(m.forward_cached({t[i]}, cache));
+    const Tensor got = stack_rows(parts);
+    float worst = 0, scale = 1;
+    for (size_t i = 0; i < full.data.size(); ++i) {
+        worst = std::max(worst, std::fabs(got.data[i] - full.data[i]));
+        scale = std::max(scale, std::fabs(full.data[i]));
+    }
+    CHECK(got.shape == full.shape && worst < 1e-4f * scale);
+    CHECK(cache.keys(11).shape[1] == 9 && cache.values(10).shape[1] == 9);
+    const Model m16 = random_model(c, 61, WeightFormat::fp16);
+    const Device before = device();
+    set_device(Device::Cpu);
+    test_fp16_kv(m16, c);
+    set_device(before);
+}
+
 // generate()'s trace: each step = the full-pass analyses at that position on the text so far (the
 // chosen token's probability and top tokens, logit lens, DLA, where each head attended), hooks included.
 static void test_generate_trace(const Model& m) {
@@ -3934,6 +4025,7 @@ int main(int argc, char** argv) {
             test_generate_speculative(m, random_model(kv.second, 43));
         });
     }
+    run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16", test_forward_cached_many_layers);
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
     run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);
     run("fp16", "linear layers on 1-16 rows: direct from the weights, fp16 = rounded float32, rows independent", test_linear_few_rows);
@@ -3989,10 +4081,11 @@ int main(int argc, char** argv) {
     for (const auto& kv : gpu_block_configs())
         run("gpu", "attention on the GPU: batched passes = per-layer and plain (macOS): " + kv.first, [&] {
             detail::set_gpu_attention(true);
+            const Model pm = random_model(kv.second, 47);
             for (bool tiled : {true, false}) {
                 detail::set_gpu_attention_tiled(tiled);
                 test_gpu_resident(random_model(kv.second, 43));
-                test_optimized_patching_matches_naive(random_model(kv.second, 47));
+                test_optimized_patching_matches_naive(pm, /*cpu_parts=*/tiled);  // the CPU's parts once
             }
             detail::set_gpu_attention_tiled(true);
             detail::set_gpu_attention(false);

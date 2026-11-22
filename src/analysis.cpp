@@ -168,8 +168,11 @@ void set_device(Device d) {
 
 Device device() {
     if (const int d = g_device.load(); d >= 0) return static_cast<Device>(d);
-    const char* env = std::getenv("TFI_NO_GPU");
-    return !env || !*env || std::string(env) == "0" ? Device::Both : Device::Cpu;
+    static const Device from_env = [] {  // read once: every linear layer asks
+        const char* env = std::getenv("TFI_NO_GPU");
+        return !env || !*env || std::string(env) == "0" ? Device::Both : Device::Cpu;
+    }();
+    return from_env;
 }
 
 void set_use_gpu(bool use) { set_device(use ? Device::Both : Device::Cpu); }
@@ -181,15 +184,13 @@ bool use_gpu() { return device() != Device::Cpu; }
 
 int num_threads() {
     if (const int n = g_threads.load(); n > 0) return n;
-    if (const char* env = std::getenv("TFI_THREADS")) {
-        const int n = std::atoi(env);
-        if (n > 0) return n;
-    }
-    static const int hw = [] {  // asks the system, so once: linear layers on few rows call this every time
+    static const int from_env = [] {  // TFI_THREADS, else the cores: read once, as every linear layer asks
+        if (const char* env = std::getenv("TFI_THREADS"))
+            if (const int n = std::atoi(env); n > 0) return n;
         const unsigned n = std::thread::hardware_concurrency();
         return n ? static_cast<int>(n) : 1;
     }();
-    return hw;
+    return from_env;
 }
 
 float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
