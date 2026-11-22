@@ -69,6 +69,7 @@ jobs:
           cp build/libtfi.a "$name/lib/"
           cp -R include "$name/include"
           cp README.md "$name/"
+          cp -R docs "$name/docs"
           tar czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:

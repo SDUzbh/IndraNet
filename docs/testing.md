@@ -90,5 +90,5 @@ git tag v0.1.0 && git push origin v0.1.0
 
 [.github/workflows/release.yml](../.github/workflows/release.yml) checks that the tag matches the
 version and reruns CI. It then publishes a GitHub Release with `indra` binaries (CLI, static
-library, headers) for Linux x86-64 and macOS arm64, plus the Python wheel and sdist. Tags with a
+library, headers, the README and docs/) for Linux x86-64 and macOS arm64, plus the Python wheel and sdist. Tags with a
 hyphen, such as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action versions up to date.
