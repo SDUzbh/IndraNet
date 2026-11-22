@@ -45,14 +45,20 @@ constexpr int64_t kDirectMaxRows = 16;
 // compiler may fuse a multiply-add within one). Both weight types' scalar steps go through this one
 // float32 function (fp16 values converted exactly first), so they are the same instructions whatever
 // the compiler makes of them: an fp16 model gives bit for bit what float32 weights holding the same
-// rounded values give.
+// rounded values give. One row at a time, so that each row's loop is the one a single row runs: with the
+// rows interleaved, g++ 15 at -O2 on x86-64 summed a row differently in a group of 2-4 rows than alone
+// (by an ulp or two), and a row's output then depended on the other rows.
 template <int R>
 void scalar_dot(const float* x, const float* w, int64_t in, int64_t k0, int64_t k1, float* sum) {
-    for (int64_t k = k0; k < k1; ++k)
-        for (int r = 0; r < R; ++r) {
-            const float p = x[r * in + k] * w[k - k0];
-            sum[r] += p;
+    for (int r = 0; r < R; ++r) {
+        const float* xr = x + r * in;
+        float s = sum[r];
+        for (int64_t k = k0; k < k1; ++k) {
+            const float p = xr[k] * w[k - k0];
+            s += p;
         }
+        sum[r] = s;
+    }
 }
 
 // y[r * ldy + j] = x[r] . W[j] for R rows of x (stride in) and weight rows j0..j1-1 of W (float32 or
