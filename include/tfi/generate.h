@@ -45,6 +45,7 @@ struct TraceStep {
 // greedy decoding gives the tokens it gives without speculation (up to rounding, since the checking pass
 // computes several rows at once), and sampling draws from the same distribution by the standard
 // acceptance rule (Leviathan et al. 2023, Chen et al. 2023), though not the same tokens for a given seed.
+// With hooks this holds for those generate() describes.
 struct SpeculativeStats {
     int64_t steps = 0;     // checking passes of the model
     int64_t drafted = 0;   // tokens proposed
@@ -56,7 +57,8 @@ struct SpeculativeOptions {
     // to 1) and more after a step that kept them all, so text the draft can't predict costs little.
     int64_t draft_tokens = 0;
     // Who proposes them: `draft`, a smaller model with the same tokenizer (e.g. Llama 3.2 1B for Llama
-    // 3.1 8B), sampling with the same options. Or, without one, prompt lookup: the tokens that followed
+    // 3.1 8B), sampling with the same options; once the text holds a token past its vocabulary, the model
+    // continues alone. Or, without one, prompt lookup: the tokens that followed
     // the most recent earlier occurrence of the text's last `ngram` tokens (or fewer, down to 1). Prompt
     // lookup costs nothing and helps where the output repeats the text before it (editing, summarizing,
     // quoting, code); elsewhere steps without a match are plain steps.
@@ -99,7 +101,7 @@ class Sampler {
   private:
     // The tokens that can be picked, lowest id first: their weights in w_ and ids in ids_ (empty: every
     // token, w_ then holding one weight per id), and in `total` the weights' sum. False when the pick is
-    // `best` alone (greedy, top_k 1, or an infinite logit).
+    // `best` alone (greedy, top_k 1, a temperature whose reciprocal overflows a float, or an infinite logit).
     bool select(const float* logits, int64_t n, int64_t& best, double& total);
     int64_t id(size_t j) const { return ids_.empty() ? static_cast<int64_t>(j) : ids_[j]; }
     double temperature_, top_p_;
@@ -121,7 +123,12 @@ class Sampler {
 // With options.speculative.draft_tokens, steps are speculative (see SpeculativeOptions): the prompt but
 // its last token runs in one pass, then each step runs the last token with the proposed ones, so hooks
 // see those rows, proposals the model then rejects included. Rejected rows are dropped from the cache and
-// the trace, and since attention is causal the kept rows are what they would be without speculation.
+// the trace. Since attention is causal, the kept rows are what they would be without speculation for hooks
+// that treat each row alike whatever else is in the pass (editing a head, scaling every row). A hook that
+// picks a row by index (activation[-1] is then the last proposal, not the current token), reads other rows
+// or carries state from one pass to the next (a count, a value from an earlier step) can change the output:
+// generate without speculation for those. Saving all of an activation's rows at one layer to use at a later
+// layer of the same pass is fine.
 Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
                 const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
 

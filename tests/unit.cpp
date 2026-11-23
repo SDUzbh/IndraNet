@@ -185,11 +185,13 @@ static void test_rope_scaling() {
     });
     CHECK_THROWS(detail::rope_table(wrong));
 #ifdef TFI_USE_ACCELERATE
-    const Device before = device();
-    set_device(Device::Gpu);  // single passes on the GPU: the GPU path checks the length too
-    CHECK(m.run_with_cache(seq(10, 1), cache).shape == (Shape{10, 50}));
-    CHECK_THROWS(m.run_with_cache(seq(11, 1), cache));
-    set_device(before);
+    if (m.gpu()) {  // (a Mac can have no Metal device)
+        const Device before = device();
+        set_device(Device::Gpu);  // single passes on the GPU: the GPU path checks the length too
+        CHECK(m.run_with_cache(seq(10, 1), cache).shape == (Shape{10, 50}));
+        CHECK_THROWS(m.run_with_cache(seq(11, 1), cache));
+        set_device(before);
+    }
 #endif
 }
 
@@ -3362,14 +3364,19 @@ static void test_generate_speculative(const Model& m, const Model& other) {
     CHECK(generate(m, prompt, o) == plain);
     o.speculative.ngram = 3;
     // Hooks: the tokens of plain generation with the same hooks (the draft runs without them).
-    Hooks half;
+    Hooks half, head;
     half.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { for (float& v : a.data) v *= 0.5f; });
+    head.add("blocks.0.attn.hook_z", [](const std::string&, Tensor& z) {  // one head, in every row
+        const int64_t H = z.shape[1], D = z.shape[2];
+        for (int64_t r = 0; r < z.shape[0]; ++r) std::fill(z.ptr() + r * H * D, z.ptr() + (r * H + 1) * D, 0.f);
+    });
     o.speculative.draft_tokens = 0;
-    const Tokens plain_hooked = generate(m, prompt, o, &half);
+    const Tokens plain_hooked = generate(m, prompt, o, &half), plain_head = generate(m, prompt, o, &head);
     o.speculative.draft_tokens = 3;
     for (const Model* d : {static_cast<const Model*>(nullptr), &m}) {
         o.speculative.draft = d;
         CHECK(generate(m, prompt, o, &half) == plain_hooked);
+        CHECK(generate(m, prompt, o, &head) == plain_head);
     }
     // The trace: plain generation's steps, rejected proposals left out.
     const bool post = m.cfg().norm_position == "post";
@@ -3492,6 +3499,73 @@ static void test_speculative_sampling() {
             for (size_t j = 0; j < 25; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
         }
     }
+}
+
+// A draft with a smaller vocabulary: once the text holds a token it has no row for, the model continues
+// alone, from the prompt on if the prompt holds one.
+static void test_speculative_small_draft() {
+    const Model m = random_model(tiny(), 42), draft = random_model(tiny([](ModelConfig& c) { c.vocab_size = 20; }), 43);
+    GenerateOptions o;
+    o.max_new_tokens = 8;
+    o.stop_at_eos = false;
+    SpeculativeStats st;
+    auto speculate = [&](const Tokens& prompt) {
+        GenerateOptions s = o;
+        s.speculative.draft_tokens = 3;
+        s.speculative.draft = &draft;
+        s.speculative.stats = &st;
+        return generate(m, prompt, s);
+    };
+    int left = 0;
+    for (uint64_t seed = 0; seed < 20; ++seed) {
+        const Tokens prompt = seq(6, seed, 20), plain = generate(m, prompt, o);
+        left += std::any_of(plain.begin(), plain.end() - 1, [](int64_t t) { return t >= 20; });
+        CHECK(speculate(prompt) == plain);
+        CHECK(st.steps + st.accepted == static_cast<int64_t>(plain.size()));
+    }
+    CHECK(left > 0);  // the case in question ran
+    const Tokens outside = {1, 2, 3, 30, 1, 2, 3};  // repeated: falling back to prompt lookup would propose
+    CHECK(speculate(outside) == generate(m, outside, o));
+    CHECK(st.drafted == 0 && st.steps == o.max_new_tokens);
+    o.temperature = 1.0;
+    for (uint64_t seed = 0; seed < 20; ++seed) {
+        o.seed = seed;
+        CHECK(speculate(seq(6, seed, 20)).size() == 8);
+        CHECK(speculate(outside).size() == 8);
+    }
+}
+
+// A temperature whose reciprocal overflows a float: the largest logit alone, the lowest id among equal ones.
+static void test_tiny_temperature() {
+    const Model m = random_model(tiny(), 42), other = random_model(tiny(), 43);
+    const Tokens prompt = {5, 9, 13, 5, 9, 13, 5, 9};
+    const std::vector<float> logits = {1.f, 3.f, 2.f, 3.f};
+    GenerateOptions o;
+    o.max_new_tokens = 6;
+    o.stop_at_eos = false;
+    const Tokens greedy = generate(m, prompt, o);
+    for (double temp : {2.9e-39, 1e-40, 1e-300, std::numeric_limits<double>::denorm_min()})
+        for (double top_p : {1.0, 0.9}) {
+            o.temperature = temp;
+            o.top_p = top_p;
+            std::vector<double> p;
+            Sampler(o).distribution(logits.data(), 4, p);
+            CHECK(p == (std::vector<double>{0, 1, 0, 0}));
+            o.speculative.draft_tokens = 0;
+            CHECK(generate(m, prompt, o) == greedy);
+            o.speculative.draft_tokens = 3;
+            for (const Model* d : {static_cast<const Model*>(nullptr), &other}) {
+                o.speculative.draft = d;
+                CHECK(generate(m, prompt, o) == greedy);
+            }
+            o.speculative.draft = nullptr;
+        }
+    // The smallest scale that still fits a float samples as usual: equal logits, equal chances.
+    o = GenerateOptions{};
+    o.temperature = 3e-39;
+    std::vector<double> p;
+    Sampler(o).distribution(logits.data(), 4, p);
+    CHECK(p == (std::vector<double>{0, 0.5, 0, 0.5}));
 }
 
 // The sampler alone: frequencies follow softmax(logits / temperature), restricted by top_k and top_p;
@@ -4027,7 +4101,9 @@ int main(int argc, char** argv) {
     }
     run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16", test_forward_cached_many_layers);
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
+    run("core", "sampler: temperature too small for a float's 1 / T", test_tiny_temperature);
     run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);
+    run("analysis", "speculative decoding: draft with a smaller vocabulary", test_speculative_small_draft);
     run("fp16", "linear layers on 1-16 rows: direct from the weights, fp16 = rounded float32, rows independent", test_linear_few_rows);
     run("fp16", "fp16 conversion", test_half_conversion);
     run("fp16", "fp16 weights: reads, linear, matmul", test_fp16_weight);

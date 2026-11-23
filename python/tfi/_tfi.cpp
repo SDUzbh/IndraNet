@@ -463,7 +463,10 @@ NB_MODULE(_tfi, mod) {
        "proposing up to K tokens that the model checks in one pass, from draft (a smaller model with the same "
        "tokenizer) or else from earlier in the text (the tokens after the last occurrence of the last ngram tokens). "
        "Only the speed changes: greedy output is the same up to rounding, sampled output has the same distribution "
-       "(not the same tokens for a seed). hooks then also see proposals the model rejects. A stats dict receives "
+       "(not the same tokens for a seed). hooks then also see proposals the model rejects, so this holds for hooks "
+       "that treat each row alike and carry no state between passes, not ones that pick a row by index (a[-1] is "
+       "then the last proposal). A draft "
+       "with a smaller vocabulary stops proposing once the text holds a token past it. A stats dict receives "
        "steps, drafted and accepted.");
 
     mod.def("generate_batch", [](const Model& m, nb::list prompts, int64_t max_new_tokens, double temperature, int64_t top_k,

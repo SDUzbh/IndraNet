@@ -210,7 +210,9 @@ bool Sampler::select(const float* logits, int64_t n, int64_t& best, double& tota
     if (top == -INFINITY) throw std::runtime_error("generate: no logit to choose a token from (all NaN or -inf)");
     best = 0;
     while (!(logits[best] == top)) ++best;
-    if (temperature_ == 0 || top_k_ == 1 || top == INFINITY) return false;
+    // (A temperature whose reciprocal overflows a float leaves the largest logit alone, as greedy does.)
+    if (temperature_ == 0 || top_k_ == 1 || top == INFINITY || 1.0 / temperature_ > std::numeric_limits<float>::max())
+        return false;
     const float scale = static_cast<float>(1.0 / temperature_);
     auto usable = [](float l) { return !std::isnan(l) && l != -INFINITY; };
     ids_.clear();
@@ -447,6 +449,11 @@ Tokens generate_speculative(const Model& model, const Tokens& prompt, const Gene
     };
     for (;;) {
         const int64_t pos = cache.size();  // ctx.back()'s position
+        // A token the draft has no row for (a smaller vocabulary): it can't read this text from here on, so
+        // the model continues alone.
+        if (draft && std::any_of(ctx.begin() + draft_cache.size(), ctx.end(),
+                                 [&](int64_t t) { return t >= draft->cfg().vocab_size; }))
+            draft = nullptr;
         // Proposals: no more than the tokens still wanted after this step's own, nor past the positions
         // either model can run (where generating without speculation would stop at the same token).
         int64_t k = std::min(want, o.max_new_tokens - static_cast<int64_t>(out.size()) - 1);
@@ -465,7 +472,7 @@ Tokens generate_speculative(const Model& model, const Tokens& prompt, const Gene
                 if (d.back() >= model.cfg().vocab_size) break;
                 if (i + 1 < k) dl = draft->forward_cached({d.back()}, draft_cache, nullptr, true);
             }
-        } else if (k > 0) {
+        } else if (k > 0 && !so.draft) {
             d = lookup_draft(ctx, so.ngram, k);
         }
         Tokens in{ctx.back()};
