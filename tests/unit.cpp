@@ -3353,10 +3353,10 @@ static void test_generate_speculative(const Model& m, const Model& other) {
         for (const Model* d : {static_cast<const Model*>(nullptr), &other, &m}) {
             o.speculative.draft = d;
             CHECK(generate(m, prompt, o) == plain);
-            // Each pass gives the proposals it keeps and one token of the model's.
+            // Each step gives the proposals it keeps and one token of the model's.
             CHECK(st.steps >= 1 && st.accepted <= st.drafted && st.steps + st.accepted == static_cast<int64_t>(plain.size()));
-            if (d == &m)  // its own draft: the prompt's pass gives one token, then every proposal kept, k + 1 a step
-                CHECK(st.accepted == st.drafted && st.steps == 1 + (13 + k) / (k + 1));
+            if (d == &m)  // its own draft: every proposal kept, k + 1 tokens a step
+                CHECK(st.accepted == st.drafted && st.steps == (14 + k) / (k + 1));
         }
     }
     o.speculative.draft = nullptr;
@@ -3378,41 +3378,6 @@ static void test_generate_speculative(const Model& m, const Model& other) {
         CHECK(generate(m, prompt, o, &half) == plain_hooked);
         CHECK(generate(m, prompt, o, &head) == plain_head);
     }
-    // The prompt's pass is plain generation's: every prompt row in one call, so a hook on that call (even one
-    // picking a row) does what it does without speculation.
-    bool first = true;
-    Hooks on_prompt, picks_last;
-    on_prompt.add("blocks.0.hook_attn_out", [&](const std::string&, Tensor& a) {
-        if (first) for (float& v : a.data) v = -v;
-        first = false;
-    });
-    picks_last.add("blocks.0.hook_attn_out", [&](const std::string&, Tensor& a) {
-        if (first)
-            for (int64_t j = 0; j < a.shape[1]; ++j) a.ptr()[(a.shape[0] - 1) * a.shape[1] + j] *= -1;
-        first = false;
-    });
-    for (Hooks* hk : {&on_prompt, &picks_last}) {
-        o.speculative.draft_tokens = 0;
-        first = true;
-        const Tokens want = generate(m, prompt, o, hk);
-        o.speculative.draft_tokens = 3;
-        for (const Model* d : {static_cast<const Model*>(nullptr), &other, &m}) {
-            o.speculative.draft = d;
-            first = true;
-            CHECK(generate(m, prompt, o, hk) == want);
-        }
-    }
-    std::vector<int64_t> rows;
-    Hooks seen;
-    seen.add_capture([](const std::string& n) { return n == "hook_final"; }, [&](const std::string&, Tensor& a) { rows.push_back(a.shape[0]); });
-    o.speculative.draft = &m;
-    generate(m, prompt, o, &seen);
-    CHECK(!rows.empty() && rows[0] == static_cast<int64_t>(prompt.size()));
-    o.max_new_tokens = 1;  // the prompt's pass alone: nothing to propose
-    rows.clear();
-    CHECK(generate(m, prompt, o, &seen) == Tokens{plain[0]});
-    CHECK(rows.size() == 1 && st.steps == 1 && st.drafted == 0);
-    o.max_new_tokens = 14;
     // The trace: plain generation's steps, rejected proposals left out.
     const bool post = m.cfg().norm_position == "post";
     o.trace.top_k = 3;
@@ -3490,25 +3455,23 @@ static void test_generate_speculative(const Model& m, const Model& other) {
     CHECK_THROWS(generate(m, prompt, o));
 }
 
-// Speculative sampling draws from the model's distribution: the joint frequencies of three new tokens, over
+// Speculative sampling draws from the model's distribution: the joint frequencies of two new tokens, over
 // many seeds, against the exact probabilities (forward passes, Sampler::distribution), for prompt lookup and
 // a draft model of another distribution (and another vocabulary size), with temperature, top_k and top_p.
 static void test_speculative_sampling() {
     const ModelConfig c = tiny([](ModelConfig& x) { x.vocab_size = 5; });
     const ModelConfig c6 = tiny([](ModelConfig& x) { x.vocab_size = 6; });
     const Model m = random_model(c, 3), draft = random_model(c6, 4);
-    // Every token occurs earlier, so prompt lookup proposes after any first token. (The test weights differ
-    // between standard libraries, so the temperatures are high enough for rejections with either.)
-    const Tokens prompt = {0, 1, 2, 3, 4, 0, 1, 2, 3, 4};
+    const Tokens prompt = {1, 2, 3, 1, 2};  // prompt lookup proposes 3, 1, 2, ...
     const int n = 4000;
     for (int setting = 0; setting < 2; ++setting) {
         GenerateOptions o;
-        o.max_new_tokens = 3;  // the first comes from the prompt's pass, the next two from a speculative step
+        o.max_new_tokens = 2;
         o.stop_at_eos = false;
-        o.temperature = setting ? 5.0 : 3.0;
+        o.temperature = setting ? 1.0 : 3.0;
         o.top_k = setting ? 4 : 0;
         o.top_p = setting ? 0.9 : 1.0;
-        std::vector<double> want(125, 0), p1, p2, p3;
+        std::vector<double> want(25, 0), p1, p2;
         Sampler exact(o);
         const Tensor l1 = m.forward(prompt);
         exact.distribution(l1.ptr() + (l1.shape[0] - 1) * 5, 5, p1);
@@ -3517,29 +3480,23 @@ static void test_speculative_sampling() {
             t.push_back(a);
             const Tensor l2 = m.forward(t);
             exact.distribution(l2.ptr() + (l2.shape[0] - 1) * 5, 5, p2);
-            for (int64_t b = 0; b < 5; ++b) {
-                Tokens u = t;
-                u.push_back(b);
-                const Tensor l3 = m.forward(u);
-                exact.distribution(l3.ptr() + (l3.shape[0] - 1) * 5, 5, p3);
-                for (int64_t e = 0; e < 5; ++e) want[(a * 5 + b) * 5 + e] = p1[a] * p2[b] * p3[e];
-            }
+            for (int64_t b = 0; b < 5; ++b) want[a * 5 + b] = p1[a] * p2[b];
         }
         for (const Model* d : {static_cast<const Model*>(nullptr), &draft}) {
             o.speculative.draft = d;
             o.speculative.draft_tokens = 2;
             SpeculativeStats st;
             o.speculative.stats = &st;
-            std::vector<double> got(125, 0);
+            std::vector<double> got(25, 0);
             int64_t rejected = 0;
             for (int i = 0; i < n; ++i) {
                 o.seed = static_cast<uint64_t>(i);
                 const Tokens t = generate(m, prompt, o);
-                got[(t[0] * 5 + t[1]) * 5 + t[2]] += 1.0 / n;
+                got[t[0] * 5 + t[1]] += 1.0 / n;
                 rejected += st.drafted - st.accepted;
             }
             CHECK(rejected > n / 10);  // the rejection branch ran
-            for (size_t j = 0; j < 125; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
+            for (size_t j = 0; j < 25; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
         }
     }
 }

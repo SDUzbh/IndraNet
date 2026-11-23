@@ -55,9 +55,8 @@ build/indra generate llama8b.safetensors --text "Once upon a time" --speculate 4
 
 ### Hooks and speculation
 
-The prompt's pass is the same with and without speculation, so hooks see the whole prompt, and the
-first new token comes from it. After that, hooks also run on proposals that are then rejected; those
-rows are dropped from the cache and the trace. Because attention is causal, the kept rows are what they would be without speculation for
+Hooks also run on proposals that are then rejected; those rows are dropped from the cache and the
+trace. Because attention is causal, the kept rows are what they would be without speculation for
 hooks that treat each row alike, such as editing a head or scaling every row. A hook that picks a row
 by index (`a[-1]` is then the last proposal, not the current token), reads other rows or carries state
 from one pass to the next (a count, a value from an earlier step) can change the output, so run those

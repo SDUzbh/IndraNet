@@ -47,7 +47,7 @@ struct TraceStep {
 // acceptance rule (Leviathan et al. 2023, Chen et al. 2023), though not the same tokens for a given seed.
 // With hooks this holds for those generate() describes.
 struct SpeculativeStats {
-    int64_t steps = 0;     // passes of the model that chose tokens, the prompt's included
+    int64_t steps = 0;     // checking passes of the model
     int64_t drafted = 0;   // tokens proposed
     int64_t accepted = 0;  // ... and kept
 };
@@ -120,9 +120,9 @@ class Sampler {
 // With `trace`, it also receives a TraceStep per new token (options.trace says what each holds), before
 // on_token is called for that token. Activations are recorded after `hooks` ran: the trace shows what
 // the model computed, interventions included.
-// With options.speculative.draft_tokens, steps are speculative (see SpeculativeOptions): the prompt's pass
-// and the first new token are the same as without speculation, then each step runs the last token with the
-// proposed ones, so hooks see those rows, proposals the model then rejects included. Rejected rows are dropped from the cache and
+// With options.speculative.draft_tokens, steps are speculative (see SpeculativeOptions): the prompt but
+// its last token runs in one pass, then each step runs the last token with the proposed ones, so hooks
+// see those rows, proposals the model then rejects included. Rejected rows are dropped from the cache and
 // the trace. Since attention is causal, the kept rows are what they would be without speculation for hooks
 // that treat each row alike whatever else is in the pass (editing a head, scaling every row). A hook that
 // picks a row by index (activation[-1] is then the last proposal, not the current token), reads other rows
