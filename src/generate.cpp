@@ -418,15 +418,18 @@ Tokens lookup_draft(const Tokens& ctx, int64_t max_n, int64_t k) {
     return {};
 }
 
-// generate() with speculative steps (options.speculative.draft_tokens > 0). `cache` holds every token of
-// ctx but the last, which each step runs with the proposed tokens: row i of the step's logits is the
+// generate() from its first new token on, with speculative steps (options.speculative.draft_tokens > 0).
+// `cache` holds the prompt and `out` that token. The cache always holds every token of ctx (the prompt and
+// out) but the last, which each step runs with the proposed tokens: row i of the step's logits is the
 // model's distribution after its i-th token, so for proposal i (accepted with probability min(1, p/q), else
 // replaced by a draw from max(0, p - q)) and, when all are kept, for one more token of the model's own.
 Tokens generate_speculative(const Model& model, const Tokens& prompt, const GenerateOptions& o, const Hooks* h,
-                            TraceRecorder* rec, std::vector<TraceStep>* trace, Sampler& sample, const std::set<int64_t>& stop) {
+                            TraceRecorder* rec, std::vector<TraceStep>* trace, Sampler& sample, const std::set<int64_t>& stop,
+                            KVCache cache, Tokens out) {
     const SpeculativeOptions& so = o.speculative;
     const Model* draft = so.draft;
     SpeculativeStats stats;
+    stats.steps = 1;  // the prompt's pass, which chose the first token
     std::optional<Sampler> draft_sample;
     if (draft) {  // its own generator, so the model's draws don't depend on the draft's
         GenerateOptions d = o;
@@ -434,9 +437,9 @@ Tokens generate_speculative(const Model& model, const Tokens& prompt, const Gene
         draft_sample.emplace(d);
     }
     const int64_t limit = position_limit(model), draft_limit = draft ? position_limit(*draft) : 0;
-    Tokens ctx = prompt, out;
-    KVCache cache, draft_cache;
-    if (prompt.size() > 1) model.forward_cached(Tokens(prompt.begin(), prompt.end() - 1), cache, h, /*last_only=*/true);
+    Tokens ctx = prompt;
+    ctx.insert(ctx.end(), out.begin(), out.end());
+    KVCache draft_cache;
     if (rec) rec->all_rows = true;
     std::vector<double> p, w;
     std::vector<std::vector<double>> q;  // the draft's distribution for each proposal
@@ -547,10 +550,10 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
                         [r](const std::string& n, Tensor& a) { r->capture(n, a); });
     }
     const Hooks* h = all.empty() ? nullptr : &all;
-    if (options.speculative.draft_tokens > 0)
-        return generate_speculative(model, prompt, options, h, rec ? &*rec : nullptr, trace, sample, stop);
+    const bool speculate = options.speculative.draft_tokens > 0;
     KVCache cache;
     Tensor logits = model.forward_cached(prompt, cache, h, /*last_only=*/true);
+    if (speculate && options.speculative.stats) options.speculative.stats->steps = 1;
     for (;;) {
         const int64_t t = sample(logits.ptr(), logits.shape[1]);
         if (trace) trace->push_back(rec->step(logits.ptr(), logits.shape[1], t, cache.size() - 1));
@@ -558,6 +561,8 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
         bool more = !stop.count(t) && static_cast<int64_t>(out.size()) < options.max_new_tokens;
         if (options.on_token && !options.on_token(t)) more = false;
         if (!more) return out;
+        if (speculate)  // the prompt's pass and the first token are the same with and without speculation
+            return generate_speculative(model, prompt, options, h, rec ? &*rec : nullptr, trace, sample, stop, std::move(cache), std::move(out));
         logits = model.forward_cached({t}, cache, h, /*last_only=*/true);
     }
 }
