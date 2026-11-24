@@ -132,8 +132,7 @@ def test_cpp_matches_pytorch_presets(tools, tmp_path, name):
 def test_half_export_matches_pytorch(tools, tmp_path, opts, dtype):
     """export_model(dtype="float16" / "bfloat16") files: the C++ side computes what PyTorch computes with
     the weight matrices rounded to that type, loading them as float32 and as fp16 (fp16 files: taken as
-    they are; bf16 files: converted, which is exact for all but values under about 7.6e-6), and bf16 files
-    as bf16 too (taken as they are)."""
+    they are; bf16 files: converted, which is exact for all but values under about 7.6e-6)."""
     torch.manual_seed(0)
     model = DecoderLM(tiny(**opts))
     with torch.no_grad():
@@ -146,7 +145,7 @@ def test_half_export_matches_pytorch(tools, tmp_path, opts, dtype):
             if p.dim() == 2:
                 p.copy_(p.to(getattr(torch, dtype)).float())
     export_reference(model, torch.randint(0, V, (12,)), tmp_path / "ref.safetensors", metric=(10, 3, 5))
-    for fmt in ["fp32", "fp16"] + (["bf16"] if dtype == "bfloat16" else []):
+    for fmt in ["fp32", "fp16"]:
         r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors"),
                             "1e-4", fmt], capture_output=True, text=True)
         assert r.returncode == 0, fmt + "\n" + r.stdout + r.stderr
@@ -233,7 +232,7 @@ def test_cli_commands(tools, tmp_path, opts):
     assert default.returncode == no_gpu.returncode == env_no_gpu.returncode == 0, no_gpu.stderr + env_no_gpu.stderr
     assert default.stdout == no_gpu.stdout == env_no_gpu.stdout
     help_text = subprocess.run([str(tools / "indra"), "--help"], capture_output=True, text=True).stdout
-    assert "--no-gpu" in help_text and "--fp16" in help_text and "--bf16" in help_text
+    assert "--no-gpu" in help_text and "--fp16" in help_text
     fp16 = subprocess.run(patch_args + ["--fp16"], capture_output=True, text=True)
     assert fp16.returncode == 0 and "--fp16" in fp16.stdout, fp16.stderr
     # --fp16 stores the weights in fp16 even without the GPU; --fp32 is the default.
@@ -256,28 +255,17 @@ def test_cli_commands(tools, tmp_path, opts):
     assert clash.returncode == 1 and "contradicts" in clash.stderr
     fp32 = subprocess.run(patch_args + ["--fp32"], capture_output=True, text=True)
     assert fp32.returncode == 0 and fp32.stdout == default.stdout
-    for pair in (["--fp16", "--fp32"], ["--bf16", "--fp16"], ["--bf16", "--fp32"]):
-        both = subprocess.run(patch_args + pair, capture_output=True, text=True)
-        assert both.returncode == 1 and "give one of --fp32, --fp16 and --bf16" in both.stderr
+    both = subprocess.run(patch_args + ["--fp16", "--fp32"], capture_output=True, text=True)
+    assert both.returncode == 1 and "not both" in both.stderr
     info16 = subprocess.run([str(tools / "indra"), "info", str(path), "--fp16"], capture_output=True, text=True).stdout
     info32 = subprocess.run([str(tools / "indra"), "info", str(path)], capture_output=True, text=True).stdout
-    infob = subprocess.run([str(tools / "indra"), "info", str(path), "--bf16"], capture_output=True, text=True).stdout
-    assert "weights       fp16" in info16 and "weights       float32" in info32 and "weights       bf16" in infob
-    # --bf16: weights in bf16, the GPU's multiplies untouched (float32 inputs): CPU and GPU agree as with --fp32.
-    bf16 = subprocess.run(patch_args + ["--bf16"], capture_output=True, text=True)
-    bf16_cpu = subprocess.run(patch_args + ["--bf16", "--no-gpu"], capture_output=True, text=True)
-    assert bf16.returncode == bf16_cpu.returncode == 0 and "weights are stored in bf16" in bf16.stdout, bf16.stderr
-    assert bf16.stdout == bf16_cpu.stdout
-    assert bf16.stdout.split("\n\n")[-1] != default.stdout.split("\n\n")[-1]  # really rounded (a float32 file)
+    assert "weights       fp16" in info16 and "weights       float32" in info32
     run_args = [str(tools / "indra"), "run", str(path), "--tokens", toks]
     run16 = subprocess.run(run_args + ["--fp16"], capture_output=True, text=True)
     run32 = subprocess.run(run_args, capture_output=True, text=True)
     assert run16.returncode == 0 and "weights are stored in fp16" in run16.stdout
-    runb = subprocess.run(run_args + ["--bf16"], capture_output=True, text=True)
-    assert runb.returncode == 0 and "weights are stored in bf16" in runb.stdout
     loss = lambda out: float(out.split("mean next-token loss")[1].split()[0].strip(":"))  # noqa: E731
     assert loss(run16.stdout) == pytest.approx(loss(run32.stdout), rel=1e-2)
-    assert loss(runb.stdout) == pytest.approx(loss(run32.stdout), rel=5e-2)
     ablate_args = [str(tools / "indra"), "ablate", str(path), "--tokens", toks, "--mode", "zero"]
     ablate = subprocess.run(ablate_args, capture_output=True, text=True)
     ablate_cpu = subprocess.run(ablate_args + ["--no-gpu"], capture_output=True, text=True)

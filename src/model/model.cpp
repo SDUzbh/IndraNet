@@ -315,10 +315,9 @@ using detail::split_heads;
 // --- model -----------------------------------------------------------------------
 
 namespace {
-// One weight in `format`: with fp16 or bf16, 2-D weights whose values fit become fp16 or bf16.
+// One weight in `format`: with fp16, 2-D weights whose values fit become half precision.
 Weight make_weight(Tensor t, WeightFormat format) {
     if (format == WeightFormat::fp16 && t.dim() == 2 && Weight::fits_fp16(t)) return Weight::fp16(t);
-    if (format == WeightFormat::bf16 && t.dim() == 2 && Weight::fits_bf16(t)) return Weight::bf16(t);
     return Weight(std::move(t));
 }
 
@@ -443,30 +442,26 @@ Model Model::load(const std::string& path, WeightFormat format) {
     const RawSink straight = [&](const std::string& name, const RawTensor& t) {
         if (t.shape.size() != 2) return false;
         const int64_t n = shape_numel(t.shape);
-        const bool half = format != WeightFormat::fp32;  // fp16 or bf16: 2 bytes a value
-        const char* kept = format == WeightFormat::fp16 ? "F16" : format == WeightFormat::bf16 ? "BF16" : "F32";
+        const bool to_fp16 = format == WeightFormat::fp16;
         auto read_all = [&](void* dst) { t.read(0, t.bytes, dst); };
-        auto finite = [&](const void* bits) {  // fp16 and bf16 have infinities and NaNs: those weights stay float32
-            const uint16_t* h = static_cast<const uint16_t*>(bits);
-            return !half || (format == WeightFormat::fp16 ? detail::all_finite_halves(h, n) : detail::all_finite_bf16(h, n));
-        };
-        if (t.dtype == kept && t.mapped && t.bytes > 0 && reinterpret_cast<uintptr_t>(t.mapped) % page == 0 && finite(t.mapped)) {
+        if (t.dtype == (to_fp16 ? "F16" : "F32") && t.mapped && t.bytes > 0 &&
+            reinterpret_cast<uintptr_t>(t.mapped) % page == 0 &&
+            (!to_fp16 || detail::all_finite_halves(static_cast<const uint16_t*>(t.mapped), n))) {
             const size_t capacity = (static_cast<size_t>(t.bytes) + page - 1) / page * page;  // within the mapping's last page
-            weights.emplace(name, Weight::borrowed(t.shape, format, t.mapped, capacity, t.mapping));
+            weights.emplace(name, Weight::borrowed(t.shape, to_fp16, t.mapped, capacity, t.mapping));
             return true;
         }
-        if (t.dtype == kept) {
-            Weight w = Weight::filled(t.shape, format, read_all);
-            if (finite(w.data())) {
+        if (t.dtype == (to_fp16 ? "F16" : "F32")) {
+            Weight w = Weight::filled(t.shape, to_fp16, read_all);
+            if (!to_fp16 || detail::all_finite_halves(w.f16(), n)) {
                 weights.emplace(name, std::move(w));
                 return true;
-            }  // an infinity or NaN: kept as float32, below
-        } else if (half) {  // to fp16 or bf16, unless a value doesn't fit (then float32, below)
+            }  // an fp16 infinity or NaN: kept as float32, below
+        } else if (to_fp16) {  // F32 or BF16 -> fp16, unless a value doesn't fit (then float32, below)
             int64_t bad = 0;
-            Weight w = Weight::filled(t.shape, format, [&](void* dst) {
+            Weight w = Weight::filled(t.shape, true, [&](void* dst) {
                 for_each_block(t, [&](int64_t first, const float* v, int64_t count) {
-                    uint16_t* out = static_cast<uint16_t*>(dst) + first;
-                    bad += format == WeightFormat::fp16 ? detail::floats_to_halves(v, out, count) : detail::floats_to_bf16s(v, out, count);
+                    bad += detail::floats_to_halves(v, static_cast<uint16_t*>(dst) + first, count);
                 });
             });
             if (bad == 0) {
@@ -631,9 +626,9 @@ int64_t Model::weight_bytes() const {
 
 std::vector<std::string> Model::fp32_weights() const {
     std::vector<std::string> out;
-    if (format_ != WeightFormat::fp32)
+    if (format_ == WeightFormat::fp16)
         for (const auto& kv : w_)
-            if (kv.second.dim() == 2 && kv.second.format() != format_) out.push_back(kv.first);
+            if (kv.second.dim() == 2 && !kv.second.is_fp16()) out.push_back(kv.first);
     return out;
 }
 
@@ -1109,14 +1104,10 @@ Tensor Model::run_from(int64_t layer, Tensor x, const Hooks* hooks, bool last_on
 }
 
 namespace {
-constexpr float kBf16Max = 3.38953139e38f;  // bf16's largest finite value (0x7F7F)
-// Keys or values rounded in place to what a KV cache kept in fp16 or bf16 holds (as the GPU's round_kv
-// does), clamped to the type's finite range.
-void round_kv_(Tensor& t, WeightFormat format) {
-    if (format == WeightFormat::fp16)
-        for (float& v : t.data) v = detail::half_to_float(detail::float_to_half(std::clamp(v, -65504.f, 65504.f)));
-    else if (format == WeightFormat::bf16)
-        for (float& v : t.data) v = detail::bf16_to_float(detail::float_to_bf16(std::clamp(v, -kBf16Max, kBf16Max)));
+// Keys or values rounded to fp16 values in place, clamped to fp16's finite range: what a KV cache kept in
+// fp16 holds (as the GPU's round_half does).
+void round_to_half_(Tensor& t) {
+    for (float& v : t.data) v = detail::half_to_float(detail::float_to_half(std::clamp(v, -65504.f, 65504.f)));
 }
 // A hook rounding every layer's hook_k and hook_v so (on the CPU, after the caller's hooks).
 // Which layer's keys or values a hook point name is ("blocks.<l>.attn.hook_k" / "hook_v"), read from the
@@ -1139,25 +1130,21 @@ KVHook kv_hook(const std::string& n) {
     return {layer, n.back() == 'v'};
 }
 
-// Nothing to round for a float32 cache.
-void add_kv_rounding(Hooks& h, int64_t layers, WeightFormat format) {
-    if (format == WeightFormat::fp32) return;
+void add_kv_rounding(Hooks& h, int64_t layers) {
     h.add_filter([layers](const std::string& n) { const int64_t l = kv_hook(n).layer; return l >= 0 && l < layers; },
-                 [format](const std::string&, Tensor& a) { round_kv_(a, format); });
+                 [](const std::string&, Tensor& a) { round_to_half_(a); });
 }
 #ifdef TFI_USE_ACCELERATE
-// Floats a KV slot needs for n values: n, or for fp16 or bf16 values half that.
-int64_t kv_floats(WeightFormat format, int64_t n) { return format != WeightFormat::fp32 ? (n + 1) / 2 : n; }
+// Floats a KV slot needs for n values: n, or for fp16 values half that.
+int64_t kv_floats(bool half, int64_t n) { return half ? (n + 1) / 2 : n; }
 // Positions [from, to) of a CPU cache tensor (H, c, D) into GPU slot `slot` (H, Tp, D) at position base + j:
-// copied, or for an fp16 or bf16 cache converted (exactly: the values are already fp16 or bf16 ones).
+// copied, or for an fp16 cache converted (exactly: the values are already fp16 ones).
 void upload_rows(detail::GpuKV& kv, int slot, const Tensor& cpu, int64_t Tp, int64_t base, int64_t from, int64_t to) {
     const int64_t H = cpu.shape[0], c = cpu.shape[1], D = cpu.shape[2], n = (to - from) * D;
     for (int64_t h = 0; h < H; ++h) {
         const float* src = cpu.ptr() + (h * c + from) * D;
         const int64_t at = (h * Tp + base + from) * D;
-        uint16_t* bits = reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at;
-        if (kv.format == WeightFormat::fp16) detail::floats_to_halves(src, bits, n);
-        else if (kv.format == WeightFormat::bf16) detail::floats_to_bf16s(src, bits, n);
+        if (kv.half) detail::floats_to_halves(src, reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at, n);
         else std::copy(src, src + n, kv.seq->data(slot) + at);
     }
 }
@@ -1169,7 +1156,7 @@ KVCache::KVCache(const KVCache& o) {
     k_ = o.k_;
     v_ = o.v_;
     len_ = cpu_len_ = o.len_;
-    format_ = o.format_;
+    half_ = o.half_;
 }
 
 KVCache& KVCache::operator=(const KVCache& o) {
@@ -1178,7 +1165,7 @@ KVCache& KVCache::operator=(const KVCache& o) {
     k_ = o.k_;
     v_ = o.v_;
     len_ = cpu_len_ = o.len_;
-    format_ = o.format_;
+    half_ = o.half_;
     gpu_.reset();
     region_ = gpu_len_ = 0;
     return *this;
@@ -1227,19 +1214,15 @@ void KVCache::sync_cpu() const {
     reserve_cpu(len_);
     const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
     auto gpu_halves = [&](int slot) { return reinterpret_cast<const uint16_t*>(gpu_->seq->data(slot)); };
-    auto widen = [&](const uint16_t* src, float* dst, int64_t n) {
-        if (gpu_->format == WeightFormat::fp16) detail::halves_to_floats(src, dst, n);
-        else detail::bf16s_to_floats(src, dst, n);
-    };
     for (size_t l = 0; l < k_.size(); ++l) {
         const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
         for (int64_t h = 0; h < H; ++h) {
             const int64_t from = (h * Tp + base + cpu_len_) * D, n = (len_ - cpu_len_) * D;
             float* dk = k_[l].ptr() + (h * c + cpu_len_) * D;
             float* dv = v_[l].ptr() + (h * c + cpu_len_) * D;
-            if (gpu_->format != WeightFormat::fp32) {  // fp16 or bf16 values, exactly as float32
-                widen(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, dk, n);
-                widen(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, dv, n);
+            if (gpu_->half) {  // fp16 values, exactly as float32
+                detail::halves_to_floats(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, dk, n);
+                detail::halves_to_floats(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, dv, n);
             } else {
                 const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l)));
                 const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l)));
@@ -1274,18 +1257,14 @@ void KVCache::check() const {
     if (!gpu_ || both == 0) return;
     const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
     auto gpu_halves = [&](int slot) { return reinterpret_cast<const uint16_t*>(gpu_->seq->data(slot)); };
-    auto widen = [&](const uint16_t* src, float* dst, int64_t n) {
-        if (gpu_->format == WeightFormat::fp16) detail::halves_to_floats(src, dst, n);
-        else detail::bf16s_to_floats(src, dst, n);
-    };
     for (size_t l = 0; l < k_.size(); ++l) {
         const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
         std::vector<float> gk(static_cast<size_t>(both * D)), gv(static_cast<size_t>(both * D));
         for (int64_t h = 0; h < H; ++h) {
             const int64_t from = (h * Tp + base) * D;
-            if (gpu_->format != WeightFormat::fp32) {
-                widen(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, gk.data(), both * D);
-                widen(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, gv.data(), both * D);
+            if (gpu_->half) {
+                detail::halves_to_floats(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, gk.data(), both * D);
+                detail::halves_to_floats(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, gv.data(), both * D);
             } else {
                 const float* k = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
                 const float* v = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
@@ -1351,16 +1330,18 @@ void Model::check_cache(const KVCache& cache) const {
                  cache.k_[l].shape[2] == layer_cfgs_[l].head_dim();
         if (!ok) throw std::invalid_argument("forward_cached: the cache holds another model's keys and values");
     }
-    // fp16 or bf16 values for a model with fp16 or bf16 weights; a cache keeps the precision of its first step.
-    if ((cache.len_ || !cache.k_.empty()) && cache.format_ != format_)
-        throw std::invalid_argument(std::string("forward_cached: the cache holds ") + format_name(cache.format_) +
-                                    " keys and values; this model's are " + format_name(format_));
+    // fp16 values for a model with fp16 weights; a cache keeps the precision of its first step.
+    const bool half = format_ == WeightFormat::fp16;
+    if ((cache.len_ || !cache.k_.empty()) && cache.half_ != half)
+        throw std::invalid_argument(std::string("forward_cached: the cache holds ") + (cache.half_ ? "fp16" : "float32") +
+                                    " keys and values; this model's are " + (half ? "fp16" : "float32"));
 }
 
 void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to, const Hooks* hooks) const {
     (void)cache, (void)rb, (void)T, (void)need, (void)upload_to, (void)hooks;
 #ifdef TFI_USE_ACCELERATE
     const int64_t L = cfg_.n_layers;
+    const bool half = format_ == WeightFormat::fp16;
     // The GPU, with the cache kept there (detail::GpuKV), for: the prompt when a single pass of it would
     // go to the GPU (its keys and values then go straight into the GPU's copy); later chunks of tokens big
     // enough; single tokens of models large enough that reading their weights takes the CPU longer than
@@ -1386,7 +1367,7 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
         auto kv = std::make_shared<detail::GpuKV>();
         kv->gpu = gpu_.gpu;
         kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
-        kv->format = format_;
+        kv->half = half;
         cache.gpu_ = std::move(kv);
         cache.region_ = 0;
         cache.gpu_len_ = 0;
@@ -1396,7 +1377,7 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
         cache.sync_cpu();
         kv.cap = std::max({need + std::max<int64_t>(256, need / 2), 2 * kv.cap});
         for (int64_t l = 0; l < L; ++l) {
-            const int64_t n = kv_floats(format_, layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim());
+            const int64_t n = kv_floats(half, layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim());
             kv.seq->reserve(detail::GpuKV::keys(l), n);
             kv.seq->reserve(detail::GpuKV::values(l), n);
         }
@@ -1419,7 +1400,8 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     const int64_t L = cfg_.n_layers, T = static_cast<int64_t>(tokens.size()), start = cache.len_;
     if (T == 0) throw std::invalid_argument("forward_cached needs at least one token");
     check_cache(cache);
-    cache.format_ = format_;
+    const bool half = format_ == WeightFormat::fp16;
+    cache.half_ = half;
     detail::RowBatch rb;
     rb.add(start, T);
     rb.cached = true;
@@ -1440,7 +1422,7 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     };
     Hooks h;
     if (hooks) h.extend(*hooks);
-    if (!on_gpu) add_kv_rounding(h, L, format_);  // (the GPU's pass rounds them itself)
+    if (half && !on_gpu) add_kv_rounding(h, L);  // (the GPU's pass rounds them itself)
     if (!on_gpu)
         h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
                       [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
@@ -1503,6 +1485,7 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
     if (pos < 0 || pos >= cache.len_) throw std::invalid_argument("rerun_cached: position " + std::to_string(pos) + " is not in the cache");
     if (resid.shape != Shape{1, d}) throw std::invalid_argument("rerun_cached: resid must be (1, d_model)");
     check_cache(cache);
+    const bool half = format_ == WeightFormat::fp16;
     detail::RowBatch rb;
     rb.add(pos, 1);
     rb.cached = true;
@@ -1523,7 +1506,7 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
     };
     Hooks h;
     if (hooks) h.extend(*hooks);
-    if (!on_gpu) add_kv_rounding(h, L, format_);
+    if (half && !on_gpu) add_kv_rounding(h, L);
     if (!on_gpu)
         h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
                       [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
@@ -1587,12 +1570,13 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     std::vector<Tensor> out(static_cast<size_t>(n_seq));
     if (seq_of.empty()) return out;
     const int64_t S = static_cast<int64_t>(seq_of.size()), R = rb.rows();
-    for (int64_t i : seq_of) {  // as for one cache
+    const bool half = format_ == WeightFormat::fp16;  // as for one cache
+    for (int64_t i : seq_of) {
         KVCache& c = kb.caches_[i];
-        if ((c.len_ || !c.k_.empty()) && c.format_ != format_)
-            throw std::invalid_argument(std::string("forward_cached: the batch holds ") + format_name(c.format_) +
-                                        " keys and values; this model's are " + format_name(format_));
-        c.format_ = format_;
+        if ((c.len_ || !c.k_.empty()) && c.half_ != half)
+            throw std::invalid_argument(std::string("forward_cached: the batch holds ") + (c.half_ ? "fp16" : "float32") +
+                                        " keys and values; this model's are " + (half ? "fp16" : "float32"));
+        c.half_ = half;
     }
 
 #ifdef TFI_USE_ACCELERATE
@@ -1608,7 +1592,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     if (g) {
         int64_t need = 0;
         for (int64_t sg = 0; sg < S; ++sg) need = std::max(need, rb.start[sg] + rb.len[sg]);
-        const bool fresh = !kb.gpu_ || kb.gpu_->gpu.get() != g || kb.gpu_->regions != n_seq || kb.gpu_->format != format_;
+        const bool fresh = !kb.gpu_ || kb.gpu_->gpu.get() != g || kb.gpu_->regions != n_seq || kb.gpu_->half != half;
         if (fresh || need > kb.gpu_->cap) {
             // A new or grown GPU copy loses what the old one held: every sequence's CPU side catches up first.
             for (const KVCache& c : kb.caches_) c.sync_cpu();
@@ -1617,14 +1601,14 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
                 kv->gpu = gpu_.gpu;
                 kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
                 kv->regions = n_seq;
-                kv->format = format_;
+                kv->half = half;
                 kb.gpu_ = std::move(kv);
             }
             detail::GpuKV& kv = *kb.gpu_;
             if (need > kv.cap) {
                 kv.cap = std::max({need + std::max<int64_t>(256, need / 2), 2 * kv.cap});
                 for (int64_t l = 0; l < L; ++l) {
-                    const int64_t n = kv_floats(format_, layer_cfgs_[l].kv_heads() * kv.cap * n_seq * layer_cfgs_[l].head_dim());
+                    const int64_t n = kv_floats(half, layer_cfgs_[l].kv_heads() * kv.cap * n_seq * layer_cfgs_[l].head_dim());
                     kv.seq->reserve(detail::GpuKV::keys(l), n);
                     kv.seq->reserve(detail::GpuKV::values(l), n);
                 }
@@ -1674,7 +1658,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     };
     Hooks h;
     if (hooks) h.extend(*hooks);
-    if (!on_gpu) add_kv_rounding(h, L, format_);  // (the GPU's pass rounds them itself)
+    if (half && !on_gpu) add_kv_rounding(h, L);  // (the GPU's pass rounds them itself)
     if (!on_gpu)
         h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
                       [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
@@ -1896,7 +1880,7 @@ struct GpuBlocks {
     // (a KV cache kept on the GPU gives each layer slots of its own: detail::GpuKV).
     int pk = kPK, pv = kPV, inv_freq = kInvFreq, slopes = kSlopes;
     int kbase = -1;  // a slot of each row's region start in pk / pv (several sequences' caches), or none
-    WeightFormat kv_format = WeightFormat::fp32;  // how pk / pv hold their values (a KV cache kept in fp16 or bf16)
+    bool half_prefix = false;  // pk / pv hold fp16 values (a KV cache kept in fp16)
     const Hooks* hooks = nullptr;           // inference: the pass's hooks (GpuBlocks::at)
     bool fp16 = false;                      // ... and how its runs multiply
     int par_out = -1;                       // a parallel-residual MLP's output (set by mlp())
@@ -2118,7 +2102,7 @@ struct GpuBlocks {
         const int64_t D = c.head_dim();
         return {R, c.n_heads, c.kv_heads(), D, Tp, c.sliding_window ? *c.sliding_window : 0,
                 static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D))),
-                c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f, c.positional == "alibi", blocks, Tp > 0 ? kv_format : WeightFormat::fp32};
+                c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f, c.positional == "alibi", blocks, half_prefix && Tp > 0};
     }
     // Block `layer`'s attention on the GPU, into zs; with Tp > 0, positions before each segment's
     // start read kPK / kPV (Hkv, Tp, D). Needs write_rows and write_layer_inputs.
@@ -2378,7 +2362,7 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         };
         gb.hooks = hooks;
         gb.fp16 = batch.fp16;
-        if (batch.kv) gb.kv_format = batch.kv->format;
+        if (batch.kv) gb.half_prefix = batch.kv->half;
         if (batch.kv && !batch.kbase.empty()) {  // each row's sequence's region start, for attention
             uint32_t* kb = reinterpret_cast<uint32_t*>(s.reserve(detail::GpuKV::kKBase, R));
             for (int64_t sg = 0; sg < S; ++sg)
@@ -2424,9 +2408,9 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                 q = gb.at(p + "hook_q", q, H * D, GpuBlocks::View::Heads, D);
                 k = gb.at(p + "hook_k", k, Hkv * D, GpuBlocks::View::Heads, D);
                 const int v = gb.at(p + "hook_v", v0, Hkv * D, GpuBlocks::View::Heads, D);
-                if (batch.kv && batch.kv->format != WeightFormat::fp32) {  // an fp16 or bf16 cache: the new rows rounded as stored, before attention reads them
-                    s.round_kv(k, R * Hkv * D, batch.kv->format);
-                    s.round_kv(v, R * Hkv * D, batch.kv->format);
+                if (batch.kv && batch.kv->half) {  // an fp16 cache: the new rows rounded as stored, before attention reads them
+                    s.round_half(k, R * Hkv * D);
+                    s.round_half(v, R * Hkv * D);
                 }
                 const bool pattern = batch.whole && hooks && hooks->matches(p + "hook_pattern");
                 gb.lse = pattern ? static_cast<int>(kLse) : -1;
@@ -2436,8 +2420,8 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                     const int64_t Tp_all = batch.kv->cap * batch.kv->regions;
                     for (int64_t sg = 0; sg < S; ++sg) {
                         const int64_t at = (batch.kbase.empty() ? 0 : batch.kbase[sg]) + batch.start[sg];
-                        s.kv_append(k, gb.pk, batch.len[sg], Hkv, D, Tp_all, at, batch.offset[sg], batch.kv->format);
-                        s.kv_append(v, gb.pv, batch.len[sg], Hkv, D, Tp_all, at, batch.offset[sg], batch.kv->format);
+                        s.kv_append(k, gb.pk, batch.len[sg], Hkv, D, Tp_all, at, batch.offset[sg], batch.kv->half);
+                        s.kv_append(v, gb.pv, batch.len[sg], Hkv, D, Tp_all, at, batch.offset[sg], batch.kv->half);
                     }
                 }
                 const detail::Gpu::Seq::AttnShape shape = gb.attn_shape(l, 0);

@@ -76,10 +76,10 @@ class Model;
 // and RoPE, as hook_k and hook_v see them), so that Model::forward_cached runs only new tokens. A copy
 // continues on its own: several continuations of one prompt can share its prefill.
 //
-// With a model whose weights are fp16 or bf16 (WeightFormat::fp16 / bf16, the indra CLI's --fp16 / --bf16),
-// the keys and values are rounded to that type where they are stored (after the hooks, clamped to its finite
-// range), and the GPU's copy is held in it: half the memory, at an error about that of the weights. Float32
-// models keep them in float32, exactly.
+// With a model whose weights are fp16 (WeightFormat::fp16, the indra CLI's --fp16), the keys and values are
+// rounded to fp16 where they are stored (after the hooks, clamped to fp16's finite range), and the GPU's
+// copy is held in fp16: half the memory, at an error about that of fp16 weights. Float32 models keep them
+// in float32, exactly.
 //
 // Two places may hold them: the CPU's tensors and (macOS, when steps run on the GPU) the GPU's buffers,
 // so that a sequence generated on the GPU isn't kept twice. Both are prefixes of the sequence, since a
@@ -117,10 +117,10 @@ class KVCache {
     std::shared_ptr<detail::GpuKV> gpu_;
     int64_t region_ = 0;
     int64_t gpu_len_ = 0;
-    // fp16 or bf16 values (a model with fp16 or bf16 weights): keys and values rounded to that type where
-    // they are stored, and the GPU's copy held in it (half the memory); the CPU copy holds the same values as
-    // float32. Set by the first step: a model of another precision can't continue the cache.
-    WeightFormat format_ = WeightFormat::fp32;
+    // fp16 values (a model with fp16 weights): keys and values rounded to fp16 where they are stored, and
+    // the GPU's copy held in fp16 (half the memory); the CPU copy holds the same values as float32. Set by
+    // the first step: a model of the other precision can't continue the cache.
+    bool half_ = false;
     void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);  // on the CPU, which is up to date
     void sync_cpu() const;                // [cpu_len_, size()) from the GPU
     void reserve_cpu(int64_t n) const;    // CPU capacity for n positions, keeping [0, cpu_len_)
@@ -154,11 +154,10 @@ class KVBatch {
 
 class Model {
   public:
-    // `format` fp16 or bf16 keeps the 2-D weights in that type (see WeightFormat).
+    // `format` fp16 keeps the 2-D weights in half precision (see WeightFormat).
     Model(ModelConfig cfg, std::map<std::string, Tensor> weights, WeightFormat format = WeightFormat::fp32);
-    // A safetensors file written by indranet.export. With fp16 or bf16, each weight is converted as it is
-    // read (or, stored in that type on a page boundary, used in place), so the float32 copy of the whole
-    // model never exists.
+    // A safetensors file written by indranet.export. With fp16, each weight is converted as it is
+    // read, so the float32 copy of the whole model never exists.
     static Model load(const std::string& path, WeightFormat format = WeightFormat::fp32);
 
     const ModelConfig& cfg() const { return cfg_; }
@@ -251,7 +250,7 @@ class Model {
     const std::map<std::string, Weight>& weights() const { return w_; }
     WeightFormat weight_format() const { return format_; }  // as requested at load
     int64_t weight_bytes() const;                           // memory the weights' values take
-    // With WeightFormat::fp16 or bf16: the 2-D weights kept in float32 because a value did not fit that type.
+    // With WeightFormat::fp16: the 2-D weights kept in float32 because a value did not fit fp16.
     std::vector<std::string> fp32_weights() const;
 
     // Optional vocabulary (one string per token id), read from the file when indranet.export

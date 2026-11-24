@@ -115,7 +115,7 @@ float32. A weight with a value outside fp16's range stays float32, with a warnin
 scripts take `--fp16` for the same: `induction_heads.py --export path --fp16` and
 `arithmetic.py export ... --fp16`. `dtype="bfloat16"` does the same in bf16 (rounded like
 `.bfloat16()`; only a value that rounds to infinity keeps a weight float32); `indra` loads it as
-float32 exactly, `indra --bf16` as it is, and `indra --fp16` converts it to fp16.
+float32 exactly, and `indra --fp16` converts it to fp16.
 
 Pretrained Hugging Face checkpoints don't go through `indranet`: the separate converter in
 [indranet_hf/](indranet_hf/README.md) writes the same file format from them, with numpy only.

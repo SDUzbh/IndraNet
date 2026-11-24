@@ -95,12 +95,6 @@ Precision
                                like the weights. Arithmetic stays float32.
                                A file written with export_model(..., dtype="float16") already
                                holds fp16 weights: --fp16 loads them as they are, --fp32 widens them.
-  --bf16                       weights in bf16: half the memory. A bf16 file (the usual format of
-                               published checkpoints, and of indranet_hf's output for them) loads
-                               as it is, with nothing rounded; others are rounded to 8 significant
-                               bits (relative error up to 4e-3). generate keeps its KV cache in
-                               bf16. Arithmetic stays float32, and the GPU's multiplies take float32
-                               inputs (no fp16 inputs, unlike --fp16).
 )";
 
 struct Args {
@@ -265,7 +259,7 @@ int cmd_tokenize(const Args& a) {
 int cmd_info(const Args&, const Model& m) {
     const ModelConfig& c = m.cfg();
     std::printf("parameters    %lld\n", static_cast<long long>(m.num_parameters()));
-    std::printf("weights       %s, %.2f GB in memory\n", m.weight_format() == WeightFormat::fp32 ? "float32" : format_name(m.weight_format()),
+    std::printf("weights       %s, %.2f GB in memory\n", m.weight_format() == WeightFormat::fp16 ? "fp16" : "float32",
                 double(m.weight_bytes()) / 1e9);
     std::printf("vocab/d_model %lld / %lld   layers %lld   heads %lld (kv %lld, d_head %lld)   max_seq_len %lld\n",
                 (long long)c.vocab_size, (long long)c.d_model, (long long)c.n_layers, (long long)c.n_heads,
@@ -431,9 +425,6 @@ int cmd_patch(const Args& a, const Model& m) {
                     err);
         if (err > 0.01) std::printf("warning: that is large for this gap; run with --fp32 for exact values\n");
     }
-    if (a.has("bf16"))
-        std::printf("note: --bf16: weights are stored in bf16 (a bf16 file's as they are, others rounded), so the metric\n"
-                    "      can differ from float32 weights; run with --fp32 to compare\n");
     if (method == "attribution")
         std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
                     "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
@@ -581,7 +572,6 @@ int cmd_ablate(const Args& a, const Model& m) {
     if (a.has("fp16"))
         std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of around 1e-4 to each value\n",
                     use_gpu() && m.gpu() ? " and the GPU's multiplies take fp16 inputs" : "");
-    if (a.has("bf16")) std::printf("note: --bf16: weights are stored in bf16 (a bf16 file's as they are, others rounded)\n");
     if (mode == "mean") {
         const bool per_pos = std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
         std::printf("means over %zu reference sequences, %s\n", refs.size(),
@@ -792,25 +782,20 @@ int main(int argc, char** argv) {
             else if (dev == "gpu") set_device(Device::Gpu);
             else throw std::invalid_argument("--device must be cpu, both or gpu, got '" + dev + "'");
         }
-        if (int(a.has("fp16")) + int(a.has("bf16")) + int(a.has("fp32")) > 1)
-            throw std::invalid_argument("give one of --fp32, --fp16 and --bf16");
-        const bool fp16 = a.has("fp16"), bf16 = a.has("bf16");
+        if (a.has("fp16") && a.has("fp32")) throw std::invalid_argument("give --fp16 or --fp32, not both");
+        const bool fp16 = a.has("fp16");
         set_gpu_fp16(fp16);
         if (a.command == "tokenize") return cmd_tokenize(a);
-        const WeightFormat format = fp16 ? WeightFormat::fp16 : bf16 ? WeightFormat::bf16 : WeightFormat::fp32;
-        const Model m = Model::load(a.model, format);
-        if (format != WeightFormat::fp32) {
+        const Model m = Model::load(a.model, fp16 ? WeightFormat::fp16 : WeightFormat::fp32);
+        if (fp16) {
             const std::vector<std::string> kept = m.fp32_weights();
             if (!kept.empty()) {
-                std::printf("note: %zu weight%s kept in float32 (values that don't fit %s):", kept.size(), kept.size() == 1 ? "" : "s",
-                            format_name(format));
+                std::printf("note: %zu weight%s kept in float32 (values outside fp16's range):", kept.size(), kept.size() == 1 ? "" : "s");
                 for (size_t i = 0; i < std::min<size_t>(kept.size(), 4); ++i) std::printf(" %s", kept[i].c_str());
                 std::printf("%s\n", kept.size() > 4 ? " ..." : "");
             }
-            if (a.command != "patch" && a.command != "ablate" && a.command != "info") {
-                if (fp16) std::printf("note: --fp16: weights are stored in fp16, so values can differ from float32 weights by about 1e-3 relative\n");
-                else std::printf("note: --bf16: weights are stored in bf16 (a bf16 file's as they are, others rounded)\n");
-            }
+            if (a.command != "patch" && a.command != "ablate" && a.command != "info")
+                std::printf("note: --fp16: weights are stored in fp16, so values can differ from float32 weights by about 1e-3 relative\n");
         }
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},

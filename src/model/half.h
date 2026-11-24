@@ -1,4 +1,4 @@
-// IEEE half precision (fp16) and bfloat16 (bf16) <-> float32 conversion, scalar and in bulk. Internal.
+// IEEE half precision (fp16) <-> float32 conversion, scalar and in bulk. Internal.
 #pragma once
 
 #include <cstdint>
@@ -91,60 +91,6 @@ inline int64_t floats_to_halves(const float* src, uint16_t* dst, int64_t n) {
     for (; i < n; ++i) {
         bad += !fits_half(src[i]);
         dst[i] = float_to_half(src[i]);
-    }
-    return bad;
-}
-
-// bfloat16 (bf16): the top 16 bits of a float32 (sign, 8 exponent bits, 7 fraction bits), so it widens
-// to float32 exactly by a shift; float32's range, fewer significant bits than fp16 (8 against 11).
-inline float bf16_to_float(uint16_t h) {
-    const uint32_t bits = uint32_t(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
-// Round to nearest, ties to even; NaN stays NaN (quiet). A finite value of at least 0x7F7F8000 in magnitude
-// (just under float32's largest) rounds to infinity.
-inline uint16_t float_to_bf16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    if ((x & 0x7FFFFFFF) > 0x7F800000) return static_cast<uint16_t>((x >> 16) | 0x40);
-    return static_cast<uint16_t>((x + 0x7FFF + ((x >> 16) & 1)) >> 16);
-}
-
-// Whether v rounds to a finite bf16 value.
-inline bool fits_bf16(float v) {
-    uint32_t x;
-    std::memcpy(&x, &v, 4);
-    return (x & 0x7FFFFFFF) < 0x7F7F8000;
-}
-
-// Whether every bf16 value is finite (exponent bits not all set).
-inline bool all_finite_bf16(const uint16_t* h, int64_t n) {
-    uint32_t bad = 0;
-    for (int64_t i = 0; i < n; ++i) bad |= (h[i] & 0x7F80) == 0x7F80;
-    return bad == 0;
-}
-
-inline void bf16s_to_floats(const uint16_t* src, float* dst, int64_t n) {
-    int64_t i = 0;
-#if defined(__aarch64__)
-    for (; i + 8 <= n; i += 8) {
-        const uint16x8_t h = vld1q_u16(src + i);
-        vst1q_f32(dst + i, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
-        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_high_n_u16(h, 16)));
-    }
-#endif
-    for (; i < n; ++i) dst[i] = bf16_to_float(src[i]);
-}
-
-// Returns how many values did not fit bf16 (fits_bf16); those become infinity or NaN.
-inline int64_t floats_to_bf16s(const float* src, uint16_t* dst, int64_t n) {
-    int64_t bad = 0;
-    for (int64_t i = 0; i < n; ++i) {
-        bad += !fits_bf16(src[i]);
-        dst[i] = float_to_bf16(src[i]);
     }
     return bad;
 }

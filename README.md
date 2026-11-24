@@ -30,8 +30,7 @@ build/indra generate model.safetensors --text "The capital of France is" --max-n
 ```
 
 macOS builds use Accelerate and the GPU (macOS 15 or newer); elsewhere a portable CPU path is used.
-`--fp16` or `--bf16` keeps the weights in half precision (a bf16 checkpoint loads as it is), and
-`--device cpu|both|gpu` picks where work runs.
+`--fp16` keeps the weights in half precision, and `--device cpu|both|gpu` picks where work runs.
 
 ## Commands
 

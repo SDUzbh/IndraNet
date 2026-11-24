@@ -181,5 +181,5 @@ produces activation gradients only, no weight gradients. It costs about one forw
   formats with unpredictable parts (like the arithmetic prompts) the per-head numbers include that
   noise.
 - **Scope:** one sequence at a time, float32 arithmetic (weights in fp16 and fp16 GPU inputs with
-  `--fp16`, weights in bf16 with `--bf16`), CPU plus the GPU on macOS (`--device`). Only built-in
+  `--fp16`), CPU plus the GPU on macOS (`--device`). Only built-in
   indranet components can be exported.

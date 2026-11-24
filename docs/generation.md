@@ -27,8 +27,8 @@ an intervention, side by side.
 `generate` runs the prompt in one pass and then each new token alone, reading the earlier
 positions' keys and values from a KV cache. On macOS, models of a few hundred million weights or
 more generate on the GPU, with the cache kept there only: its CPU copy is filled when something reads
-it (a CPU step, `keys()`, a copy), so a long context isn't held twice. With `--fp16` or `--bf16` (fp16
-or bf16 weights) the cache holds keys and values of that type too: half its memory, rounded like the weights; float32 models
+it (a CPU step, `keys()`, a copy), so a long context isn't held twice. With `--fp16` (fp16 weights)
+the cache holds fp16 keys and values too: half its memory, rounded like the weights; float32 models
 keep it exact. It stops at the model's end-of-text tokens (stored for
 converted models; `--no-eos` ignores them), at `--stop` ids, or after `--max-new` tokens.
 

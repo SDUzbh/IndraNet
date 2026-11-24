@@ -19,25 +19,17 @@ export_model(model, "model.safetensors", dtype="bfloat16") # ... or in bf16
 
 An fp16 file holds the same values `indra --fp16` would round a float32 file to; with `--fp16` it
 loads them as they are. A bf16 file (also the usual format of published checkpoints) loads as
-float32 exactly, with `--bf16` as it is (half the memory, nothing rounded), or with `--fp16`
-converted to fp16: exactly, except values under about 7.6e-6 and weights with values beyond fp16's
-range, which stay float32. bf16 has fp32's range but fewer significant bits than fp16 (8 against
-11), so `--bf16` rounds a float32 or fp16 file more than `--fp16` would.
-
-In every mode the arithmetic is float32: a multiply widens each fp16 or bf16 weight to float32 as it
-reads it (for bf16, exactly, by a shift), so a model gives what float32 weights holding the same
-values give, bit for bit on the CPU. The KV cache of `generate` is kept in the weights' type. On
-the GPU, MPS multiplies fp16 weights; it has no bf16, so bf16 weights go through the engine's own
-kernels, with float32 inputs (`--fp16`'s fp16 GPU inputs don't apply to them).
+float32 exactly, or with `--fp16` converted to fp16: exactly, except values under about 7.6e-6 and
+weights with values beyond fp16's range, which stay float32. bf16 has fp32's range but fewer
+significant bits than fp16 (8 against 11).
 
 The engine memory-maps model files. Some matrices are used in place, with no copy, the GPU
-included: those stored in the type the engine keeps them in (F16 with `--fp16`, BF16 with `--bf16`,
-F32 otherwise) and
+included: those stored in the type the engine keeps them in (F16 with `--fp16`, F32 otherwise) and
 starting on a page boundary, as files from the Hugging Face converter do. Loading then reads
 nothing ahead of time, and the weights take no memory of the process's own, since they're shared
-with the system's file cache. Other matrices (stored in another type) are converted as they're
-read, as before. So a converted bf16 checkpoint (the converter keeps bf16 by default) loads in place
-with `--bf16`, and `--dtype float16` gives the fastest and leanest `--fp16` runs.
+with the system's file cache. Other matrices (bf16, or stored in the other type) are converted as
+they're read, as before. So for a converted model, `--dtype float16` gives the fastest and leanest
+`--fp16` runs.
 
 ## Converting Hugging Face checkpoints
 

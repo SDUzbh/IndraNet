@@ -192,11 +192,7 @@ def test_vocab_tokenizer_and_settings(tfi, tmp_path):
     vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
     _, path = exported(tmp_path, vocab=vocab)
     m = tfi.Model.load(str(path), fp16=True)
-    assert m.fp16 and not m.bf16 and not m.has_tokenizer and m.vocab == vocab
-    mb = tfi.Model.load(str(path), bf16=True)
-    assert mb.bf16 and not mb.fp16 and mb.weight_bytes == m.weight_bytes and mb.vocab == vocab
-    with pytest.raises(ValueError):
-        tfi.Model.load(str(path), fp16=True, bf16=True)
+    assert m.fp16 and not m.has_tokenizer and m.vocab == vocab
     assert m.tokenize("abc") == [0, 1, 2] and m.token_str(2) == "c"
     meta = tfi.read_metadata(str(path))
     assert meta["format"] == "indranet" and "config" in meta

@@ -42,13 +42,6 @@
   loading with conversion. On the GPU, its batched passes and gradients must equal that float32
   model's bit for bit. The patching, attribution, DLA, lens and circuit invariants above are
   rerun on every configuration with fp16 weights.
-- **bf16 weights** (also `tests/unit.cpp`): the bf16 conversion must round trip every bf16 value and
-  round to nearest-even; a model with bf16 weights must compute what the float32 model with the
-  rounded weights computes, bit for bit on the CPU (1-16 rows straight from the weights, more in
-  converted blocks), keep its KV cache in bf16, and load a BF16 file in place. On the GPU, whose
-  bf16 multiplies are the engine's own kernels (MPS has none), linear layers, passes, gradients,
-  attribution, circuits and cached decoding must match the CPU; the analysis invariants are rerun
-  on every configuration with bf16 weights.
 
 ## Tests
 
@@ -66,7 +59,6 @@ The C++ unit tests are in five groups, so part of the suite can run on its own:
 | `analysis` | per model type: cache and hooks, logit lens, DLA, patching, ablation, circuits |
 | `grad` | gradients against finite differences, attribution and mixed patching |
 | `fp16` | fp16 conversion and weights, and the analysis invariants rerun with fp16 weights |
-| `bf16` | bf16 conversion and weights, and the analysis invariants rerun with bf16 weights |
 | `gpu` | GPU work chunking and thresholds; on macOS also the kernels, resident passes, GPU attention and its backward |
 
 ```bash

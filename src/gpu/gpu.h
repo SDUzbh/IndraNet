@@ -34,14 +34,13 @@ class Gpu {
     ~Gpu();
 
     // linear(x, W, b) on the GPU: x (..., k), W (n, k). A float32 W is copied to the GPU the first
-    // time it is used; an fp16 or bf16 W (WeightFormat::fp16, bf16) is used where it is, without a copy.
+    // time it is used; a half-precision W (WeightFormat::fp16) is used where it is, without a copy.
     // Weights are identified by their address, so a Gpu must only see weights that outlive it and
     // never change (Model::gpu() keeps one per model). Thread-safe.
     // With fp16, x and W go in half precision (accumulation and output stay fp32): the multiply runs
     // several times faster, with relative errors around 1e-3. An x or a float32 W with a value outside
     // fp16's range (|v| > 65504) is multiplied in fp32 instead. Without fp16, x stays fp32; a
-    // half-precision W is then multiplied as it is, exactly (each fp16 value is an fp32 value). A bf16 W
-    // always takes fp32 x (MPS has no bf16: our own kernels, each value widened exactly, sums in fp32).
+    // half-precision W is then multiplied as it is, exactly (each fp16 value is an fp32 value).
     Tensor linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16 = false);
 
     // linear(x, Ws[i], bs[i]) for every i in one GPU submission: x is copied to the GPU once and
@@ -83,11 +82,11 @@ class Gpu::Seq {
     void copy(int x, int y, int64_t n, int64_t x_offset = 0, int64_t y_offset = 0);  // y[y_offset..][0, n) = x[x_offset..][0, n)
     // A KV cache's new positions: rows src_row.. of `src` (rows, heads * D) into `dst` (heads, cap, D), as
     // positions start .. start + rows - 1 (start + rows <= cap).
-    // With format fp16 or bf16, dst holds such values (2 per float of the slot), each rounded as it is written.
+    // With half, dst holds fp16 values (2 per float of the slot), each rounded as it is written.
     void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row = 0,
-                   WeightFormat format = WeightFormat::fp32);
-    // x[0, n) rounded to fp16 or bf16 values (clamped to the type's finite range), in place; nothing for fp32.
-    void round_kv(int x, int64_t n, WeightFormat format);
+                   bool half = false);
+    // x[0, n) rounded to fp16 values (clamped to fp16's finite range), in place.
+    void round_half(int x, int64_t n);
     // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
     // norm()'s input gradient given its input x and output gradient dy (as grad.cpp's norm_backward);
     // dpre = dpost * act'(pre); and for a GLU, post = act(pre) * up: dpre = dpost * up * act'(pre),
@@ -115,7 +114,7 @@ class Gpu::Seq {
         float scale, cap;
         bool has_slopes;
         int64_t blocks = 0;
-        WeightFormat prefix = WeightFormat::fp32;  // pk / pv hold fp16 or bf16 values (a KV cache kept so), 2 per float of the slot
+        bool half_prefix = false;  // pk / pv hold fp16 values (a KV cache kept in fp16), 2 per float of the slot
     };
     // lse >= 0: also each (row, head)'s log of the sum of exp(score) into that slot (rows, H), for
     // attention_backward.
@@ -139,7 +138,7 @@ class Gpu::Seq {
     void glu_backward(int dpost, int pre, int up, int dpre, int dup, int64_t n, GpuAct act);
 
     // Run everything recorded since the last run in one submission and wait. With fp16, linear()
-    // inputs and weights go in half precision, as in Gpu::linear (bf16 weights excepted); if any input is outside fp16's
+    // inputs and weights go in half precision, as in Gpu::linear; if any input is outside fp16's
     // range the whole run is repeated in fp32. So the recorded operations must not overwrite a slot
     // that they read before writing it (anything the CPU or an earlier run left there).
     void run(bool fp16);
@@ -163,7 +162,7 @@ struct GpuKV {
     std::unique_ptr<Gpu::Seq> seq;
     int64_t cap = 0;                    // positions each sequence's region of a layer's slots holds
     int64_t regions = 1;                // sequences (a KVBatch's), region r at positions r * cap ..
-    WeightFormat format = WeightFormat::fp32;  // keys and values held as fp16 or bf16 (a model with those weights), 2 per float of a slot
+    bool half = false;                  // keys and values held as fp16 (a model with fp16 weights), 2 per float of a slot
     static int keys(int64_t layer) { return kSlot0 + 5 * static_cast<int>(layer); }
     static int values(int64_t layer) { return keys(layer) + 1; }
     static int inv_freq(int64_t layer) { return keys(layer) + 2; }
@@ -191,9 +190,8 @@ class Gpu::Batch {
     float* floats(int buf);
     uint16_t* halves(int buf);  // fp16 bit patterns
     const uint32_t* uints(int buf) { return reinterpret_cast<const uint32_t*>(floats(buf)); }
-    // A 2-D model weight (float32, fp16 or bf16), used in place. With fp16, a float32 weight's fp16 copy
-    // instead (kept by the Gpu), unless a value doesn't fit fp16: then the float32 weight. A bf16 weight
-    // stays bf16 (is_fp16() false) and goes on the right of matmul(), times float32 values.
+    // A 2-D model weight (float32 or fp16), used in place. With fp16, a float32 weight's fp16 copy
+    // instead (kept by the Gpu), unless a value doesn't fit fp16: then the float32 weight.
     // The weight must outlive the Batch.
     int weight(const Weight& W, bool fp16 = false);
     bool is_fp16(int buf);
@@ -206,7 +204,7 @@ class Gpu::Batch {
         int64_t ld;
     };
     // C (m, n) = A (m, k) B (k, n), or with trans_b A B^T for B (n, k). A and B are float32 or
-    // (weights) fp16, or B a bf16 weight with A float32; C is float32.
+    // (weights) fp16; C is float32.
     void matmul(Mat A, Mat B, Mat C, int64_t m, int64_t n, int64_t k, bool trans_b);
     // out[out_offset + i * (cols / bn) + j] = the sum of squares of block (i, j), bm x bn, of the
     // rows x cols matrix C (rows and cols multiples of bm and bn).
