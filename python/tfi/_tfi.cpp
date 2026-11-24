@@ -248,8 +248,6 @@ NB_MODULE(_tfi, mod) {
     mod.def("device", [] { return std::string(device_name(device())); });
     mod.def("set_num_threads", &set_num_threads, "n"_a, "Threads for patching, ablation and means (0: TFI_THREADS, else every core).");
     mod.def("num_threads", &num_threads);
-    mod.def("set_gpu_fp16", &set_gpu_fp16, "fp16"_a, "GPU multiplies take fp16 inputs (faster; errors around 1e-3).");
-    mod.def("gpu_fp16", &gpu_fp16);
     mod.def("read_metadata", &read_safetensors_metadata, "path"_a, nb::call_guard<nb::gil_scoped_release>(),
             "The string metadata of a safetensors file's header (no tensor is read).");
 

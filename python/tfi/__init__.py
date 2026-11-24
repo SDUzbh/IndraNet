@@ -26,9 +26,9 @@ dicts of arrays and lists. Engine calls release the GIL. The functions mirror in
 try:
     from ._tfi import (  # noqa: F401
         KVCache, Model, Tokenizer, composition_random_baseline, composition_scores, device, direct_logit_attribution,
-        generate, generate_batch, gpu_fp16, head_ablation, head_scores, head_weights, lens_grid, logit_lens, logit_metric,
+        generate, generate_batch, head_ablation, head_scores, head_weights, lens_grid, logit_lens, logit_metric,
         metric_gradients, next_token_loss, num_threads, ov_copying_scores, patch, read_metadata, set_device,
-        set_gpu_fp16, set_num_threads,
+        set_num_threads,
     )
 except ImportError as e:  # pragma: no cover - depends on the build
     raise ImportError(f"the tfi bindings are not built ({e}); run `make python` in the repository root "
@@ -36,7 +36,7 @@ except ImportError as e:  # pragma: no cover - depends on the build
 
 __all__ = [
     "KVCache", "Model", "Tokenizer", "composition_random_baseline", "composition_scores", "device",
-    "direct_logit_attribution", "generate", "generate_batch", "gpu_fp16", "head_ablation", "head_scores", "head_weights", "lens_grid",
+    "direct_logit_attribution", "generate", "generate_batch", "head_ablation", "head_scores", "head_weights", "lens_grid",
     "logit_lens", "logit_metric", "metric_gradients", "next_token_loss", "num_threads", "ov_copying_scores",
-    "patch", "read_metadata", "set_device", "set_gpu_fp16", "set_num_threads",
+    "patch", "read_metadata", "set_device", "set_num_threads",
 ]

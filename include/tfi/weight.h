@@ -14,7 +14,10 @@ namespace tfi {
 // attention and MLP projections, unembedding) in half precision, halving the model's memory. Each
 // value is rounded to the nearest fp16 value, a relative error of at most 2^-11 (about 5e-4); a
 // weight with a value outside fp16's range (|v| > 65504, or not finite) stays float32. 1-D weights
-// (norm scales, biases) always stay float32, and all arithmetic is float32 either way.
+// (norm scales, biases) always stay float32. The CPU's arithmetic is float32 either way. On the GPU an fp16
+// model's matrix multiplies take fp16 inputs (the activations rounded to fp16; sums and outputs float32),
+// several times faster, with errors around 1e-3 relative; a run with an input outside fp16's range is repeated
+// with float32 inputs. A float32 model's GPU multiplies are float32.
 enum class WeightFormat { fp32, fp16 };
 
 // One weight. A 2-D weight (a matrix: embeddings, projections, unembedding) keeps its values, float32

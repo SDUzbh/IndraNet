@@ -54,6 +54,18 @@ static int g_failures = 0, g_checks = 0;
         CHECK(threw);                          \
     } while (0)
 
+// With fp16 weights the GPU's multiplies take fp16 inputs (WeightFormat): a GPU result is then within about 1e-3
+// relative of the CPU's per multiply, compounded through the layers. The tolerance of a comparison that may involve
+// the GPU: fp32's own for a float32 model, at least 2e-2 for an fp16 one.
+static double tol_for(const Model& m, double fp32) { return m.weight_format() == WeightFormat::fp16 ? std::max(fp32, 2e-2) : fp32; }
+// check_close's added tolerance while an fp16 model is tested (HalfTolerance); 0 for float32.
+static double g_half_tol = 0;
+struct HalfTolerance {
+    double prev;
+    explicit HalfTolerance(const Model& m) : prev(g_half_tol) { g_half_tol = std::max(prev, tol_for(m, 0)); }
+    ~HalfTolerance() { g_half_tol = prev; }
+};
+
 // Random weights with exactly the tensor names and shapes indranet's state_dict uses.
 static Model random_model(ModelConfig cfg, uint64_t seed = 0, WeightFormat format = WeightFormat::fp32) {
     std::mt19937_64 rng(seed);
@@ -306,6 +318,7 @@ static void test_dla(const Model& m) {
 }
 
 static void test_patching(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     const Tokens clean = seq(8, 6);
     Tokens corrupt = clean;
     corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
@@ -419,6 +432,7 @@ static bool same_values(const Tensor& a, const Tensor& b) {
 // Two computations of the same thing that add numbers in different orders (batched vs per pass, GPU
 // vs CPU): close relative to each value, plus a little relative to the tensor's largest value, since
 // rounding errors scale with the numbers summed (models without norms reach ~100 in a small output).
+// An fp16 model's GPU multiplies round their inputs to fp16: g_half_tol then.
 static void check_close(const Tensor& got, const Tensor& want) {
     CHECK(got.shape == want.shape);
     float scale = 0;
@@ -426,7 +440,8 @@ static void check_close(const Tensor& got, const Tensor& want) {
         if (!std::isnan(v)) scale = std::max(scale, std::fabs(v));
     for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i) {
         if (std::isnan(want.data[i])) CHECK(std::isnan(got.data[i]));
-        else CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])) + 1e-5 * scale);
+        else CHECK_NEAR(got.data[i], want.data[i], std::max(1e-4, g_half_tol) * std::max(1.f, std::fabs(want.data[i])) +
+                                                   std::max(1e-5, g_half_tol) * scale);
     }
 }
 
@@ -499,7 +514,7 @@ static void check_ablation_matches_naive(const Model& m, const Tokens& t, const 
         const NaiveAblation& na = naive[i];
         CHECK(means.layers.size() == na.means.layers.size());
         for (size_t l = 0; l < means.layers.size() && l < na.means.layers.size(); ++l)
-            CHECK(max_abs_diff(means.layers[l], na.means.layers[l]) <= 1e-5f * std::max(1.f, max_abs(na.means.layers[l])));
+            CHECK(max_abs_diff(means.layers[l], na.means.layers[l]) <= tol_for(m, 1e-5) * std::max(1.f, max_abs(na.means.layers[l])));
         if (!means.per_position()) continue;
         for (Ablation mode : {Ablation::Zero, Ablation::Mean}) {
             const Tensor got = head_ablation(m, t, mode, sets[i]);
@@ -507,7 +522,7 @@ static void check_ablation_matches_naive(const Model& m, const Tokens& t, const 
             for (int64_t l = 0; l < m.cfg().n_layers; ++l)
                 for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h)
                     // float rounding grows with the loss (models without norms reach losses in the hundreds)
-                    CHECK_NEAR(got.at({l, h}), want.at({l, h}), 1e-5 * std::max(1.f, std::fabs(na.base)));
+                    CHECK_NEAR(got.at({l, h}), want.at({l, h}), tol_for(m, 1e-5) * std::max(1.f, std::fabs(na.base)));
         }
     }
 }
@@ -537,6 +552,7 @@ static NaiveRefs naive_refs(const Model& m, const Tokens& t, const Tokens& corru
 // cpu_parts false leaves out what doesn't involve the GPU (forward_from, the CPU's batched passes), for
 // callers that already ran it on the same model and only change a GPU setting.
 static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts = true) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     const Tokens t = seq(9, 51);
     if (cpu_parts) {  // forward_from reproduces forward exactly from any layer's cached input
         ActivationCache cache;
@@ -622,11 +638,16 @@ static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts
         CHECK(same_values(patch_heads(m, t, corrupt, 8, 1, 2).effect, cpu_heads));
         set_use_gpu(true);
 
-        // fp16 GPU multiplies: really used, close to naive patching (errors around 1e-3 relative),
-        // the same for any thread count, and no effect when the GPU is off.
-        const Tensor gpu32 = patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect;
-        set_gpu_fp16(true);
-        CHECK(max_abs_diff(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, gpu32) > 0.f);
+        // A model with fp16 weights: its GPU multiplies take fp16 inputs, really (they differ from its CPU passes, whose
+        // arithmetic is float32), close to naive patching (errors around 1e-3 relative), the same for any thread
+        // count; with the GPU off, its CPU passes.
+        std::map<std::string, Tensor> w;
+        for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+        const Model m16(m.cfg(), w, WeightFormat::fp16);
+        set_use_gpu(false);
+        const Tensor cpu16 = patch_residual(m16, t, corrupt, "attn_out", 8, 1, 2).effect;
+        set_use_gpu(true);
+        CHECK(max_abs_diff(patch_residual(m16, t, corrupt, "attn_out", 8, 1, 2).effect, cpu16) > 0.f);
         auto check_fp16 = [](const Tensor& got, const Tensor& want) {
             CHECK(got.shape == want.shape);
             float scale = 1.f;
@@ -637,18 +658,17 @@ static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts
         };
         for (int64_t pos : {8, 3}) {
             for (const std::string site : {"resid_pre", "attn_out", "mlp_out"})
-                check_fp16(patch_residual(m, t, corrupt, site, pos, 1, 2).effect, naive.residual.at({pos, site}));
-            check_fp16(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive.heads.at({pos, 2}));
+                check_fp16(patch_residual(m16, t, corrupt, site, pos, 1, 2).effect, naive.residual.at({pos, site}));
+            check_fp16(patch_heads(m16, t, corrupt, pos, 1, 2).effect, naive.heads.at({pos, 2}));
         }
         set_num_threads(1);
-        const Tensor f1 = patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect;
+        const Tensor f1 = patch_residual(m16, t, corrupt, "attn_out", 8, 1, 2).effect;
         set_num_threads(4);
-        CHECK(same_values(patch_residual(m, t, corrupt, "attn_out", 8, 1, 2).effect, f1));
+        CHECK(same_values(patch_residual(m16, t, corrupt, "attn_out", 8, 1, 2).effect, f1));
         set_num_threads(0);
         set_use_gpu(false);
-        CHECK(same_values(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, cpu));
+        CHECK(same_values(patch_residual(m16, t, corrupt, "attn_out", 8, 1, 2).effect, cpu16));
         set_use_gpu(true);
-        set_gpu_fp16(false);
     }
     detail::set_gpu_min_rows(0);
     detail::set_gpu_min_work(0);
@@ -657,10 +677,6 @@ static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts
     CHECK(!use_gpu());
     set_use_gpu(true);
     CHECK(use_gpu());
-    CHECK(!gpu_fp16());
-    set_gpu_fp16(true);
-    CHECK(gpu_fp16());
-    set_gpu_fp16(false);
 
 }
 
@@ -1844,6 +1860,7 @@ static void test_gpu_attention_long() {
 // short sequences stay on the CPU, bit for bit. Activations are compared relative to each one's
 // largest value: nearly one-hot patterns (the large random model) magnify rounding differences.
 static void test_gpu_single_pass(const Model& m, int64_t T) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -1856,9 +1873,10 @@ static void test_gpu_single_pass(const Model& m, int64_t T) {
                         ++calls[n];
                         for (int64_t i = 0; i < a.numel(); ++i) a.data[i] *= 1.f + 0.01f * static_cast<float>(i % 5);
                     });
-    auto near = [](const Tensor& got, const Tensor& want) {
+    const double tol = tol_for(m, 1e-4);
+    auto near = [tol](const Tensor& got, const Tensor& want) {
         CHECK(got.shape == want.shape);
-        if (got.shape == want.shape) CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
+        if (got.shape == want.shape) CHECK(max_abs_diff(got, want) <= tol * std::max(1.f, max_abs(want)));
     };
     auto pass = [&](Device dev, bool resident, ActivationCache& cache, Tensor& edited, std::map<std::string, int>& n_calls) {
         set_device(dev);
@@ -1886,7 +1904,7 @@ static void test_gpu_single_pass(const Model& m, int64_t T) {
             CHECK(gpu.count(name) == 1);
             if (gpu.count(name)) {
                 CHECK(gpu.at(name).shape == want.shape);
-                if (gpu.at(name).shape == want.shape) CHECK(max_abs_diff(gpu.at(name), want) <= 1e-3f * std::max(1.f, max_abs(want)));
+                if (gpu.at(name).shape == want.shape) CHECK(max_abs_diff(gpu.at(name), want) <= tol_for(m, 1e-3) * std::max(1.f, max_abs(want)));
             }
         }
         near(gpu_edited, cpu_edited);
@@ -1988,6 +2006,7 @@ static void test_gpu_single_pass_defaults() {
 // the plain forward pass, and every pass equals the one-linear-layer-at-a-time GPU path, with hooks
 // on CPU-side activations (q, z) and on GPU-side ones (which bring that block back to the CPU).
 static void test_gpu_resident(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -2062,6 +2081,7 @@ static void test_gpu_resident(const Model& m) {
 // Batched gradient passes on the GPU (Model::gradients_rows) = one run_with_gradients per sequence,
 // at every hook point they support, for log p(target) and a logit difference at each sequence's end.
 static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens = {9, 5, 12}) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -2245,6 +2265,7 @@ static void test_gradients(const Model& m) {
 }
 
 static void test_attribution_patching(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     const Tokens clean = seq(8, 6);
     Tokens corrupt = clean;
     corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
@@ -2326,7 +2347,7 @@ static void check_mixed(const PatchResult& mixed, const PatchResult& atp, const 
             ++flagged;
             CHECK(can);
             // Measured: the same up to float rounding (batched passes group different sites).
-            CHECK_NEAR(mixed.effect.data[i], exact.effect.data[i], 1e-5 * std::max(1.f, std::fabs(exact.effect.data[i])));
+            CHECK_NEAR(mixed.effect.data[i], exact.effect.data[i], std::max(1e-5, g_half_tol) * std::max(1.f, std::fabs(exact.effect.data[i])));
             min_flagged = std::min(min_flagged, std::fabs(est));
         } else {
             CHECK(std::isnan(est) ? std::isnan(mixed.effect.data[i]) : mixed.effect.data[i] == est);
@@ -2341,6 +2362,7 @@ static void check_mixed(const PatchResult& mixed, const PatchResult& atp, const 
 }
 
 static void test_mixed_patching(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     const Tokens clean = seq(8, 6);
     Tokens corrupt = clean;
     corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
@@ -2366,6 +2388,7 @@ static void test_mixed_patching(const Model& m) {
 // Attribution and mixed patching with their gradient runs batched on the GPU: close to the CPU's
 // results for any batch size, the same for any thread count, and the CPU tests' invariants hold.
 static void test_gpu_attribution(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -2374,13 +2397,14 @@ static void test_gpu_attribution(const Model& m) {
     Tokens corrupt = clean;
     corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
     const int64_t pos = 6;
-    auto close = [](const Tensor& got, const Tensor& want) {
+    const double tol = tol_for(m, 1e-4);
+    auto close = [tol](const Tensor& got, const Tensor& want) {
         CHECK(got.shape == want.shape);
         float scale = 1.f;
         for (float v : want.data) if (!std::isnan(v)) scale = std::max(scale, std::fabs(v));
         for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i)
             if (std::isnan(want.data[i])) CHECK(std::isnan(got.data[i]));
-            else CHECK_NEAR(got.data[i], want.data[i], 1e-4 * scale);
+            else CHECK_NEAR(got.data[i], want.data[i], tol * scale);
     };
     bool differs = false;  // the GPU really ran
     for (const int64_t steps : {1, 3}) {
@@ -2637,37 +2661,42 @@ static void test_gpu_circuits(const Model& m) {
     detail::set_gpu_chunk_flops(0);
     detail::set_circuits_run_bytes(0);
 
-    // fp16 inputs: close to the CPU, and really fp16 (composition differs from float32 in its last bits).
-    set_gpu_fp16(true);
-    const Composition ch = composition_scores(m);
+    // A model with fp16 weights: its circuits on the GPU take fp16 inputs, close to the CPU's (which computes them in
+    // float32 from the same fp16 weights), and really fp16 (composition differs from float32 in its last bits).
+    std::map<std::string, Tensor> w;
+    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+    const Model m16(m.cfg(), w, WeightFormat::fp16);
+    set_use_gpu(false);
+    const Composition c16 = composition_scores(m16);
+    const Tensor o16 = ov_copying_scores(m16, n), p16 = ov_pair_copying_scores(m16, n);
+    set_use_gpu(true);
+    const Composition ch = composition_scores(m16);
     double comp_scale = 0, diff32 = 0;
-    for (const float v : cc.q.data)
+    for (const float v : c16.q.data)
         if (!std::isnan(v)) comp_scale = std::max(comp_scale, double(std::fabs(v)));
     for (int64_t i = 0; i < ch.q.numel(); ++i)
-        if (!std::isnan(cg.q.data[i])) diff32 = std::max(diff32, double(std::fabs(ch.q.data[i] - cg.q.data[i])));
+        if (!std::isnan(c16.q.data[i])) diff32 = std::max(diff32, double(std::fabs(ch.q.data[i] - c16.q.data[i])));
     const double tol = 5e-3 * std::max(1.0, comp_scale);
-    CHECK(close(ch.q, cc.q, tol) && close(ch.k, cc.k, tol) && close(ch.v, cc.v, tol));
+    CHECK(close(ch.q, c16.q, tol) && close(ch.k, c16.k, tol) && close(ch.v, c16.v, tol));
     CHECK(diff32 > 0);
-    CHECK(close(ov_copying_scores(m, n), oc, 4.0 / n) && close(ov_pair_copying_scores(m, n), pc, 4.0 / n));
-    // Values too large for fp16: the work runs again in float32, with float32's results. First an
-    // input that doesn't fit (W_O x 1e6), then products that don't while their inputs do
-    // (embeddings and W_O x 1000).
+    CHECK(close(ov_copying_scores(m16, n), o16, 4.0 / n) && close(ov_pair_copying_scores(m16, n), p16, 4.0 / n));
+    // Values too large for fp16: the work runs again in float32, as close to the CPU as float32 runs are. First an
+    // input that doesn't fit (W_O x 1e6, which the model keeps float32), then products that don't while their inputs
+    // do (embeddings and W_O x 1000).
     for (const float scale : {1e6f, 1e3f}) {
-        std::map<std::string, Tensor> w;
-        for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
-        for (auto& kv : w)
+        std::map<std::string, Tensor> wb = w;
+        for (auto& kv : wb)
             if (kv.first.find("o_proj.weight") != std::string::npos || (scale < 1e6f && kv.first == "embed.weight"))
                 for (float& v : kv.second.data) v *= scale;
-        const Model big(m.cfg(), w);
-        set_gpu_fp16(false);
-        const Composition b32 = composition_scores(big);
-        const Tensor o32 = ov_copying_scores(big, n), p32 = ov_pair_copying_scores(big, n);
-        set_gpu_fp16(true);
-        const Composition b16 = composition_scores(big);
-        if (scale == 1e6f) CHECK(same(b16.q, b32.q) && same(b16.k, b32.k) && same(b16.v, b32.v));
-        CHECK(same(ov_copying_scores(big, n), o32) && same(ov_pair_copying_scores(big, n), p32));
+        const Model big(m.cfg(), wb, WeightFormat::fp16);
+        set_use_gpu(false);
+        const Composition bc = composition_scores(big);
+        const Tensor oc_big = ov_copying_scores(big, n), pc_big = ov_pair_copying_scores(big, n);
+        set_use_gpu(true);
+        const Composition bg = composition_scores(big);
+        if (scale == 1e6f) CHECK(close(bg.q, bc.q, 1e-5) && close(bg.k, bc.k, 1e-5) && close(bg.v, bc.v, 1e-5));
+        CHECK(close(ov_copying_scores(big, n), oc_big, 1.5 / n) && close(ov_pair_copying_scores(big, n), pc_big, 1.5 / n));
     }
-    set_gpu_fp16(false);
     detail::set_gpu_min_work(0);
 }
 #endif
@@ -3193,11 +3222,14 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
     const Tokens t = seq(12, 74);
     ActivationCache acts;
     const Tensor want = m16.run_with_cache(t, acts, nullptr, &round);
-    auto close = [](const Tensor& got, const Tensor& w) {  // an fp16 step of difference in a key moves logits by ~1e-3
+    // An fp16 step of difference in a key moves logits by ~1e-3; on the GPU the multiplies' fp16 inputs add ~1e-3 each.
+    const bool gpu = device() != Device::Cpu && m16.gpu();
+    const double rel = gpu ? 2e-2 : 2e-3, of_scale = gpu ? 2e-3 : 1e-4;
+    auto close = [rel, of_scale](const Tensor& got, const Tensor& w) {
         CHECK(got.shape == w.shape);
         const float sc = max_abs(w);
         for (int64_t i = 0; i < got.numel() && got.shape == w.shape; ++i)
-            CHECK_NEAR(got.data[i], w.data[i], 2e-3 * std::max(1.f, std::fabs(w.data[i])) + 1e-4 * sc);
+            CHECK_NEAR(got.data[i], w.data[i], rel * std::max(1.f, std::fabs(w.data[i])) + of_scale * sc);
     };
     KVCache cache;
     std::vector<Tensor> parts{m16.forward_cached(Tokens(t.begin(), t.begin() + 6), cache)};
@@ -3402,6 +3434,7 @@ static void test_generate_trace(const Model& m) {
 // Speculative decoding: greedy output = plain greedy's whatever proposes (prompt lookup, another model,
 // the model itself), with hooks too; the trace = plain generation's; the counts; the position limit.
 static void test_generate_speculative(const Model& m, const Model& other) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     Tokens prompt = seq(6, 81);
     prompt.insert(prompt.end(), prompt.begin(), prompt.end());  // repeated: prompt lookup finds matches
     GenerateOptions o;
@@ -4336,6 +4369,7 @@ static void test_sampler() {
 // forward_cached and generate on the GPU (macOS): GPU-only mode, where every cached step runs there,
 // and both mode with chunks of 2 rows or more on the GPU.
 static void test_gpu_forward_cached(const Model& m) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -4396,6 +4430,7 @@ static void test_gpu_chunked_commits(const Model& m) {
 // and batches. After every step the logits = the whole pass on the same history, keys() = its hook_k, and
 // (set_check_kv) each cache's CPU and GPU copies agree wherever both are up to date.
 static void test_kv_random(const Model& m, uint64_t seed) {
+    const HalfTolerance half_tolerance(m);  // fp16 weights: the GPU rounds its multiplies' inputs
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -4412,7 +4447,10 @@ static void test_kv_random(const Model& m, uint64_t seed) {
     // rounding point exactly (clamped keys), and set_check_kv the CPU and GPU copies bit for bit.
     const bool half = m.weight_format() == WeightFormat::fp16;
     const Hooks round = round_kv_to_half(m);
-    const double rel = half ? 2e-3 : 1e-4, of_scale = half ? 1e-2 : 1e-4;
+    // Its GPU multiplies also take fp16 inputs (~1e-3 relative each): over long chunks of these random models that tips
+    // near-ties in attention, up to ~6% of the logits' scale (measured). Still far from a cache holding the wrong
+    // positions (off by the whole scale); set_check_kv checks the CPU and GPU copies bit for bit.
+    const double rel = half ? 1e-1 : 1e-4, of_scale = half ? 1e-1 : 1e-4;
     auto reference = [&](const Tokens& t) {  // the whole pass on the CPU: logits and every layer's keys
         set_device(Device::Cpu);
         ActivationCache acts;
@@ -4527,7 +4565,7 @@ static void test_kv_random(const Model& m, uint64_t seed) {
 // the residual stream itself) force that repeat: the result = the fp32 pass. And without overflow,
 // fp16 stays close to fp32.
 static void test_gpu_fp16_cached_repeat() {
-    const Model m = random_model(tiny([](ModelConfig& c) { c.mlp = "none"; c.norm = "none"; }), 61);
+    const Model m = random_model(tiny([](ModelConfig& c) { c.mlp = "none"; c.norm = "none"; }), 61, WeightFormat::fp16);
     if (!m.gpu()) {
         std::printf("     (no Metal device: GPU path not tested)\n");
         return;
@@ -4536,22 +4574,21 @@ static void test_gpu_fp16_cached_repeat() {
     for (const float scale : {1e5f, 1.f}) {
         Hooks big;
         big.add("hook_embed", [scale](const std::string&, Tensor& a) { for (float& v : a.data) v *= scale; });
-        auto run = [&](bool fp16) {
-            set_device(Device::Gpu);
-            set_gpu_fp16(fp16);
+        auto run = [&](Device dev) {  // fp16 weights: the GPU's multiplies take fp16 inputs; the CPU's arithmetic is float32
+            set_device(dev);
             KVCache cache;
             std::vector<Tensor> parts{m.forward_cached(Tokens(t.begin(), t.begin() + 8), cache, &big)};
             for (int64_t i = 8; i < 14; ++i) parts.push_back(m.forward_cached({t[i]}, cache, &big));
-            set_gpu_fp16(false);
             set_device(Device::Both);
             return stack_rows(parts);
         };
-        const Tensor fp32 = run(false), fp16 = run(true);
+        const Tensor cpu = run(Device::Cpu), gpu = run(Device::Gpu);
         if (scale > 1) {
-            check_close(fp16, fp32);  // every run overflowed and repeated in fp32
+            check_close(gpu, cpu);  // every GPU run overflowed and repeated with float32 inputs
         } else {
-            CHECK(fp16.shape == fp32.shape);
-            CHECK(max_abs_diff(fp16, fp32) <= 3e-2f * std::max(1.f, max_abs(fp32)));
+            CHECK(gpu.shape == cpu.shape);
+            CHECK(max_abs_diff(gpu, cpu) <= 3e-2f * std::max(1.f, max_abs(cpu)));
+            CHECK(max_abs_diff(gpu, cpu) > 0.f);  // really fp16 inputs
         }
     }
 }

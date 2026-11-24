@@ -176,7 +176,7 @@ class Model {
     // chunks of tokens large enough, for single tokens of models of a few hundred million weights or more,
     // and always in GPU-only mode; then the cache keeps a copy of its keys and values on the GPU, appended
     // to there (a prompt's go straight in), and the pass, final norm and unembedding included, is one GPU
-    // submission, also with fp16 multiplies (set_gpu_fp16). Not when a hook reads hook_pattern, or a
+    // submission (with fp16 weights, fp16 multiplies: see WeightFormat). Not when a hook reads hook_pattern, or a
     // layer's heads are too wide for the GPU's attention: the CPU then (a prompt: forward()'s whole pass).
     Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
     // Several sequences in one pass: tokens[i] continues sequence i of `batch` (empty: it sits this call

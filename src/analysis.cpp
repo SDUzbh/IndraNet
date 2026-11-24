@@ -29,7 +29,6 @@ namespace {
 
 std::atomic<int> g_threads{0};  // 0 = TFI_THREADS, else every core
 std::atomic<int> g_device{-1};  // a Device, or -1: TFI_NO_GPU decides
-std::atomic<bool> g_gpu_fp16{false};
 
 // Run fn(0..n-1) on up to num_threads() threads. Jobs are independent; the first exception any job
 // throws is re-thrown here after the workers stop.
@@ -177,8 +176,6 @@ Device device() {
 
 void set_use_gpu(bool use) { set_device(use ? Device::Both : Device::Cpu); }
 
-void set_gpu_fp16(bool fp16) { g_gpu_fp16 = fp16; }
-bool gpu_fp16() { return g_gpu_fp16; }
 
 bool use_gpu() { return device() != Device::Cpu; }
 
@@ -651,7 +648,7 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
 
     const std::vector<Batch> batches = make_batches(todo, [P](int64_t t) { return P - t; }, batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
-    const bool fp16 = gpu_fp16();  // read once: the same for every batch
+    const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
         const Batch& b = batches[j];
         const int64_t i = b.layer;
@@ -718,7 +715,7 @@ PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens&
 
     const std::vector<Batch> batches = make_batches(todo, [P](int64_t) { return P; }, head_batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
-    const bool fp16 = gpu_fp16();  // read once: the same for every batch
+    const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
         const Batch& b = batches[j];
         const int64_t i = b.layer, Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
@@ -1091,7 +1088,7 @@ HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64
     const std::vector<Batch> batches = make_batches(
         {all}, [&](int64_t n) { return static_cast<int64_t>(reference[n].size()); }, ablation_batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
-    const bool fp16 = gpu_fp16();
+    const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     std::vector<std::vector<Tensor>> zs(R, std::vector<Tensor>(L));  // reference n, layer i: (len, H, D)
     parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
         const Batch& b = batches[j];
@@ -1225,7 +1222,7 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
 
     const std::vector<Batch> batches = make_batches(todo, [T](int64_t) { return T; }, ablation_batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
-    const bool fp16 = gpu_fp16();  // read once: the same for every batch
+    const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     // Logits are unembedded a few passes at a time: at most this many floats at once.
     constexpr int64_t kMaxLogits = int64_t(1) << 23;
     parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
@@ -1463,7 +1460,7 @@ Composition composition_scores(const Model& m) {
             if (ids[a].first < ids[b].first) pairs.emplace_back(a, b);
 #ifdef TFI_USE_ACCELERATE
     try {
-        GpuRun r = composition_gpu(m, ids, heads, c, gpu_fp16());
+        GpuRun r = composition_gpu(m, ids, heads, c, m.weight_format() == WeightFormat::fp16);
         if (r == GpuRun::Overflow) r = composition_gpu(m, ids, heads, c, false);
         if (r == GpuRun::Done) return c;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
@@ -1790,7 +1787,7 @@ Tensor ov_copying_scores(const Model& m, int64_t max_tokens) {
 #ifdef TFI_USE_ACCELERATE
     try {
         Tensor out({L, H}, kNaN);
-        GpuRun r = ov_copying_gpu(m, max_tokens, out, gpu_fp16());
+        GpuRun r = ov_copying_gpu(m, max_tokens, out, m.weight_format() == WeightFormat::fp16);
         if (r == GpuRun::Overflow) r = ov_copying_gpu(m, max_tokens, out, false);
         if (r == GpuRun::Done) return out;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below
@@ -1818,7 +1815,7 @@ Tensor ov_pair_copying_scores(const Model& m, int64_t max_tokens) {
 #ifdef TFI_USE_ACCELERATE
     try {
         Tensor out({N, N}, kNaN);
-        GpuRun r = ov_pair_copying_gpu(m, max_tokens, ids, out, gpu_fp16());
+        GpuRun r = ov_pair_copying_gpu(m, max_tokens, ids, out, m.weight_format() == WeightFormat::fp16);
         if (r == GpuRun::Overflow) r = ov_pair_copying_gpu(m, max_tokens, ids, out, false);
         if (r == GpuRun::Done) return out;
     } catch (const detail::GpuFailure&) {  // still failing after retries: the CPU computes it below

@@ -1090,7 +1090,7 @@ Tensor Model::run_from(int64_t layer, Tensor x, const Hooks* hooks, bool last_on
     rb.gpu = layer < cfg_.n_layers ? single_pass_gpu(*this, layer, x.shape[0]) : nullptr;
     if (rb.gpu) {
         rb.whole = true;
-        rb.fp16 = gpu_fp16();
+        rb.fp16 = format_ == WeightFormat::fp16;  // fp16 weights: fp16 multiplies on the GPU
         rb.add(0, x.shape[0]);
         x = run_rows(layer, std::move(x), rb, hooks);
     }
@@ -1391,7 +1391,7 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
     }
     cache.gpu_len_ = std::max(cache.gpu_len_, upload_to);
     rb.gpu = g;
-    rb.fp16 = gpu_fp16();
+    rb.fp16 = format_ == WeightFormat::fp16;  // fp16 weights: fp16 multiplies on the GPU
     rb.kv = &kv;
 #endif
 }
@@ -1472,7 +1472,7 @@ Tensor Model::rerun_final(int64_t pos, const Tensor& final_out, const KVCache& c
 #ifdef TFI_USE_ACCELERATE
     if (cache.gpu_ && cache.gpu_len_ > pos) {
         rb.gpu = cache.gpu_->gpu.get();
-        rb.fp16 = gpu_fp16();
+        rb.fp16 = format_ == WeightFormat::fp16;  // fp16 weights: fp16 multiplies on the GPU
         rb.whole = true;  // on the GPU whatever the rows, as the pass was
     }
 #endif
@@ -1633,7 +1633,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
             rb.kbase.push_back(i * kv.cap);
         }
         rb.gpu = g;
-        rb.fp16 = gpu_fp16();
+        rb.fp16 = format_ == WeightFormat::fp16;  // fp16 weights: fp16 multiplies on the GPU
         rb.kv = &kv;
     }
 #endif

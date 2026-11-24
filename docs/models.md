@@ -23,6 +23,12 @@ float32 exactly, or with `--fp16` converted to fp16: exactly, except values unde
 weights with values beyond fp16's range, which stay float32. bf16 has fp32's range but fewer
 significant bits than fp16 (8 against 11).
 
+With fp16 weights the CPU still computes in float32: a model gives, bit for bit, what float32 weights
+holding the same rounded values give. On the GPU its matrix multiplies take fp16 inputs (the
+activations rounded to fp16, sums in float32), several times faster, with errors around 1e-3
+relative; a run with a value beyond fp16's range is repeated with float32 inputs. Weights in float32
+always multiply in float32.
+
 The engine memory-maps model files. Some matrices are used in place, with no copy, the GPU
 included: those stored in the type the engine keeps them in (F16 with `--fp16`, F32 otherwise) and
 starting on a page boundary, as files from the Hugging Face converter do. Loading then reads
