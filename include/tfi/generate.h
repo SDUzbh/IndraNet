@@ -4,8 +4,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <memory>
-#include <optional>
 #include <random>
 #include <vector>
 
@@ -47,7 +45,7 @@ struct TraceStep {
 // greedy decoding gives the tokens it gives without speculation (up to rounding, since the checking pass
 // computes several rows at once), and sampling draws from the same distribution by the standard
 // acceptance rule (Leviathan et al. 2023, Chen et al. 2023), though not the same tokens for a given seed.
-// Hooks run as they do without speculation (see DecodeRuntime).
+// Hooks run as they do without speculation (see DecodeRuntime, tfi/runtime.h).
 struct SpeculativeStats {
     int64_t steps = 0;     // passes of the model that chose tokens, the prompt's included
     int64_t drafted = 0;   // tokens proposed
@@ -116,31 +114,6 @@ class Sampler {
     std::vector<double> hist_;
 };
 
-// One decoding, a token at a time. Each next() returns the next new token (nothing once it has stopped), and
-// the outside sees the same sequence of events whether or not it speculates:
-//   the prompt's hooks, token 1, token 1's hooks, token 2, token 2's hooks, ...
-// A token's hooks run on the next() after it is returned, so a token that ends the text never reaches them.
-// Inside, a pass may compute guesses at the following tokens. Hooks never run on a guess: its row gets a
-// prediction of what they will do, learned from their earlier calls. Once the guess is confirmed, the real
-// hooks get its activations, in order, one row per call. If they do what was predicted the row stands;
-// if not, the token is computed again with their real output. So hooks can keep state, pick rows, draw random
-// numbers or use another token's activation, unchanged. Hooks whose edits can't be predicted run with little or
-// no speculation. The model, options' draft, hooks and trace must outlive the runtime; options.on_token is
-// generate()'s, not used here. After an exception from a hook or the model, next() returns nothing.
-class DecodeRuntime {
-  public:
-    DecodeRuntime(const Model& model, const Tokens& prompt, const GenerateOptions& options = {}, const Hooks* hooks = nullptr,
-                  std::vector<TraceStep>* trace = nullptr);
-    ~DecodeRuntime();
-    DecodeRuntime(const DecodeRuntime&) = delete;
-    DecodeRuntime& operator=(const DecodeRuntime&) = delete;
-    std::optional<int64_t> next();
-
-  private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
 // New tokens continuing `prompt` (not including it), at most max_new_tokens. The prompt runs in one
 // pass, then each new token alone. `hooks` apply to every pass: the prompt's activations first, then
 // each new token's (see Model::forward_cached for their shapes), so an intervention lasts through the
@@ -149,7 +122,7 @@ class DecodeRuntime {
 // on_token is called for that token. Activations are recorded after `hooks` ran: the trace shows what
 // the model computed, interventions included.
 // With options.speculative.draft_tokens, steps are speculative (see SpeculativeOptions), through a
-// DecodeRuntime: hooks and on_token see what they see without speculation.
+// DecodeRuntime (tfi/runtime.h): hooks and on_token see what they see without speculation.
 Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
                 const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
 

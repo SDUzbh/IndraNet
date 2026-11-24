@@ -21,6 +21,7 @@ included. macOS builds need macOS 15 or newer.
 ```cpp
 #include "tfi/analysis.h"
 #include "tfi/generate.h"
+#include "tfi/runtime.h"
 using namespace tfi;
 
 Model m = Model::load("model.safetensors");                 // or (..., WeightFormat::fp16): half the memory
@@ -57,7 +58,7 @@ std::vector<Tokens> both = generate_batch(m, {t, t}, opt, {nullptr, &hooks});  /
 opt.speculative.draft_tokens = 8;                            // speculative decoding: prompt lookup,
 opt.speculative.draft = &small;                              // or a draft model with the same tokenizer
 Tokens fast = generate(m, t, opt);
-DecodeRuntime runtime(m, t, opt, &hooks);                    // the same decoding, a token at a time
+DecodeRuntime runtime(m, t, opt, &hooks);                    // tfi/runtime.h: the same decoding, a token at a time
 while (std::optional<int64_t> token = runtime.next()) { /* ... */ }
 std::string text = m.decode(more);
 

@@ -88,7 +88,7 @@ So a hook only affects the speed:
 Predictions are compared up to rounding (a relative difference of about 1e-6), since redoing an edit such
 as adding a vector can differ in the last bits.
 
-From C++, `DecodeRuntime` gives the same decoding one token at a time, and a token's hooks run when the
+From C++, `DecodeRuntime` (`tfi/runtime.h`) gives the same decoding one token at a time, and a token's hooks run when the
 next one is asked for:
 
 ```cpp

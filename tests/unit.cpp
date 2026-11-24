@@ -19,6 +19,7 @@
 
 #include "tfi/analysis.h"
 #include "tfi/generate.h"
+#include "tfi/runtime.h"
 #include "tfi/json.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
