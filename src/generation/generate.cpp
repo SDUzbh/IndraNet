@@ -1,6 +1,6 @@
 #include "tfi/generate.h"
 
-#include "ops.h"
+#include "../model/ops.h"
 #include "tfi/runtime.h"
 #include "trace.h"
 

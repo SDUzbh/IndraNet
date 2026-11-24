@@ -138,7 +138,7 @@ hook names.
 
 | Path | What it is |
 |---|---|
-| [include/tfi/](include/tfi/), [src/](src/) | The tfi engine |
+| [include/tfi/](include/tfi/), [src/](src/) | The tfi engine: its API, and the code in `model/`, `gpu/`, `text/`, `generation/` and `io/` |
 | [tools/indra.cpp](tools/indra.cpp) | The `indra` command line |
 | [python/](python/) | `indranet` (PyTorch models), [`indranet_hf`](python/indranet_hf/) (converter), [`tfi`](python/tfi/) (bindings) |
 | [examples/](examples/) | Two circuits trained in Python and reverse-engineered with `indra` |

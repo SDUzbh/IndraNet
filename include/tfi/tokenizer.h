@@ -9,7 +9,7 @@
 //   added_tokens    matched leftmost-longest, before (or, for normalized ones, after) normalization,
 //                   with lstrip / rstrip / single_word
 // Anything else is refused with a message naming it. Unicode data (categories for \p{..}, NFC) is
-// version 13.0 (src/unicode_tables.h); text with characters assigned later may split differently.
+// version 13.0 (src/text/unicode_tables.h); text with characters assigned later may split differently.
 #pragma once
 
 #include <cstdint>

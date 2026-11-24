@@ -11,7 +11,7 @@
 #include <stdexcept>
 
 #include "tfi/json.h"
-#include "half.h"
+#include "../model/half.h"
 
 namespace tfi {
 

@@ -18,10 +18,10 @@
 namespace tfi {
 
 namespace detail {
-struct RowBatch;  // internal (src/ops.h)
-struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model.cpp)
-class Gpu;        // internal (src/gpu.h, macOS)
-struct GpuKV;     // internal (src/gpu.h, macOS): a KVCache's copy on the GPU
+struct RowBatch;  // internal (src/model/ops.h)
+struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model/model.cpp)
+class Gpu;        // internal (src/gpu/gpu.h, macOS)
+struct GpuKV;     // internal (src/gpu/gpu.h, macOS): a KVCache's copy on the GPU
 
 // A model's GPU context, created on first use. Copies start empty: each model has its own context
 // (a copy shares the weights' memory, which each context uses in place).

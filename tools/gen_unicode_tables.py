@@ -1,12 +1,12 @@
-"""Generate src/unicode_tables.h: the Unicode data the tokenizer needs, from Python's unicodedata.
+"""Generate src/text/unicode_tables.h: the Unicode data the tokenizer needs, from Python's unicodedata.
 
-    python3 tools/gen_unicode_tables.py > src/unicode_tables.h
+    python3 tools/gen_unicode_tables.py > src/text/unicode_tables.h
 
 - general categories, as ranges (for the regex classes \\p{L}, \\p{N}, ... in pre-tokenizer patterns)
 - canonical decompositions, combining classes and primary compositions (for NFC / NFD normalizers)
 
 The tables follow the Unicode version of the Python that runs this (printed in the header). Hangul
-syllables are composed and decomposed algorithmically in src/unicode.cpp, so they are left out here.
+syllables are composed and decomposed algorithmically in src/text/unicode.cpp, so they are left out here.
 """
 import sys
 import unicodedata

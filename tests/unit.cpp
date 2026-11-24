@@ -23,13 +23,13 @@
 #include "tfi/json.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
-#include "../src/vmath.h"  // internal: vectorizable exp / erf / tanh
-#include "../src/gpu.h"    // internal (macOS): GPU matrix multiplies
-#include "../src/ops.h"    // internal: patching batch sizes
-#include "../src/half.h"   // internal: fp16 conversion
-#include "../src/gpu_chunks.h"  // internal: chunked GPU work (portable half)
-#include "../src/regex.h"       // internal: tokenizer split patterns
-#include "../src/unicode.h"     // internal: UTF-8, categories, NFC
+#include "../src/model/vmath.h"      // internal: vectorizable exp / erf / tanh
+#include "../src/gpu/gpu.h"          // internal (macOS): GPU matrix multiplies
+#include "../src/model/ops.h"        // internal: patching batch sizes
+#include "../src/model/half.h"       // internal: fp16 conversion
+#include "../src/gpu/gpu_chunks.h"   // internal: chunked GPU work (portable half)
+#include "../src/text/regex.h"       // internal: tokenizer split patterns
+#include "../src/text/unicode.h"     // internal: UTF-8, categories, NFC
 #include "tfi/tokenizer.h"
 
 using namespace tfi;
@@ -854,7 +854,7 @@ static void test_post_norm_dla_refused() {
     CHECK_THROWS(direct_logit_attribution(mixed, seq(5, 1), 4, 1));
 }
 
-// The vectorizable exp, erf and tanh (src/vmath.h) against double precision, at every 16th float
+// The vectorizable exp, erf and tanh (src/model/vmath.h) against double precision, at every 16th float
 // of their working range, plus special values.
 // --- fp16 weights ----------------------------------------------------------------------------
 
@@ -2829,7 +2829,7 @@ static void test_gpu_wide_heads() {
 //   grad      gradients against finite differences, attribution and mixed patching
 //   fp16      fp16 conversion and weights, and the analysis invariants with fp16 weights
 //   gpu       GPU work: chunking and thresholds everywhere; kernels, resident passes, attention on macOS
-// Linear layers on 1-4 rows multiply straight from the weights (src/weight.cpp): = a double-precision
+// Linear layers on 1-4 rows multiply straight from the weights (src/model/weight.cpp): = a double-precision
 // reference, for float32 and fp16 weights and sizes with a tail past the 8-wide steps; fp16 weights =
 // float32 weights holding the same rounded values, bit for bit (on 1-4 rows); the same with one thread
 // or many.

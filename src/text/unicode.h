@@ -1,5 +1,5 @@
 // Unicode for the tokenizer: UTF-8, general categories, White_Space, and NFC / NFD normalization.
-// Data from src/unicode_tables.h (tools/gen_unicode_tables.py).
+// Data from src/text/unicode_tables.h (tools/gen_unicode_tables.py).
 #pragma once
 
 #include <cstdint>

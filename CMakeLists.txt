@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-# macOS builds need macOS 15 or newer (src/gpu.mm); set before project() so it takes effect.
+# macOS builds need macOS 15 or newer (src/gpu/gpu.mm); set before project() so it takes effect.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 project(IndraNet LANGUAGES CXX)
 
@@ -11,7 +11,7 @@ endif()
 
 option(TFI_PYTHON "Build the Python bindings (python/tfi; needs nanobind: pip install nanobind)" OFF)
 
-file(GLOB TFI_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+file(GLOB TFI_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*/*.cpp)
 add_library(tfi STATIC ${TFI_SOURCES})
 if(TFI_PYTHON)
   set_target_properties(tfi PROPERTIES POSITION_INDEPENDENT_CODE ON)  # linked into a shared module
@@ -21,7 +21,7 @@ target_compile_options(tfi PRIVATE -Wall -Wextra)
 find_package(Threads REQUIRED)
 target_link_libraries(tfi PUBLIC Threads::Threads)
 
-# macOS: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu.mm).
+# macOS: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu/gpu.mm).
 # PUBLIC so the unit tests also exercise the macOS-only paths.
 if(APPLE)
   find_library(ACCELERATE Accelerate)
@@ -32,8 +32,8 @@ if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-    target_sources(tfi PRIVATE src/gpu.mm)
-    set_source_files_properties(src/gpu.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_sources(tfi PRIVATE src/gpu/gpu.mm)
+    set_source_files_properties(src/gpu/gpu.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(tfi PUBLIC TFI_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
     target_link_libraries(tfi PUBLIC ${ACCELERATE} ${METAL} ${MPS} ${FOUNDATION})
   endif()

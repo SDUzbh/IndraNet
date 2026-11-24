@@ -16,7 +16,7 @@
 #include "half.h"
 #include "ops.h"
 #include "vmath.h"
-#include "gpu.h"
+#include "../gpu/gpu.h"
 
 namespace tfi {
 

@@ -41,7 +41,7 @@ double gpu_min_work() {
 }
 void set_gpu_min_work(double multiply_adds) { g_min_work = multiply_adds; }
 
-// Kernels of Gpu::Seq, compiled when first needed. The math is src/vmath.h's (same polynomials),
+// Kernels of Gpu::Seq, compiled when first needed. The math is src/model/vmath.h's (same polynomials),
 // so GPU and CPU agree to float rounding.
 const char* const kKernelSource = R"(
 #include <metal_stdlib>

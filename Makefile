@@ -12,16 +12,16 @@ override CXXFLAGS += -std=c++17 -Wall -Wextra -Iinclude -pthread
 LDLIBS :=
 
 BUILD := build
-LIB_SRCS := $(wildcard src/*.cpp)
+LIB_SRCS := $(wildcard src/*.cpp src/*/*.cpp)
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=$(BUILD)/obj/%.o)
 
-# macOS 15 or newer: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu.mm).
+# macOS 15 or newer: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu/gpu.mm).
 ifeq ($(shell uname -s),Darwin)
   override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK -mmacosx-version-min=15.0
   LDLIBS += -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation
-  LIB_OBJS += $(BUILD)/obj/gpu.o
+  LIB_OBJS += $(BUILD)/obj/gpu/gpu.o
 endif
-HEADERS := $(wildcard include/tfi/*.h src/*.h)
+HEADERS := $(wildcard include/tfi/*.h src/*.h src/*/*.h)
 
 all: $(BUILD)/libtfi.a $(BUILD)/indra $(BUILD)/tfi_golden $(BUILD)/tfi_tests
 

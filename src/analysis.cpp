@@ -14,10 +14,10 @@
 #include <stdexcept>
 #include <thread>
 
-#include "gpu.h"
-#include "gpu_chunks.h"
-#include "half.h"
-#include "ops.h"
+#include "gpu/gpu.h"
+#include "gpu/gpu_chunks.h"
+#include "model/half.h"
+#include "model/ops.h"
 
 #ifdef TFI_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>

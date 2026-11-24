@@ -13,7 +13,7 @@
 namespace tfi {
 
 // RoPE frequency scaling, as Hugging Face's rope_scaling (indranet.config.ROPE_SCALING). Unused
-// fields keep their defaults; rope_frequencies (src/ops.h) turns it into frequencies.
+// fields keep their defaults; rope_frequencies (src/model/ops.h) turns it into frequencies.
 struct RopeScaling {
     std::string type;                             // linear | dynamic | llama3 | yarn | longrope
     std::optional<double> factor;
