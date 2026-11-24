@@ -35,6 +35,10 @@ Sampler::Sampler(const GenerateOptions& o) : temperature_(o.temperature), top_p_
     check(o);
 }
 
+bool Sampler::greedy() const {
+    return temperature_ == 0 || top_k_ == 1 || 1.0 / temperature_ > std::numeric_limits<float>::max();
+}
+
 // exp(x) for the sampler's weights, Cephes' expf: 2^n e^r with |r| <= ln(2)/2, a degree-5 polynomial for
 // e^r, relative error about 1e-7. Written as separate IEEE multiplies and adds (no fused multiply-adds, no
 // library calls), the same in the vector loop as in the scalar one, so the weights, and with them the
@@ -215,8 +219,7 @@ bool Sampler::select(const float* logits, int64_t n, int64_t& best, double& tota
     best = 0;
     while (!(logits[best] == top)) ++best;
     // (A temperature whose reciprocal overflows a float leaves the largest logit alone, as greedy does.)
-    if (temperature_ == 0 || top_k_ == 1 || top == INFINITY || 1.0 / temperature_ > std::numeric_limits<float>::max())
-        return false;
+    if (greedy() || top == INFINITY) return false;
     const float scale = static_cast<float>(1.0 / temperature_);
     auto usable = [](float l) { return !std::isnan(l) && l != -INFINITY; };
     ids_.clear();

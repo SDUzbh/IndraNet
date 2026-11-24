@@ -1464,6 +1464,21 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     return logits;
 }
 
+Tensor Model::rerun_final(int64_t pos, const Tensor& final_out, const KVCache& cache) const {
+    if (pos < 0 || pos >= cache.len_) throw std::invalid_argument("rerun_final: position " + std::to_string(pos) + " is not in the cache");
+    if (final_out.shape != Shape{1, cfg_.d_model}) throw std::invalid_argument("rerun_final: final_out must be (1, d_model)");
+    check_cache(cache);
+    detail::RowBatch rb;
+#ifdef TFI_USE_ACCELERATE
+    if (cache.gpu_ && cache.gpu_len_ > pos) {
+        rb.gpu = cache.gpu_->gpu.get();
+        rb.fp16 = gpu_fp16();
+        rb.whole = true;  // on the GPU whatever the rows, as the pass was
+    }
+#endif
+    return logits_from_final(final_out, rb.gpu ? &rb : nullptr);
+}
+
 Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& cache, const Hooks* hooks) const {
     const int64_t L = cfg_.n_layers, d = cfg_.d_model;
     if (layer < 0 || layer >= L) throw std::invalid_argument("rerun_cached: layer " + std::to_string(layer) + " is not in 0.." + std::to_string(L - 1));

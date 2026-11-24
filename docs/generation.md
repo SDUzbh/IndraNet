@@ -74,7 +74,9 @@ repeating patterns such as one edit on every second token. Once a proposal is co
 runs on its recorded activation. If it does what was predicted, the batched row stands. If not, that
 token is computed again from the hook's block with the real output: the blocks below it were right.
 The proposals after it stay, since their lower blocks are right too, and each one that is confirmed is
-computed again from that block.
+computed again from that block. At `hook_final`, after the last block, only that token's logits are
+computed again, from the hook's real output: nothing else reads it, so the proposals after it stand as
+they are.
 
 So a hook only affects the speed:
 
@@ -85,8 +87,14 @@ So a hook only affects the speed:
 | Edits that can't be predicted (random noise, a value from another token or layer), in the upper half of the blocks | Keeps part of the speedup: each token is computed again from the hook's block |
 | Edits that can't be predicted, in the lower half | About the speed of ordinary decoding: proposals wait until predictions have been right |
 
-Predictions are compared up to rounding (a relative difference of about 1e-6), since redoing an edit such
-as adding a vector can differ in the last bits.
+A prediction that leaves a row alone or overwrites values must match the hook's output exactly, so an
+edit of any size counts. A predicted scale or offset is compared up to rounding (a relative difference of
+about 1e-6), since redoing one, such as adding a vector, can differ in the last bits.
+
+As in ordinary decoding, where each pass runs a copy of the hooks, each token's hooks run on a copy made
+just before they run: state a C++ hook keeps in itself (a `mutable` lambda's) lasts one token, and the
+`Hooks` object is never changed. Filters are asked then too, so a filter that turns on or off between
+tokens takes effect at the same token as without `speculate`.
 
 From C++, `DecodeRuntime` (`tfi/runtime.h`) gives the same decoding one token at a time, and a token's hooks run when the
 next one is asked for:

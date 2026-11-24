@@ -194,6 +194,10 @@ class Model {
     // truncate. Returns that position's logits, (1, vocab). Hooks see blocks layer.. and hook_final. On
     // the GPU under forward_cached's rules for one token.
     Tensor rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& cache, const Hooks* hooks = nullptr) const;
+    // Internal, for speculative decoding: position `pos`'s logits, (1, vocab), from `final_out` (1, d_model),
+    // what hook_final put out there, the blocks' work at pos standing: the unembedding (and final softcap)
+    // only, on the GPU if the cache's copy there holds pos (the pass that computed it ran there).
+    Tensor rerun_final(int64_t pos, const Tensor& final_out, const KVCache& cache) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
     // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping

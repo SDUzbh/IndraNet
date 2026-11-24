@@ -3007,6 +3007,18 @@ static void test_forward_cached(const Model& m) {
         CHECK_THROWS(m.rerun_cached(0, 0, rows(acts.at("blocks.0.hook_resid_pre"), 0, 2), r));
         KVCache none;
         CHECK_THROWS(m.rerun_cached(0, 0, in0, none));
+        // rerun_final: a position's logits from hook_final's output there, the cache left as it was.
+        for (int64_t p : {int64_t(0), int64_t(4), T - 1}) {
+            const KVCache before = c;
+            check_close(m.rerun_final(p, rows(acts.at("hook_final"), p, p + 1), c), rows(full, p, p + 1));
+            CHECK(c.size() == before.size());
+            for (int64_t l = 0; l < L; ++l) check_close(c.keys(l), before.keys(l));
+        }
+        const Tensor f0 = rows(acts.at("hook_final"), 0, 1);
+        CHECK_THROWS(m.rerun_final(T, f0, c));
+        CHECK_THROWS(m.rerun_final(-1, f0, c));
+        CHECK_THROWS(m.rerun_final(0, rows(acts.at("hook_final"), 0, 2), c));
+        CHECK_THROWS(m.rerun_final(0, f0, none));
     }
     // Edits at every step = the same edits on the whole pass: zeroing a head's z, scaling keys (what
     // later tokens read from the cache) and editing the pattern.
@@ -3428,6 +3440,32 @@ static void test_generate_speculative(const Model& m, const Model& other) {
         CHECK(generate(m, prompt, o, &half) == plain_hooked);
         CHECK(generate(m, prompt, o, &head) == plain_head);
     }
+    // hook_final zeroing its row now and then (all logits equal: greedy takes id 0): a guess it was predicted to
+    // leave alone gets its logits computed again from the real output.
+    {
+        int calls = 0;
+        Hooks zero;
+        zero.add("hook_final", [&](const std::string&, Tensor& a) {
+            const int k = calls++;
+            if (k == 4 || k == 9 || k == 11) std::fill(a.data.begin(), a.data.end(), 0.f);
+        });
+        o.speculative.draft_tokens = 0;
+        const Tokens want = generate(m, prompt, o, &zero);
+        CHECK(want != plain);
+        o.speculative.draft_tokens = 4;
+        for (const Model* d : {static_cast<const Model*>(nullptr), &m}) {
+            o.speculative.draft = d;
+            calls = 0;
+            CHECK(generate(m, prompt, o, &zero) == want);
+        }
+    }
+    // Greedy picks from top_k 1 at a temperature: proposals checked by id, as at temperature 0.
+    o.speculative.draft = &other;
+    o.temperature = 0.8;
+    o.top_k = 1;
+    CHECK(generate(m, prompt, o) == plain);
+    o.temperature = 0;
+    o.top_k = 0;
     // The trace: plain generation's steps, rejected proposals left out.
     const bool post = m.cfg().norm_position == "post";
     o.trace.top_k = 3;
@@ -3946,6 +3984,129 @@ static void test_runtime_interface() {
     c.speculative.stats = &st;
     CHECK(generate(m4, prompt, c, &random_choice) == chosen);
     CHECK(st.reruns <= 8);
+
+    // A hook's real edit is never taken for its prediction. hook_final zeroes every row (all logits equal, so greedy
+    // takes id 0, and prompt lookup keeps proposing it), then writes 5e-10 instead, which breaks the tie: values
+    // left alone or overwritten must match exactly.
+    {
+        GenerateOptions s = o;
+        s.max_new_tokens = 16;
+        const Tokens zeros(6, 0);
+        int calls = 0;
+        Hooks h;
+        h.add("hook_final", [&](const std::string&, Tensor& a) {
+            const bool nudge = ++calls > 8;
+            for (float& v : a.data) v = nudge ? 5e-10f : 0.f;
+        });
+        const Tokens want = generate(m, zeros, s, &h);
+        CHECK(want.front() == 0 && want.back() != 0);
+        calls = 0;
+        s.speculative.draft_tokens = 4;
+        s.speculative.stats = &st;
+        CHECK(generate(m, zeros, s, &h) == want);
+        CHECK(st.accepted > 0);
+    }
+    // ... nor is an overwritten value that moves by one ulp: from the 9th call, every other call writes the float
+    // after 1 instead of 1, and those tokens are computed again with it.
+    {
+        auto reruns = [&](bool nudge) {
+            int calls = 0;
+            Hooks h;
+            h.add("blocks.1.hook_resid_post", [&](const std::string&, Tensor& a) {
+                ++calls;
+                a.data[0] = nudge && calls > 8 && calls % 2 ? std::nextafter(1.f, 2.f) : 1.f;
+            });
+            GenerateOptions g = o;
+            g.max_new_tokens = 24;
+            g.speculative.draft_tokens = 4;
+            g.speculative.draft = &m;
+            SpeculativeStats s2;
+            g.speculative.stats = &s2;
+            generate(m, prompt, g, &h);
+            return s2.reruns;
+        };
+        CHECK(reruns(true) > reruns(false));
+    }
+    // Each token's hooks run on a copy of the caller's hooks, as each pass of ordinary decoding does: a mutable
+    // lambda's count starts again at every token, and the caller's Hooks is left as it was.
+    {
+        GenerateOptions s = o;
+        s.max_new_tokens = 12;
+        Hooks h;
+        h.add("blocks.1.hook_resid_post", [count = 0](const std::string&, Tensor& a) mutable {
+            if (++count > 1)
+                for (float& v : a.data) v = -v;
+        });
+        const Tokens want = generate(m, prompt, s, &h);
+        s.speculative.draft_tokens = 4;
+        s.speculative.draft = &m;
+        CHECK(generate(m, prompt, s, &h) == want);
+        CHECK(generate(m, prompt, s, &h) == want);  // the same Hooks again
+        s.speculative = {};
+        CHECK(generate(m, prompt, s, &h) == want);
+    }
+    // Filters are asked at every token, as each pass of ordinary decoding asks them: hook_final is negated only while
+    // `on` is set, which the caller changes between tokens, next to a capture that is always on.
+    {
+        auto run = [&](int64_t k) {
+            bool on = false;
+            int finals = 0, embeds = 0;
+            Hooks h;
+            h.add_capture([](const std::string& n) { return n == "hook_embed"; }, [&](const std::string&, Tensor&) { ++embeds; });
+            h.add_filter([&on](const std::string& n) { return on && n == "hook_final"; }, [&](const std::string&, Tensor& a) {
+                ++finals;
+                for (float& v : a.data) v = -v;
+            });
+            GenerateOptions g = o;
+            g.max_new_tokens = 12;
+            g.speculative.draft_tokens = k;
+            g.speculative.draft = k ? &m : nullptr;
+            DecodeRuntime rt(m, prompt, g, &h);
+            Tokens got;
+            while (const auto t = rt.next()) {
+                got.push_back(*t);
+                const size_t i = got.size();
+                on = i == 1 || i == 2 || i == 3 || i >= 7;
+            }
+            return std::make_tuple(got, finals, embeds);
+        };
+        const auto want = run(0);
+        CHECK(std::get<1>(want) > 0);
+        CHECK(run(4) == want);
+    }
+    // A mispredicted hook_final changes its row's logits only: the guesses after it in the pass still stand, and
+    // only the tokens it got wrong are counted as computed again.
+    {
+        auto run = [&](int64_t k, SpeculativeStats* stats) {
+            int c = 0;
+            Hooks h;
+            h.add("hook_final", [&](const std::string&, Tensor& a) {
+                const int i = c++;
+                if (i == 9 || i == 20 || i == 26 || i == 37 || i == 45) for (int64_t r = 0; r < a.shape[0]; ++r) a.ptr()[r * a.shape[1]] += 0.05f;
+            });
+            GenerateOptions g = o;
+            g.max_new_tokens = 60;
+            g.speculative.draft_tokens = k;
+            g.speculative.draft = k ? &m4 : nullptr;
+            g.speculative.stats = stats;
+            return generate(m4, prompt, g, &h);
+        };
+        SpeculativeStats s2;
+        CHECK(run(6, &s2) == run(0, nullptr));
+        CHECK(s2.reruns > 0 && s2.reruns <= 10 && s2.steps < 20);
+    }
+    // Sampler::greedy: whatever the logits, the most likely token.
+    {
+        GenerateOptions g;
+        CHECK(Sampler(g).greedy());
+        g.temperature = 0.8;
+        CHECK(!Sampler(g).greedy());
+        g.top_k = 1;
+        CHECK(Sampler(g).greedy());
+        g.top_k = 0;
+        g.temperature = 1e-300;
+        CHECK(Sampler(g).greedy());
+    }
 }
 
 // A temperature whose reciprocal overflows a float: the largest logit alone, the lowest id among equal ones.

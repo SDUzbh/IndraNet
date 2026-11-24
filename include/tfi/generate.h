@@ -98,6 +98,9 @@ class Sampler {
     void distribution(const float* logits, int64_t n, std::vector<double>& p);
     double uniform();                            // in [0, 1), from the generator's top 53 bits
     int64_t draw(const std::vector<double>& w);  // index i with probability w[i] / sum(w)
+    // Whether every pick is the most likely token, whatever the logits: temperature 0, top_k 1, or a
+    // temperature whose reciprocal overflows a float. (A row with an infinite logit is picked greedily too.)
+    bool greedy() const;
 
   private:
     // The tokens that can be picked, lowest id first: their weights in w_ and ids in ids_ (empty: every
