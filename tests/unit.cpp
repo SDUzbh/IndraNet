@@ -2958,6 +2958,55 @@ static void test_forward_cached(const Model& m) {
         check_close(seen.at("hook_final"), rows(acts.at("hook_final"), 9, T));
         if (m.cfg().embedding_positional()) check_close(seen.at("hook_pos_embed"), rows(acts.at("hook_pos_embed"), 9, T));
     }
+    // rerun_cached: a cached position computed again from a block, from its input there, gives the same row,
+    // keys and values, and the positions after it keep theirs; with hooks from that block on, the row, keys
+    // and values are those of a step of that token with the hooks.
+    {
+        auto first_positions = [](const Tensor& k, int64_t n) {
+            const int64_t H = k.shape[0], P = k.shape[1], D = k.shape[2];
+            Tensor out({H, n, D});
+            for (int64_t h = 0; h < H; ++h) std::copy(k.ptr() + h * P * D, k.ptr() + (h * P + n) * D, out.ptr() + h * n * D);
+            return out;
+        };
+        KVCache c;
+        m.forward_cached(t, c);
+        const std::string top = "blocks." + std::to_string(L - 1) + ".";
+        Hooks edit;
+        edit.add(top + "attn.hook_k", [](const std::string&, Tensor& k) { for (float& x : k.data) x *= 1.5f; });
+        edit.add(top + "hook_resid_post", [](const std::string&, Tensor& a) { for (float& x : a.data) x *= 0.5f; });
+        for (int64_t b : {int64_t(0), L - 1})
+            for (int64_t p : {int64_t(0), int64_t(4), T - 1}) {
+                const Tensor in = rows(acts.at("blocks." + std::to_string(b) + ".hook_resid_pre"), p, p + 1);
+                KVCache r = c;
+                check_close(m.rerun_cached(b, p, in, r), rows(full, p, p + 1));
+                CHECK(r.size() == T);
+                for (int64_t l = 0; l < L; ++l) {
+                    check_close(r.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+                    check_close(r.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+                }
+                KVCache step = c;
+                step.truncate(p);
+                const Tensor want = m.forward_cached({t[static_cast<size_t>(p)]}, step, &edit);
+                KVCache got = c;
+                check_close(m.rerun_cached(b, p, in, got, &edit), want);
+                for (int64_t l = 0; l < L; ++l) {
+                    check_close(first_positions(got.keys(l), p + 1), step.keys(l));
+                    check_close(first_positions(got.values(l), p + 1), step.values(l));
+                }
+                if (p + 3 > T) continue;  // continued by a step of several tokens (the GPU, in that mode): it reads the new values
+                got.truncate(p + 1);
+                const Tokens rest(t.begin() + p + 1, t.end());
+                check_close(m.forward_cached(rest, got), m.forward_cached(rest, step));
+            }
+        const Tensor in0 = rows(acts.at("blocks.0.hook_resid_pre"), 0, 1);
+        KVCache r = c;
+        CHECK_THROWS(m.rerun_cached(L, 0, in0, r));
+        CHECK_THROWS(m.rerun_cached(-1, 0, in0, r));
+        CHECK_THROWS(m.rerun_cached(0, T, in0, r));
+        CHECK_THROWS(m.rerun_cached(0, 0, rows(acts.at("blocks.0.hook_resid_pre"), 0, 2), r));
+        KVCache none;
+        CHECK_THROWS(m.rerun_cached(0, 0, in0, none));
+    }
     // Edits at every step = the same edits on the whole pass: zeroing a head's z, scaling keys (what
     // later tokens read from the cache) and editing the pattern.
     {
@@ -3353,10 +3402,10 @@ static void test_generate_speculative(const Model& m, const Model& other) {
         for (const Model* d : {static_cast<const Model*>(nullptr), &other, &m}) {
             o.speculative.draft = d;
             CHECK(generate(m, prompt, o) == plain);
-            // Each step gives the proposals it keeps and one token of the model's.
+            // Each pass gives the proposals it keeps and one token of the model's.
             CHECK(st.steps >= 1 && st.accepted <= st.drafted && st.steps + st.accepted == static_cast<int64_t>(plain.size()));
-            if (d == &m)  // its own draft: every proposal kept, k + 1 tokens a step
-                CHECK(st.accepted == st.drafted && st.steps == (14 + k) / (k + 1));
+            if (d == &m)  // its own draft: the prompt's pass gives one token, then every proposal kept, k + 1 a step
+                CHECK(st.accepted == st.drafted && st.steps == 1 + (13 + k) / (k + 1));
         }
     }
     o.speculative.draft = nullptr;
@@ -3455,23 +3504,24 @@ static void test_generate_speculative(const Model& m, const Model& other) {
     CHECK_THROWS(generate(m, prompt, o));
 }
 
-// Speculative sampling draws from the model's distribution: the joint frequencies of two new tokens, over
+// Speculative sampling draws from the model's distribution: the joint frequencies of three new tokens, over
 // many seeds, against the exact probabilities (forward passes, Sampler::distribution), for prompt lookup and
 // a draft model of another distribution (and another vocabulary size), with temperature, top_k and top_p.
 static void test_speculative_sampling() {
     const ModelConfig c = tiny([](ModelConfig& x) { x.vocab_size = 5; });
     const ModelConfig c6 = tiny([](ModelConfig& x) { x.vocab_size = 6; });
     const Model m = random_model(c, 3), draft = random_model(c6, 4);
-    const Tokens prompt = {1, 2, 3, 1, 2};  // prompt lookup proposes 3, 1, 2, ...
+    const Tokens prompt = {0, 1, 2, 3, 4, 0, 1, 2, 3, 4};  // every token occurs earlier: prompt lookup always proposes
     const int n = 4000;
+    int64_t rejected = 0;  // over all settings: the test weights differ between standard libraries
     for (int setting = 0; setting < 2; ++setting) {
         GenerateOptions o;
-        o.max_new_tokens = 2;
+        o.max_new_tokens = 3;  // the first from the prompt's pass, the next two from a speculative step
         o.stop_at_eos = false;
-        o.temperature = setting ? 1.0 : 3.0;
+        o.temperature = setting ? 5.0 : 3.0;
         o.top_k = setting ? 4 : 0;
         o.top_p = setting ? 0.9 : 1.0;
-        std::vector<double> want(25, 0), p1, p2;
+        std::vector<double> want(125, 0), p1, p2, p3;
         Sampler exact(o);
         const Tensor l1 = m.forward(prompt);
         exact.distribution(l1.ptr() + (l1.shape[0] - 1) * 5, 5, p1);
@@ -3480,25 +3530,30 @@ static void test_speculative_sampling() {
             t.push_back(a);
             const Tensor l2 = m.forward(t);
             exact.distribution(l2.ptr() + (l2.shape[0] - 1) * 5, 5, p2);
-            for (int64_t b = 0; b < 5; ++b) want[a * 5 + b] = p1[a] * p2[b];
+            for (int64_t b = 0; b < 5; ++b) {
+                Tokens u = t;
+                u.push_back(b);
+                const Tensor l3 = m.forward(u);
+                exact.distribution(l3.ptr() + (l3.shape[0] - 1) * 5, 5, p3);
+                for (int64_t e = 0; e < 5; ++e) want[static_cast<size_t>((a * 5 + b) * 5 + e)] = p1[a] * p2[b] * p3[e];
+            }
         }
         for (const Model* d : {static_cast<const Model*>(nullptr), &draft}) {
             o.speculative.draft = d;
             o.speculative.draft_tokens = 2;
             SpeculativeStats st;
             o.speculative.stats = &st;
-            std::vector<double> got(25, 0);
-            int64_t rejected = 0;
+            std::vector<double> got(125, 0);
             for (int i = 0; i < n; ++i) {
                 o.seed = static_cast<uint64_t>(i);
                 const Tokens t = generate(m, prompt, o);
-                got[t[0] * 5 + t[1]] += 1.0 / n;
+                got[static_cast<size_t>((t[0] * 5 + t[1]) * 5 + t[2])] += 1.0 / n;
                 rejected += st.drafted - st.accepted;
             }
-            CHECK(rejected > n / 10);  // the rejection branch ran
-            for (size_t j = 0; j < 25; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
+            for (size_t j = 0; j < 125; ++j) CHECK_NEAR(got[j], want[j], 5 * std::sqrt(want[j] * (1 - want[j]) / n) + 1e-3);
         }
     }
+    CHECK(rejected > n / 10);  // the rejection branch ran
 }
 
 // A draft with a smaller vocabulary: once the text holds a token it has no row for, the model continues
@@ -3533,6 +3588,363 @@ static void test_speculative_small_draft() {
         CHECK(speculate(seq(6, seed, 20)).size() == 8);
         CHECK(speculate(outside).size() == 8);
     }
+}
+
+// One hook setup for the runtime tests: `calls` receives each call's hook point and shape, `state` whatever the
+// hooks remember, so a run's whole visible behavior can be compared with decoding without speculation.
+struct RuntimeHookRun {
+    std::vector<std::pair<std::string, Shape>> calls;
+    std::vector<float> state;
+    Hooks hooks;
+};
+using RuntimeHookSetup = std::function<void(RuntimeHookRun&)>;
+
+static std::vector<std::pair<std::string, RuntimeHookSetup>> runtime_hook_setups(const Model& m) {
+    const std::string first = "blocks.0.", last = "blocks." + std::to_string(m.cfg().n_layers - 1) + ".";
+    const std::string A = first + "hook_resid_post", B = last + "hook_resid_post", Z = first + "attn.hook_z", K = first + "attn.hook_k",
+                      P = first + "attn.hook_pattern";
+    using Edit = std::function<void(Tensor&, std::vector<float>&)>;
+    auto on = [](const std::string& point, Edit edit) -> RuntimeHookSetup {
+        return [point, edit](RuntimeHookRun& r) {
+            r.hooks.add(point, [&r, edit](const std::string& n, Tensor& a) {
+                r.calls.push_back({n, a.shape});
+                edit(a, r.state);
+            });
+        };
+    };
+    auto row = [](const Tensor& a) { return a.numel() / a.shape[0]; };
+    auto negate = [](Tensor& a, int64_t from, int64_t to) { for (int64_t i = from; i < to; ++i) a.ptr()[i] = -a.ptr()[i]; };
+    auto count = [](std::vector<float>& s) { if (s.empty()) s.push_back(0); return ++s[0]; };
+    std::vector<std::pair<std::string, RuntimeHookSetup>> v;
+    v.push_back({"a[-1]", on(A, [=](Tensor& a, std::vector<float>&) { negate(a, a.numel() - row(a), a.numel()); })});
+    v.push_back({"a[0]", on(A, [=](Tensor& a, std::vector<float>&) { negate(a, 0, row(a)); })});
+    v.push_back({"a - a.mean()", on(A, [=](Tensor& a, std::vector<float>&) {
+        const int64_t w = row(a), n = a.shape[0];
+        std::vector<float> mean(static_cast<size_t>(w), 0.f);
+        for (int64_t r = 0; r < n; ++r) for (int64_t j = 0; j < w; ++j) mean[static_cast<size_t>(j)] += a.ptr()[r * w + j] / static_cast<float>(n);
+        for (int64_t r = 0; r < n; ++r) for (int64_t j = 0; j < w; ++j) a.ptr()[r * w + j] = 0.5f * a.ptr()[r * w + j] - 0.5f * mean[static_cast<size_t>(j)];
+    })});
+    v.push_back({"len(a) == 1", on(A, [=](Tensor& a, std::vector<float>&) { if (a.shape[0] == 1) negate(a, 0, a.numel()); })});
+    v.push_back({"counter", on(A, [=](Tensor& a, std::vector<float>& s) { if (static_cast<int64_t>(count(s)) % 3 == 0) negate(a, 0, a.numel()); })});
+    v.push_back({"log", on(A, [](Tensor& a, std::vector<float>& s) { s.insert(s.end(), a.ptr(), a.ptr() + a.numel()); })});
+    v.push_back({"random noise", [A](RuntimeHookRun& r) {
+        auto rng = std::make_shared<std::mt19937>(5);
+        r.hooks.add(A, [&r, rng](const std::string& n, Tensor& a) {
+            r.calls.push_back({n, a.shape});
+            for (float& x : a.data) x += 0.2f * (static_cast<float>((*rng)() >> 8) * 0x1p-24f - 0.5f);
+            r.state.assign(1, static_cast<float>((*rng)() >> 8));
+        });
+    }});
+    v.push_back({"value from the last call", on(A, [=](Tensor& a, std::vector<float>& s) {
+        const int64_t w = row(a);
+        const std::vector<float> keep(a.ptr() + a.numel() - w, a.ptr() + a.numel());
+        if (!s.empty()) for (int64_t i = 0; i < a.numel(); ++i) a.ptr()[i] += 0.7f * std::tanh(s[static_cast<size_t>(i % w)]);
+        s = keep;
+    })});
+    v.push_back({"earlier token's later layer", [A](RuntimeHookRun& r) {
+        r.hooks.add(A, [&r](const std::string& n, Tensor& a) {
+            r.calls.push_back({n, a.shape});
+            const int64_t w = a.numel() / a.shape[0];
+            if (!r.state.empty()) for (int64_t i = 0; i < a.numel(); ++i) a.ptr()[i] += 0.7f * std::tanh(r.state[static_cast<size_t>(i % w)]);
+        });
+        r.hooks.add("hook_final", [&r](const std::string& n, Tensor& a) {
+            r.calls.push_back({n, a.shape});
+            const int64_t w = a.numel() / a.shape[0];
+            r.state.assign(a.ptr() + a.numel() - w, a.ptr() + a.numel());
+        });
+    }});
+    v.push_back({"first call only", on(A, [=](Tensor& a, std::vector<float>& s) { if (count(s) == 1) negate(a, a.numel() - row(a), a.numel()); })});
+    v.push_back({"alternating edits", on(A, [=](Tensor& a, std::vector<float>& s) { if (static_cast<int64_t>(count(s)) % 2 == 0) negate(a, 0, a.numel()); })});
+    v.push_back({"same edit on hook_z", on(Z, [](Tensor& z, std::vector<float>&) {
+        const int64_t H = z.shape[1], D = z.shape[2];
+        for (int64_t r = 0; r < z.shape[0]; ++r) std::fill(z.ptr() + r * H * D, z.ptr() + (r * H + 1) * D, 0.f);
+    })});
+    v.push_back({"hook_k, what later tokens read", on(K, [](Tensor& k, std::vector<float>&) { for (float& x : k.data) x *= 0.5f; })});
+    v.push_back({"hook_pattern", on(P, [](Tensor& p, std::vector<float>& s) {
+        s.assign(1, static_cast<float>(p.shape[2]));
+        const int64_t H = p.shape[0], T = p.shape[1], K2 = p.shape[2];
+        for (int64_t r = 0; r < H * T; ++r) { float* row2 = p.ptr() + r * K2; std::reverse(row2, row2 + K2); }
+    })});
+    v.push_back({"capture", [B](RuntimeHookRun& r) {
+        r.hooks.add_capture([B](const std::string& n) { return n == B; }, [&r](const std::string& n, Tensor& a) {
+            r.calls.push_back({n, a.shape});
+            r.state.push_back(a.ptr()[0]);
+        });
+    }});
+    v.push_back({"edits, and a capture of the last block", [=](RuntimeHookRun& r) {  // what it sees depends on the edits
+        on(A, [=](Tensor& a, std::vector<float>& s) { if (static_cast<int64_t>(count(s)) % 3 == 0) negate(a, 0, a.numel()); })(r);
+        r.hooks.add_capture([B](const std::string& n) { return n == B; }, [&r](const std::string& n, Tensor& a) {
+            r.calls.push_back({n, a.shape});
+            r.state.insert(r.state.end(), a.ptr() + a.numel() - a.shape.back(), a.ptr() + a.numel());
+        });
+    }});
+    v.push_back({"several hook points", [=](RuntimeHookRun& r) {
+        on(A, [=](Tensor& a, std::vector<float>& s) { if (static_cast<int64_t>(count(s)) % 4 == 0) negate(a, 0, a.numel()); })(r);
+        r.hooks.add(B, [&r](const std::string& n, Tensor& a) { r.calls.push_back({n, a.shape}); for (float& x : a.data) x *= 0.75f; });
+    }});
+    return v;
+}
+
+// A hook that changes what it does once predictions trust it: the guesses in that pass hold the wrong edit, and
+// the real hook's output must replace it. The model is its own draft, so proposals survive until the edit starts.
+static void test_runtime_mispredictions(const Model& m) {
+    Tokens prompt = seq(6, 81);
+    prompt.insert(prompt.end(), prompt.begin(), prompt.end());
+    GenerateOptions o;
+    o.max_new_tokens = 40;
+    if (m.cfg().positional == "learned") o.max_new_tokens = std::min<int64_t>(40, m.cfg().max_seq_len - static_cast<int64_t>(prompt.size()));
+    o.stop_at_eos = false;
+    const Tokens unhooked = generate(m, prompt, o);
+    const std::string point = "blocks.0.hook_resid_post";
+    int64_t reruns = 0;
+    bool changed = false;
+    for (int start : {9, 12, 15, 18, 23, 29})
+        for (int stop_at : {0, 1, 5}) {  // the edit lasts, or stops again after 1 or 5 calls
+            if (start >= o.max_new_tokens) continue;
+            int calls = 0;
+            std::vector<Shape> seen;
+            Hooks h;
+            h.add(point, [&](const std::string&, Tensor& a) {
+                seen.push_back(a.shape);
+                const int c = calls++;
+                if (c >= start && (!stop_at || c < start + stop_at))
+                    for (float& x : a.data) x = -x;
+            });
+            const Tokens want = generate(m, prompt, o, &h);
+            const std::vector<Shape> want_calls = seen;
+            changed = changed || want != unhooked;
+            for (int64_t k : {2, 4, 8}) {
+                GenerateOptions s = o;
+                s.speculative.draft_tokens = k;
+                s.speculative.draft = &m;
+                SpeculativeStats st;
+                s.speculative.stats = &st;
+                calls = 0;
+                seen.clear();
+                CHECK(generate(m, prompt, s, &h) == want);
+                CHECK(seen == want_calls);
+                reruns += st.reruns;
+            }
+        }
+    CHECK(changed);       // the edits matter
+    CHECK(reruns > 0);    // and were mispredicted
+}
+
+// DecodeRuntime: whatever the proposals, hooks get exactly the calls of decoding without speculation, keep the
+// same state, and the text is the same.
+static void test_runtime_hooks(const Model& m, const Model& other) {
+    Tokens prompt = seq(6, 81);
+    prompt.insert(prompt.end(), prompt.begin(), prompt.end());
+    GenerateOptions o;
+    o.max_new_tokens = 14;
+    o.stop_at_eos = false;
+    for (const auto& kv : runtime_hook_setups(m)) {
+        RuntimeHookRun base;
+        kv.second(base);
+        const Tokens want = generate(m, prompt, o, &base.hooks);
+        CHECK(base.calls.size() >= 14);
+        for (int64_t k : {1, 3, 8})
+            for (const Model* d : {static_cast<const Model*>(nullptr), &other, &m}) {
+                GenerateOptions s = o;
+                s.speculative.draft_tokens = k;
+                s.speculative.draft = d;
+                RuntimeHookRun run;
+                kv.second(run);
+                CHECK(generate(m, prompt, s, &run.hooks) == want);
+                CHECK(run.calls == base.calls);
+                CHECK(run.state.size() == base.state.size());
+                for (size_t i = 0; i < run.state.size() && i < base.state.size(); ++i)
+                    CHECK_NEAR(run.state[i], base.state[i], 2e-2 * std::max(1.f, std::fabs(base.state[i])));
+            }
+    }
+}
+
+static void test_runtime_interface() {
+    const Model m = random_model(tiny(), 42), other = random_model(tiny(), 43);
+    const Tokens prompt = {5, 9, 13, 2, 7, 5, 9, 13};
+    GenerateOptions o;
+    o.max_new_tokens = 10;
+    o.stop_at_eos = false;
+    // Lazy: the prompt's call, then each token's call only when the token after it is asked for.
+    for (int64_t k : {0, 4}) {
+        GenerateOptions s = o;
+        s.speculative.draft_tokens = k;
+        s.speculative.draft = k ? &m : nullptr;
+        int calls = 0;
+        Hooks h;
+        h.add("blocks.0.hook_resid_post", [&](const std::string&, Tensor&) { ++calls; });
+        const Tokens want = generate(m, prompt, s, &h);
+        CHECK(calls == 10);  // the last token ends the text and is never run
+        calls = 0;
+        DecodeRuntime rt(m, prompt, s, &h);
+        CHECK(calls == 0);
+        Tokens got;
+        while (const auto t = rt.next()) {
+            got.push_back(*t);
+            CHECK(calls == static_cast<int>(got.size()));
+        }
+        CHECK(got == want && calls == 10);
+        CHECK(!rt.next().has_value());
+    }
+    // A stop token is delivered and never reaches the hooks; proposals don't go past it.
+    const Tokens plain = generate(m, prompt, o);
+    size_t at = 1;
+    while (at < plain.size() && std::find(plain.begin(), plain.begin() + static_cast<std::ptrdiff_t>(at), plain[at]) != plain.begin() + static_cast<std::ptrdiff_t>(at)) ++at;
+    if (at < plain.size()) {
+        GenerateOptions s = o;
+        s.stop_tokens = {plain[at]};
+        s.speculative.draft_tokens = 8;
+        s.speculative.draft = &m;
+        SpeculativeStats st;
+        s.speculative.stats = &st;
+        CHECK(generate(m, prompt, s) == Tokens(plain.begin(), plain.begin() + static_cast<std::ptrdiff_t>(at) + 1));
+        CHECK(st.drafted <= static_cast<int64_t>(at));
+    }
+    // A failing hook ends the decoding.
+    int n = 0;
+    Hooks bad;
+    bad.add("hook_final", [&](const std::string&, Tensor&) { if (++n == 3) throw std::runtime_error("hook failed"); });
+    GenerateOptions s = o;
+    s.speculative.draft_tokens = 4;
+    s.speculative.draft = &m;
+    DecodeRuntime rt(m, prompt, s, &bad);
+    bool threw = false;
+    try {
+        while (rt.next()) {}
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw && !rt.next().has_value());
+    CHECK_THROWS(DecodeRuntime(m, Tokens{}, o));
+    // Prompt lookup continues a repeating text past its end: after x y x y ... x it proposes y x y x ..., as many
+    // as asked for, not only the token or two after the last occurrence.
+    bool repeats = false;
+    for (int64_t x = 0; x < 50 && !repeats; ++x)
+        for (int64_t y = 0; y < 50 && !repeats; ++y) {
+            Tokens xy;
+            for (int i = 0; i < 4; ++i) xy.insert(xy.end(), {x, y});
+            GenerateOptions g = o;
+            g.max_new_tokens = 1;
+            if (x == y || generate(m, xy, g) != Tokens{x}) continue;
+            repeats = true;
+            GenerateOptions s = o;
+            s.max_new_tokens = 12;
+            s.speculative.draft_tokens = 8;
+            SpeculativeStats st;
+            s.speculative.stats = &st;
+            DecodeRuntime rt(m, xy, s);
+            rt.next();
+            rt.next();
+            CHECK(st.drafted == 8);
+        }
+    CHECK(repeats);
+    // Four blocks: an edit at the end of block 0 that is mispredicted means computing the token again from block
+    // 1 (most of the model), so it is only speculated on once predictions have earned trust; at the end of block 2,
+    // from block 3, so it always is.
+    const Model m4 = random_model(tiny([](ModelConfig& c) { c.n_layers = 4; }), 42);
+    const std::string low = "blocks.0.hook_resid_post", high = "blocks.2.hook_resid_post";
+    // After a token is computed again from block 3, the guesses after it that its old values reached there are
+    // computed again from there too, and their hooks from there on run only then: a capture of block 3 sees
+    // what it sees without speculation (to rounding: float32 on the CPU), though the edit (now and then, small
+    // enough for the draft's guesses to stay right) is predicted right on those tokens.
+    {
+        GenerateOptions p = o;
+        p.max_new_tokens = 60;
+        int c = 0;
+        std::vector<float> seen;
+        Hooks h;
+        h.add(high, [&](const std::string&, Tensor& a) {
+            const int k = c++;
+            if (k == 9 || k == 20 || k == 26 || k == 37 || k == 45) for (int64_t r = 0; r < a.shape[0]; ++r) a.ptr()[r * a.shape[1]] += 0.05f;
+        });
+        h.add_capture([](const std::string& n) { return n == "blocks.3.hook_resid_post"; },
+                      [&](const std::string&, Tensor& a) { seen.insert(seen.end(), a.ptr() + a.numel() - a.shape[1], a.ptr() + a.numel()); });
+        const Tokens text = generate(m4, prompt, p, &h);
+        const std::vector<float> want = seen;
+        c = 0;
+        seen.clear();
+        p.speculative.draft_tokens = 6;
+        p.speculative.draft = &m4;
+        SpeculativeStats st;
+        p.speculative.stats = &st;
+        CHECK(generate(m4, prompt, p, &h) == text);
+        CHECK(seen.size() == want.size());
+        float worst = 0;
+        for (size_t i = 0; i < seen.size() && i < want.size(); ++i) worst = std::max(worst, std::fabs(seen[i] - want[i]));
+        CHECK(worst < 1e-4f);
+        CHECK(st.reruns > 0 && st.reruns < st.accepted && st.steps < 30);
+    }
+    // Hooks whose edits repeat keep speculating, including when they alternate: nearly nothing is recomputed.
+    for (int period : {1, 2, 3, 12}) {
+        GenerateOptions p = o;
+        p.max_new_tokens = 96;
+        int c = 0;
+        Hooks small;  // edits small enough that the draft's proposals nearly always stay right
+        small.add(low, [&](const std::string&, Tensor& a) {
+            if (c++ % period == 0) for (float& x : a.data) x *= 1.0001f;
+        });
+        const Tokens text = generate(m4, prompt, p, &small);
+        c = 0;
+        p.speculative.draft_tokens = 4;
+        p.speculative.draft = &m4;
+        SpeculativeStats st;
+        p.speculative.stats = &st;
+        CHECK(generate(m4, prompt, p, &small) == text);
+        CHECK(st.steps < 50 && st.reruns <= (period == 12 ? 4 : 2));
+    }
+    // Proposals that keep failing stop being made, and the draft stops running with them. The draft is the model
+    // with its unembedding negated: it always proposes the token the model likes least.
+    const ModelConfig untied = tiny([](ModelConfig& c) { c.tie_embeddings = false; });
+    const Model base = random_model(untied, 42);
+    std::map<std::string, Tensor> flipped;
+    for (const auto& kv : base.weights()) flipped[kv.first] = kv.second.to_tensor();
+    for (float& x : flipped.at("unembed.weight").data) x = -x;
+    const Model contrary(untied, flipped);
+    GenerateOptions u = o;
+    u.max_new_tokens = 60;
+    const Tokens alone = generate(base, prompt, u);
+    u.speculative.draft_tokens = 8;
+    u.speculative.draft = &contrary;
+    SpeculativeStats st;
+    u.speculative.stats = &st;
+    CHECK(generate(base, prompt, u) == alone);
+    CHECK(st.accepted == 0 && st.drafted > 0 && st.drafted <= 30);
+    // A hook whose edits can't be predicted: low in the model it isn't speculated on, so nothing is computed
+    // twice; high, every confirmed guess is computed again from block 3, and passes still choose several tokens.
+    std::mt19937 noise(1);
+    for (const std::string& point : {low, high}) {
+        Hooks random_edit;
+        random_edit.add(point, [&](const std::string&, Tensor& a) {
+            for (float& x : a.data) x += 0.05f * (static_cast<float>(noise() >> 8) * 0x1p-24f - 0.5f);
+        });
+        GenerateOptions r = o;
+        r.max_new_tokens = 40;
+        noise.seed(1);
+        const Tokens noisy = generate(m4, prompt, r, &random_edit);
+        noise.seed(1);
+        r.speculative.draft_tokens = 8;
+        r.speculative.draft = &m4;
+        r.speculative.stats = &st;
+        CHECK(generate(m4, prompt, r, &random_edit) == noisy);
+        if (point == low) CHECK(st.drafted == 0 && st.reruns == 0);
+        else CHECK(st.accepted > 20 && st.reruns == st.accepted && st.steps < 20);
+    }
+    // Edits from a small set in random order: each id is known but the next can't be predicted, so the predictions
+    // lose trust instead of being recomputed over and over.
+    std::mt19937 coin(2);
+    Hooks random_choice;
+    random_choice.add(low, [&](const std::string&, Tensor& a) {
+        if (coin() & 256) for (float& x : a.data) x *= 1.0001f;
+    });
+    GenerateOptions c = o;
+    c.max_new_tokens = 80;
+    const Tokens chosen = generate(m4, prompt, c, &random_choice);
+    coin.seed(2);
+    c.speculative.draft_tokens = 8;
+    c.speculative.draft = &m4;
+    c.speculative.stats = &st;
+    CHECK(generate(m4, prompt, c, &random_choice) == chosen);
+    CHECK(st.reruns <= 8);
 }
 
 // A temperature whose reciprocal overflows a float: the largest logit alone, the lowest id among equal ones.
@@ -3773,10 +4185,13 @@ static void test_gpu_forward_cached(const Model& m) {
     test_generate_trace(m);
     test_generate_batch(m);
     test_generate_speculative(m, random_model(m.cfg(), 43));  // steps of several rows, rolled back on the GPU
+    test_runtime_hooks(m, random_model(m.cfg(), 43));
+    test_runtime_mispredictions(m);
     set_device(Device::Both);
     detail::set_gpu_min_rows(2);
     test_forward_cached(m);
     test_forward_cached_batch(m);
+    test_runtime_mispredictions(m);  // passes of several tokens on the GPU, single tokens computed again on the CPU
     detail::set_gpu_min_rows(0);
 }
 #endif
@@ -4098,12 +4513,17 @@ int main(int argc, char** argv) {
         run("analysis", "speculative decoding: greedy = plain greedy, hooks, trace, limits: " + kv.first, [&] {
             test_generate_speculative(m, random_model(kv.second, 43));
         });
+        run("analysis", "decode runtime: hooks see what they see without speculation: " + kv.first, [&] {
+            test_runtime_hooks(m, random_model(kv.second, 43));
+        });
+        run("analysis", "decode runtime: a wrong prediction is replaced by the real hook: " + kv.first, [&] { test_runtime_mispredictions(m); });
     }
     run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16", test_forward_cached_many_layers);
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
     run("core", "sampler: temperature too small for a float's 1 / T", test_tiny_temperature);
     run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);
     run("analysis", "speculative decoding: draft with a smaller vocabulary", test_speculative_small_draft);
+    run("analysis", "decode runtime: one token at a time, stops, failures, prediction, backoff", test_runtime_interface);
     run("fp16", "linear layers on 1-16 rows: direct from the weights, fp16 = rounded float32, rows independent", test_linear_few_rows);
     run("fp16", "fp16 conversion", test_half_conversion);
     run("fp16", "fp16 weights: reads, linear, matmul", test_fp16_weight);

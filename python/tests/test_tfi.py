@@ -452,13 +452,47 @@ def test_generate_speculative(tfi, tmp_path):
     assert [s["prob"] for s in steps] == pytest.approx([s["prob"] for s in steps0], rel=1e-4)
     for s, s0 in zip(steps, steps0):
         np.testing.assert_allclose(s["lens"]["prob"], s0["lens"]["prob"], rtol=1e-4, atol=1e-6)
-    # Sampling: the first token's frequencies over seeds follow the model's distribution.
-    p = torch.softmax(torch.tensor(m.forward(TOKENS)[-1], dtype=torch.float64) / 2.0, 0).numpy()
+    # Hooks that keep state or pick a row: the same text, calls and state as without speculation.
+    def counting():
+        seen = []
+
+        def edit(a, name):
+            seen.append(a.shape)
+            if len(seen) % 3 == 0:
+                a[-1] *= -1
+        return {"blocks.0.hook_attn_out": edit}, seen
+
+    def carrying():
+        kept = []
+
+        def use(a, name):
+            kept.append(a.shape)
+            if len(kept) > 1:
+                a += 0.5 * np.tanh(saved[0])
+
+        saved = [None]
+
+        def save(a, name):
+            saved[0] = a[-1].copy()
+        return {"blocks.0.hook_attn_out": use, "blocks.1.hook_resid_post": save}, kept
+    for make in (counting, carrying):
+        hooks, seen = make()
+        want = tfi.generate(m, TOKENS, max_new_tokens=10, hooks=hooks)
+        calls = list(seen)
+        for d in (None, draft, m):
+            hooks, seen = make()
+            stats = {}
+            assert tfi.generate(m, TOKENS, max_new_tokens=10, hooks=hooks, speculate=4, draft=d, stats=stats) == want
+            assert seen == calls and calls[0][0] == len(TOKENS) and "reruns" in stats
+    # Sampling: the second token, the first one a step can propose, follows the model's distribution.
+    softmax = lambda logits: torch.softmax(torch.tensor(logits, dtype=torch.float64) / 2.0, 0).numpy()
+    first = softmax(m.forward(TOKENS)[-1])
+    p = sum(first[a] * softmax(m.forward(TOKENS + [a])[-1]) for a in range(V))
     n = 3000
     for d in (None, draft):
         counts = np.zeros(V)
         for seed in range(n):
-            counts[tfi.generate(m, TOKENS, max_new_tokens=2, temperature=2.0, seed=seed, speculate=2, draft=d)[0]] += 1
+            counts[tfi.generate(m, TOKENS, max_new_tokens=3, temperature=2.0, seed=seed, speculate=2, draft=d)[1]] += 1
         assert np.all(np.abs(counts / n - p) <= 5 * np.sqrt(p * (1 - p) / n) + 1e-3)
     with pytest.raises(ValueError, match="draft needs speculate"):
         tfi.generate(m, TOKENS, draft=draft)

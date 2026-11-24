@@ -39,9 +39,11 @@ checks them all in one pass, which costs about as much as one token since its we
 It keeps the tokens it agrees with, plus one of its own. The proposals come from `--draft FILE`, a
 smaller model with the same tokenizer (Llama 3.2 1B for Llama 3.1 8B, Qwen2.5 0.5B for the larger
 Qwen2.5 models). Without a draft they come from earlier in the text: the tokens that followed the last
-occurrence of the last `--ngram` tokens (3 by default). That costs nothing and pays off where the
-output repeats the input: editing, summarizing, quoting, code. Steps propose fewer tokens after a
-rejection, so on text that doesn't repeat it costs almost nothing. A draft with a smaller vocabulary
+occurrence of the last `--ngram` tokens (3 by default), continuing the repeat past the end of the text
+when that occurrence is close (after `x y x y` it proposes `x y x y ...`). That costs nothing and pays
+off where the output repeats the input or itself: editing, summarizing, quoting, code, loops. Steps propose fewer tokens after a
+rejection. If proposals keep failing it stops proposing, and stops running the draft, for a few
+tokens, then longer each time, so text it can't predict costs little. A draft with a smaller vocabulary
 stops proposing once the text holds a token it has no id for, and the model continues alone.
 
 The proposals only change the speed. Greedy output is the same as without speculation, up to
@@ -55,29 +57,41 @@ build/indra generate llama8b.safetensors --text "Once upon a time" --speculate 4
 
 ### Hooks and speculation
 
-Hooks also run on proposals that are then rejected; those rows are dropped from the cache and the
-trace. Because attention is causal, the kept rows are what they would be without speculation for
-hooks that treat each row alike, such as editing a head or scaling every row. A hook that picks a row
-by index (`a[-1]` is then the last proposal, not the current token), reads other rows or carries state
-from one pass to the next (a count, a value from an earlier step) can change the output, so run those
-without `speculate`. Saving all of an activation's rows at one layer to use at a later layer of the
-same pass is fine.
-
-For example, say the text ends in `C` and the proposals are `D E F`:
-
-```python
-def edit_last(a, name):
-    a[-1] *= -1
-
-hooks = {"hook_final": edit_last}
-tfi.generate(m, t, hooks=hooks)               # a[-1] is each new token in turn
-tfi.generate(m, t, hooks=hooks, speculate=4)  # a[-1] is the last proposal: the text can differ
-```
+Hooks don't need to know about speculation. With or without `speculate`, they see the same calls in
+the same order:
 
 ```
-without speculate:  [C]  [D]  [E]  [F]    each pass edits its own token
-with speculate:     [C, D, E, F]          one pass: only F's row is edited
+the prompt's hooks → token 1 → token 1's hooks → token 2 → token 2's hooks → ...
 ```
 
-Row `C` decides whether `D` is kept, row `D` whether `E` is, and row `E` whether `F` is, so all three
-checks use rows the hook never edited.
+The prompt arrives in one call. After that, each call holds one token's row, and a hook never runs on
+a proposal that gets rejected. So a hook can use `a[-1]`, keep a count or a log, draw random numbers, or
+use a value saved from an earlier token, exactly as it would without `speculate`.
+
+While a pass computes proposals, their rows get a *prediction* of what the hook will do, learned from
+its earlier calls: leaving the row alone, overwriting values, scaling or adding an offset, including
+repeating patterns such as one edit on every second token. Once a proposal is confirmed, the real hook
+runs on its recorded activation. If it does what was predicted, the batched row stands. If not, that
+token is computed again from the hook's block with the real output: the blocks below it were right.
+The proposals after it stay, since their lower blocks are right too, and each one that is confirmed is
+computed again from that block.
+
+So a hook only affects the speed:
+
+| Hook | With `speculate` |
+|---|---|
+| The same edit each token, or a repeating pattern of edits | Keeps most of the speedup |
+| Read-only hooks and captures | Keeps the speedup |
+| Edits that can't be predicted (random noise, a value from another token or layer), in the upper half of the blocks | Keeps part of the speedup: each token is computed again from the hook's block |
+| Edits that can't be predicted, in the lower half | About the speed of ordinary decoding: proposals wait until predictions have been right |
+
+Predictions are compared up to rounding (a relative difference of about 1e-6), since redoing an edit such
+as adding a vector can differ in the last bits.
+
+From C++, `DecodeRuntime` gives the same decoding one token at a time, and a token's hooks run when the
+next one is asked for:
+
+```cpp
+DecodeRuntime runtime(m, prompt, options, &hooks);
+while (std::optional<int64_t> token = runtime.next()) { /* ... */ }
+```

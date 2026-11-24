@@ -1321,10 +1321,9 @@ void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v,
     cpu_len_ = len_;
 }
 
-Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks, bool last_only) const {
-    const int64_t L = cfg_.n_layers, T = static_cast<int64_t>(tokens.size()), start = cache.len_;
-    if (T == 0) throw std::invalid_argument("forward_cached needs at least one token");
-    if (start) {  // the cache must be this model's: a tensor per layer, each with the layer's heads
+void Model::check_cache(const KVCache& cache) const {
+    const int64_t L = cfg_.n_layers;
+    if (cache.len_) {  // the cache must be this model's: a tensor per layer, each with the layer's heads
         bool ok = static_cast<int64_t>(cache.k_.size()) == L;
         for (int64_t l = 0; ok && l < L; ++l)
             ok = cache.k_[l].dim() == 3 && cache.k_[l].shape[0] == layer_cfgs_[l].kv_heads() &&
@@ -1333,14 +1332,16 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     }
     // fp16 values for a model with fp16 weights; a cache keeps the precision of its first step.
     const bool half = format_ == WeightFormat::fp16;
-    if ((start || !cache.k_.empty()) && cache.half_ != half)
+    if ((cache.len_ || !cache.k_.empty()) && cache.half_ != half)
         throw std::invalid_argument(std::string("forward_cached: the cache holds ") + (cache.half_ ? "fp16" : "float32") +
                                     " keys and values; this model's are " + (half ? "fp16" : "float32"));
-    cache.half_ = half;
-    detail::RowBatch rb;
-    rb.add(start, T);
-    rb.cached = true;
+}
+
+void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to, const Hooks* hooks) const {
+    (void)cache, (void)rb, (void)T, (void)need, (void)upload_to, (void)hooks;
 #ifdef TFI_USE_ACCELERATE
+    const int64_t L = cfg_.n_layers;
+    const bool half = format_ == WeightFormat::fp16;
     // The GPU, with the cache kept there (detail::GpuKV), for: the prompt when a single pass of it would
     // go to the GPU (its keys and values then go straight into the GPU's copy); later chunks of tokens big
     // enough; single tokens of models large enough that reading their weights takes the CPU longer than
@@ -1351,7 +1352,7 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     for (int64_t l = 0; l < L && hooks; ++l) pattern_hook = pattern_hook || hooks->matches(layer_prefix(l) + "attn.hook_pattern");
     detail::Gpu* g = nullptr;
     if (use_gpu() && !pattern_hook && gpu_attention_fits(layer_cfgs_, 0)) {
-        if (start == 0) {
+        if (cache.len_ == 0) {
             g = single_pass_gpu(*this, 0, T);
         } else {
             double block_weights = 0;
@@ -1360,40 +1361,51 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
             if (detail::gpu_only() || T >= detail::gpu_min_rows() || block_weights >= kDecodeWeights) g = gpu();
         }
     }
-    if (g) {
-        if (!cache.gpu_ || cache.gpu_->gpu.get() != g || cache.gpu_->regions != 1) {  // first use, or another model's GPU
-            cache.sync_cpu();  // the old GPU copy goes: the CPU must hold everything first
-            auto kv = std::make_shared<detail::GpuKV>();
-            kv->gpu = gpu_.gpu;
-            kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
-            kv->half = half;
-            cache.gpu_ = std::move(kv);
-            cache.region_ = 0;
-            cache.gpu_len_ = 0;
-        }
-        detail::GpuKV& kv = *cache.gpu_;
-        if (start + T > kv.cap) {  // grow, which loses the buffers' contents: the CPU must hold everything first
-            cache.sync_cpu();
-            kv.cap = std::max({start + T + std::max<int64_t>(256, (start + T) / 2), 2 * kv.cap});
-            for (int64_t l = 0; l < L; ++l) {
-                const int64_t n = kv_floats(half, layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim());
-                kv.seq->reserve(detail::GpuKV::keys(l), n);
-                kv.seq->reserve(detail::GpuKV::values(l), n);
-            }
-            cache.gpu_len_ = 0;
-        }
-        // Positions only the CPU holds (CPU steps, a copy, the buffers growing): up to the GPU. The CPU
-        // holds them all whenever the GPU lacks any (the invariant).
-        for (int64_t l = 0; l < L && cache.gpu_len_ < start; ++l) {
-            upload_rows(kv, detail::GpuKV::keys(l), cache.k_[l], kv.cap, 0, cache.gpu_len_, start);
-            upload_rows(kv, detail::GpuKV::values(l), cache.v_[l], kv.cap, 0, cache.gpu_len_, start);
-        }
-        cache.gpu_len_ = start;
-        rb.gpu = g;
-        rb.fp16 = gpu_fp16();
-        rb.kv = &kv;
+    if (!g) return;
+    if (!cache.gpu_ || cache.gpu_->gpu.get() != g || cache.gpu_->regions != 1) {  // first use, or another model's GPU
+        cache.sync_cpu();  // the old GPU copy goes: the CPU must hold everything first
+        auto kv = std::make_shared<detail::GpuKV>();
+        kv->gpu = gpu_.gpu;
+        kv->seq = std::make_unique<detail::Gpu::Seq>(*g);
+        kv->half = half;
+        cache.gpu_ = std::move(kv);
+        cache.region_ = 0;
+        cache.gpu_len_ = 0;
     }
+    detail::GpuKV& kv = *cache.gpu_;
+    if (need > kv.cap) {  // grow, which loses the buffers' contents: the CPU must hold everything first
+        cache.sync_cpu();
+        kv.cap = std::max({need + std::max<int64_t>(256, need / 2), 2 * kv.cap});
+        for (int64_t l = 0; l < L; ++l) {
+            const int64_t n = kv_floats(half, layer_cfgs_[l].kv_heads() * kv.cap * layer_cfgs_[l].head_dim());
+            kv.seq->reserve(detail::GpuKV::keys(l), n);
+            kv.seq->reserve(detail::GpuKV::values(l), n);
+        }
+        cache.gpu_len_ = 0;
+    }
+    // Positions only the CPU holds (CPU steps, a copy, the buffers growing): up to the GPU. The CPU
+    // holds them all whenever the GPU lacks any (the invariant).
+    for (int64_t l = 0; l < L && cache.gpu_len_ < upload_to; ++l) {
+        upload_rows(kv, detail::GpuKV::keys(l), cache.k_[l], kv.cap, 0, cache.gpu_len_, upload_to);
+        upload_rows(kv, detail::GpuKV::values(l), cache.v_[l], kv.cap, 0, cache.gpu_len_, upload_to);
+    }
+    cache.gpu_len_ = std::max(cache.gpu_len_, upload_to);
+    rb.gpu = g;
+    rb.fp16 = gpu_fp16();
+    rb.kv = &kv;
 #endif
+}
+
+Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks, bool last_only) const {
+    const int64_t L = cfg_.n_layers, T = static_cast<int64_t>(tokens.size()), start = cache.len_;
+    if (T == 0) throw std::invalid_argument("forward_cached needs at least one token");
+    check_cache(cache);
+    const bool half = format_ == WeightFormat::fp16;
+    cache.half_ = half;
+    detail::RowBatch rb;
+    rb.add(start, T);
+    rb.cached = true;
+    use_gpu_cache(cache, rb, T, start + T, start, hooks);
     const bool on_gpu = rb.kv != nullptr;  // the new positions go to the GPU's copy only
     if (!on_gpu && start) {
         cache.sync_cpu();
@@ -1447,6 +1459,67 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
                 throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
         }
         cache.append(new_k, new_v, T);
+    }
+    cache.check();
+    return logits;
+}
+
+Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& cache, const Hooks* hooks) const {
+    const int64_t L = cfg_.n_layers, d = cfg_.d_model;
+    if (layer < 0 || layer >= L) throw std::invalid_argument("rerun_cached: layer " + std::to_string(layer) + " is not in 0.." + std::to_string(L - 1));
+    if (pos < 0 || pos >= cache.len_) throw std::invalid_argument("rerun_cached: position " + std::to_string(pos) + " is not in the cache");
+    if (resid.shape != Shape{1, d}) throw std::invalid_argument("rerun_cached: resid must be (1, d_model)");
+    check_cache(cache);
+    const bool half = format_ == WeightFormat::fp16;
+    detail::RowBatch rb;
+    rb.add(pos, 1);
+    rb.cached = true;
+    // Every position on the GPU (the blocks before `layer` read their own at pos there), or every one on the CPU.
+    use_gpu_cache(cache, rb, 1, cache.len_, cache.len_, hooks);
+    const bool on_gpu = rb.kv != nullptr;
+    if (!on_gpu) {
+        cache.sync_cpu();
+        for (int64_t l = 0; l < L; ++l) {
+            rb.prefix_k.push_back(&cache.k_[l]);
+            rb.prefix_v.push_back(&cache.v_[l]);
+        }
+    }
+    std::vector<Tensor> new_k(L), new_v(L);
+    auto slot = [&](const std::string& n) -> Tensor* {
+        const KVHook kv = kv_hook(n);
+        return kv.layer < layer || kv.layer >= L ? nullptr : kv.value ? &new_v[kv.layer] : &new_k[kv.layer];
+    };
+    Hooks h;
+    if (hooks) h.extend(*hooks);
+    if (half && !on_gpu) add_kv_rounding(h, L);
+    if (!on_gpu)
+        h.add_capture([&slot](const std::string& n) { return slot(n) != nullptr; },
+                      [&slot](const std::string& n, Tensor& act) { *slot(n) = act; });
+    Tensor logits;
+    if (on_gpu) {
+        run_rows(layer, std::move(resid), rb, &h, false, &logits, true);
+        if (cfg_.final_logit_softcap) {
+            const float cap = static_cast<float>(*cfg_.final_logit_softcap);
+            for (float& v : logits.data) v = cap * vm::tanh(v / cap);
+        }
+        cache.cpu_len_ = std::min(cache.cpu_len_, pos);  // the GPU's copy has the new values at pos
+    } else {
+        Tensor f = final_norm(run_rows(layer, std::move(resid), rb, &h));
+        hook(&h, "hook_final", f);
+        logits = logits_from_final(f);
+        for (int64_t l = layer; l < L; ++l) {
+            const Shape want{layer_cfgs_[l].kv_heads(), 1, layer_cfgs_[l].head_dim()};
+            if (new_k[l].shape != want || new_v[l].shape != want)
+                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
+        }
+        for (int64_t l = layer; l < L; ++l)
+            for (int pass = 0; pass < 2; ++pass) {
+                Tensor& dst = pass ? cache.v_[l] : cache.k_[l];
+                const Tensor& src = pass ? new_v[l] : new_k[l];
+                const int64_t H = src.shape[0], D = src.shape[2], c = dst.shape[1];
+                for (int64_t hh = 0; hh < H; ++hh) std::copy(src.ptr() + hh * D, src.ptr() + (hh + 1) * D, dst.ptr() + (hh * c + pos) * D);
+            }
+        cache.gpu_len_ = std::min(cache.gpu_len_, pos);  // the CPU's copy has the new values at pos
     }
     cache.check();
     return logits;

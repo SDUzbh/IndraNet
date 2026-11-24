@@ -57,6 +57,8 @@ std::vector<Tokens> both = generate_batch(m, {t, t}, opt, {nullptr, &hooks});  /
 opt.speculative.draft_tokens = 8;                            // speculative decoding: prompt lookup,
 opt.speculative.draft = &small;                              // or a draft model with the same tokenizer
 Tokens fast = generate(m, t, opt);
+DecodeRuntime runtime(m, t, opt, &hooks);                    // the same decoding, a token at a time
+while (std::optional<int64_t> token = runtime.next()) { /* ... */ }
 std::string text = m.decode(more);
 
 const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16

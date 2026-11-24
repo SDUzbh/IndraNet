@@ -187,6 +187,13 @@ class Model {
     // rules as forward_cached, the batch keeping every sequence's keys and values there.
     std::vector<Tensor> forward_cached(const std::vector<Tokens>& tokens, KVBatch& batch, const Hooks* hooks = nullptr,
                                        bool last_only = false) const;
+    // Internal, for speculative decoding: position `pos` (< cache.size()) computed again from block `layer`
+    // on, `resid` (1, d_model) being its input to that block (what blocks.<layer>.hook_resid_pre sees).
+    // Blocks before `layer` keep the keys and values the cache has at `pos`; later blocks get new ones
+    // there, so their later positions, if any, are left stale for the caller to compute again or
+    // truncate. Returns that position's logits, (1, vocab). Hooks see blocks layer.. and hook_final. On
+    // the GPU under forward_cached's rules for one token.
+    Tensor rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& cache, const Hooks* hooks = nullptr) const;
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
     // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping
@@ -320,6 +327,11 @@ class Model {
     Tensor embed_at(const Tokens& tokens, const std::vector<int64_t>& positions, const Hooks* hooks) const;
     // forward_from, with only the last row unembedded when last_only (hook_final still sees every row).
     Tensor run_from(int64_t layer, Tensor resid, const Hooks* hooks, bool last_only) const;
+    // macOS: whether a cached pass of T new rows goes to the GPU (forward_cached's rules); if so, sets up
+    // the cache's GPU copy with room for `need` positions, uploads what only the CPU holds below
+    // `upload_to`, and points rb at it.
+    void use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to, const Hooks* hooks) const;
+    void check_cache(const KVCache& cache) const;  // the cache, if not empty, is this model's
 };
 
 }  // namespace tfi
