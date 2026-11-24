@@ -282,12 +282,14 @@ NB_MODULE(_tfi, mod) {
     // --- model ---------------------------------------------------------------------------
     nb::class_<Model>(mod, "Model", "A model loaded from a safetensors file (indranet.export or indranet_hf).")
         .def_static(
-            "load", [](const std::string& path, bool fp16) {
+            "load", [](const std::string& path, bool fp16, bool bf16) {
+                if (fp16 && bf16) throw std::invalid_argument("give fp16 or bf16, not both");
                 nb::gil_scoped_release release;
-                return Model::load(path, fp16 ? WeightFormat::fp16 : WeightFormat::fp32);
+                return Model::load(path, fp16 ? WeightFormat::fp16 : bf16 ? WeightFormat::bf16 : WeightFormat::fp32);
             },
-            "path"_a, "fp16"_a = false,
-            "Load a model; fp16 keeps the matrices in half precision (half the memory).")
+            "path"_a, "fp16"_a = false, "bf16"_a = false,
+            "Load a model; fp16 or bf16 keeps the matrices in that type (half the memory). With bf16, a bf16 "
+            "file (the usual format of published checkpoints) loads as it is, nothing rounded.")
         .def_prop_ro("n_layers", [](const Model& m) { return m.cfg().n_layers; })
         .def_prop_ro("d_model", [](const Model& m) { return m.cfg().d_model; })
         .def_prop_ro("vocab_size", [](const Model& m) { return m.cfg().vocab_size; })
@@ -301,6 +303,7 @@ NB_MODULE(_tfi, mod) {
         .def_prop_ro("num_parameters", &Model::num_parameters)
         .def_prop_ro("weight_bytes", &Model::weight_bytes)
         .def_prop_ro("fp16", [](const Model& m) { return m.weight_format() == WeightFormat::fp16; })
+        .def_prop_ro("bf16", [](const Model& m) { return m.weight_format() == WeightFormat::bf16; })
         .def_prop_ro("vocab", &Model::vocab, "One string per token id, or empty.")
         .def_prop_ro("has_tokenizer", &Model::has_tokenizer)
         .def("token_str", &Model::token_str, "id"_a, "The token's text, or its id.")

@@ -24,7 +24,7 @@ included. macOS builds need macOS 15 or newer.
 #include "tfi/runtime.h"
 using namespace tfi;
 
-Model m = Model::load("model.safetensors");                 // or (..., WeightFormat::fp16): half the memory
+Model m = Model::load("model.safetensors");                 // or (..., WeightFormat::fp16 / bf16): half the memory
 Tokens t = {5, 17, 3, 5, 17};
 
 ActivationCache cache;                                       // every hook point, IndraNet names
@@ -62,11 +62,11 @@ DecodeRuntime runtime(m, t, opt, &hooks);                    // tfi/runtime.h: t
 while (std::optional<int64_t> token = runtime.next()) { /* ... */ }
 std::string text = m.decode(more);
 
-const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
+const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32, fp16 or bf16
 Tensor q_rows = Wq.rows(0, 16);                              // read as float32 either way (also cols, to_tensor)
 ```
 
-`Model::weight` returns a `Weight`. Matrices (float32 or fp16) are read with `rows()`, `cols()`,
+`Model::weight` returns a `Weight`. Matrices (float32, fp16 or bf16) are read with `rows()`, `cols()`,
 `to_tensor()` and the `linear()` / `matmul()` overloads, which give float32 either way; they sit in
 page-aligned memory that the GPU uses in place, so no weight is held twice. Norm scales and biases
 are float32 tensors, read with `f32()`.
@@ -83,7 +83,7 @@ path; elsewhere, set `PYTHONPATH=python`.
 ```python
 import tfi
 
-m = tfi.Model.load("model.safetensors", fp16=True)
+m = tfi.Model.load("model.safetensors", fp16=True)  # or bf16=True
 t = m.tokenize("When Mary and John went to the store, John gave a drink to")
 logits, cache = m.run_with_cache(t, names=["blocks.9.attn.hook_pattern"])   # numpy float32, (H, T, T)
 

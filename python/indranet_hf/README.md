@@ -57,8 +57,9 @@ the engine computes them exactly up to that length and refuses longer sequences.
   there). A tied output matrix is stored once. Only one tensor is in memory at a time.
 - **Layout:** the data and every matrix start on a 16 KiB boundary, with small `__padding<k>` U8
   tensors filling the gaps (safetensors allows no holes). The engine memory-maps the file and uses
-  a matrix in place when it's stored in the type it keeps: F16 under `indra --fp16`, F32 otherwise.
-  `--dtype float16` therefore gives the fastest, leanest `--fp16` loading; bf16 matrices are
+  a matrix in place when it's stored in the type it keeps: F16 under `indra --fp16`, BF16 under
+  `indra --bf16`, F32 otherwise. A bf16 checkpoint converted as it is therefore loads in place with
+  `--bf16`, and `--dtype float16` gives the fastest, leanest `--fp16` loading; other matrices are
   converted as they're read. Hugging Face's `safetensors` reads these files as they are, with the
   padding as extra tensors. Engines from before this layout don't know the padding and refuse the
   files.

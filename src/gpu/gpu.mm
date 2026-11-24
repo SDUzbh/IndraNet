@@ -176,6 +176,20 @@ kernel void copy_k(device const float* x [[buffer(0)]], device float* y [[buffer
     if (i < n) y[i] = x[i];
 }
 
+// A KV cache's values as kept: float, half (fp16) or ushort (bf16 bit patterns: read by a shift, written
+// rounded to nearest even, as the CPU's float_to_bf16).
+inline float kvf(float x) { return x; }
+inline float kvf(half x) { return float(x); }
+inline float kvf(ushort x) { return as_type<float>(uint(x) << 16); }
+inline ushort to_bf16(float f) {
+    const uint x = as_type<uint>(f);
+    return (x & 0x7FFFFFFFu) > 0x7F800000u ? ushort((x >> 16) | 0x40u) : ushort((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16);
+}
+template <typename PT> PT kv_to(float x);
+template <> float kv_to<float>(float x) { return x; }
+template <> half kv_to<half>(float x) { return half(x); }
+template <> ushort kv_to<ushort>(float x) { return to_bf16(x); }
+
 // rows of keys or values (rows, heads * D) into a cache (heads, cap, D) at positions start, start + 1, ...
 struct KvArgs { uint rows, heads, D, cap, start; };
 template <typename PT>
@@ -183,15 +197,20 @@ kernel void kv_append_kt(device const float* src [[buffer(0)]], device PT* dst [
                          uint i [[thread_position_in_grid]]) {
     if (i >= a.rows * a.heads * a.D) return;
     const uint d = i % a.D, t = i / a.D, g = t % a.heads, r = t / a.heads;
-    dst[(ulong(g) * a.cap + a.start + r) * a.D + d] = PT(src[i]);
+    dst[(ulong(g) * a.cap + a.start + r) * a.D + d] = kv_to<PT>(src[i]);
 }
 template [[host_name("kv_append_k")]] kernel decltype(kv_append_kt<float>) kv_append_kt<float>;
 template [[host_name("kv_append_k_h")]] kernel decltype(kv_append_kt<half>) kv_append_kt<half>;
+template [[host_name("kv_append_k_b")]] kernel decltype(kv_append_kt<ushort>) kv_append_kt<ushort>;
 
 // x = x rounded to fp16 (clamped to its finite range), in place: what a KV cache kept in fp16 will hold,
 // before attention reads it, so that every position's keys and values are the same rounded values.
 kernel void round_half_k(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i < n) x[i] = float(half(clamp(x[i], -65504.0f, 65504.0f)));
+}
+// ... and to bf16, for a KV cache kept in bf16 (clamped to its largest finite value, 0x7F7F).
+kernel void round_bf16_k(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) x[i] = kvf(to_bf16(clamp(x[i], -3.38953139e38f, 3.38953139e38f)));
 }
 
 struct BiasArgs { uint n, cols; };
@@ -262,8 +281,8 @@ kernel void rope_pass_k(device const float* x [[buffer(0)]], device float* y [[b
 // Causal attention, one threadgroup per (row, head): the row's allowed keys in tiles of 1024 with a
 // running softmax (max m, sum l), the weighted values accumulated per dimension (at most 4 per thread).
 struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
-// The attention kernels read earlier positions' keys and values (pk, pv) as PT: float, or half for a KV
-// cache kept in fp16 (the _h variants). Written once, instantiated for both.
+// The attention kernels read earlier positions' keys and values (pk, pv) as PT: float, half for a KV cache
+// kept in fp16 (the _h variants) or ushort for one kept in bf16 (_b). Written once, instantiated for each.
 #define ATTN_K_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* z [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* meta [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]
 template <typename PT>
 kernel void attn_kt(ATTN_K_PARAMS(PT)) {
@@ -287,7 +306,7 @@ kernel void attn_kt(ATTN_K_PARAMS(PT)) {
             float s = 0.f;
             if (j < start) {
                 device const PT* kr = pk + (ulong(g) * a.Tp + kb + j) * D;
-                for (uint d = 0; d < D; ++d) s += qs[d] * float(kr[d]);
+                for (uint d = 0; d < D; ++d) s += qs[d] * kvf(kr[d]);
             } else {
                 device const float* kr = k + (ulong(off + j - start) * a.Hkv + g) * D;
                 for (uint d = 0; d < D; ++d) s += qs[d] * kr[d];
@@ -313,7 +332,7 @@ kernel void attn_kt(ATTN_K_PARAMS(PT)) {
             float s = acc[t] * keep;
             for (uint jj = 0; jj < n; ++jj) {
                 const uint j = c0 + jj;
-                s += ss[jj] * (j < start ? float(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
+                s += ss[jj] * (j < start ? kvf(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
             }
             acc[t] = s;
         }
@@ -327,6 +346,7 @@ kernel void attn_kt(ATTN_K_PARAMS(PT)) {
 }
 template [[host_name("attn_k")]] kernel void attn_kt<float>(ATTN_K_PARAMS(float));
 template [[host_name("attn_k_h")]] kernel void attn_kt<half>(ATTN_K_PARAMS(half));
+template [[host_name("attn_k_b")]] kernel void attn_kt<ushort>(ATTN_K_PARAMS(ushort));
 
 // Split-key attention for few rows over many keys (a generated token's pass): the row's allowed keys
 // in chunks of kSplitKeys, one threadgroup per (row, head, chunk), each writing its chunk's max m, sum
@@ -363,7 +383,7 @@ kernel void attn_split_kt(ATTN_SPLIT_PARAMS(PT)) {
         float sc = 0.f;
         if (j < start) {
             device const PT* kr = pk + (ulong(g) * a.Tp + kb + j) * D;
-            for (uint d = 0; d < D; ++d) sc += qs[d] * float(kr[d]);
+            for (uint d = 0; d < D; ++d) sc += qs[d] * kvf(kr[d]);
         } else {
             device const float* kr = k + (ulong(off + j - start) * a.Hkv + g) * D;
             for (uint d = 0; d < D; ++d) sc += qs[d] * kr[d];
@@ -386,7 +406,7 @@ kernel void attn_split_kt(ATTN_SPLIT_PARAMS(PT)) {
         float acc = 0.f;
         for (uint jj = 0; jj < n; ++jj) {
             const uint j = c0 + jj;
-            acc += ss[jj] * (j < start ? float(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
+            acc += ss[jj] * (j < start ? kvf(pv[(ulong(g) * a.Tp + kb + j) * D + d]) : v[(ulong(off + j - start) * a.Hkv + g) * D + d]);
         }
         out[2 + d] = acc;
     }
@@ -397,6 +417,7 @@ kernel void attn_split_kt(ATTN_SPLIT_PARAMS(PT)) {
 }
 template [[host_name("attn_split_k")]] kernel void attn_split_kt<float>(ATTN_SPLIT_PARAMS(float));
 template [[host_name("attn_split_k_h")]] kernel void attn_split_kt<half>(ATTN_SPLIT_PARAMS(half));
+template [[host_name("attn_split_k_b")]] kernel void attn_split_kt<ushort>(ATTN_SPLIT_PARAMS(ushort));
 
 // attn_split_k's chunks of one (row, head) per threadgroup: rescaled to the largest max, summed, into z.
 kernel void attn_combine_k(device const float* part [[buffer(0)]], device float* z [[buffer(1)]], constant AttnArgs& a [[buffer(2)]],
@@ -641,8 +662,8 @@ kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
             float kv = 0.f, vv = 0.f;
             if (j <= last) {
                 const ulong src = j < start ? (ulong(g) * a.Tp + kb + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
-                kv = j < start ? float(pk[src]) : k[src];
-                vv = j < start ? float(pv[src]) : v[src];
+                kv = j < start ? kvf(pk[src]) : k[src];
+                vv = j < start ? kvf(pv[src]) : v[src];
             }
             Ks[e] = kv;
             Vs[e] = vv;
@@ -706,6 +727,7 @@ kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
 }
 template [[host_name("attn_mma_k")]] kernel void attn_mma_kt<float>(ATTN_MMA_PARAMS(float));
 template [[host_name("attn_mma_k_h")]] kernel void attn_mma_kt<half>(ATTN_MMA_PARAMS(half));
+template [[host_name("attn_mma_k_b")]] kernel void attn_mma_kt<ushort>(ATTN_MMA_PARAMS(ushort));
 
 // One threadgroup per block: the sum of squares of a bm x bn block of a matrix with row stride ld.
 struct BlockArgs { uint ld, bm, bn, nbc; };
@@ -834,12 +856,57 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
         for (uint j = tid; j < d; j += tg) dxi[j] = inv * dyi[j] * w[j] - xi[j] * inv * inv * inv * gxm;
     }
 }
+// Multiplies with a bf16 weight (its bit patterns, used in place; MPS takes no bf16): float32 inputs,
+// sums and outputs, each weight value widened exactly by a shift.
+// y (m, n) = x (m, k) W^T for few rows (m <= 16) of x, W (n, k): one simdgroup per output column (a row of
+// W), its lanes along k, read once for every row of x. With vec, k and the row strides are multiples of 8
+// and the matrices 16-byte aligned: 8 weights a load.
+struct LinArgs { uint m, n, k, lda, ldw, ldc, vec; };
+kernel void lin_bf16_k(device const float* x [[buffer(0)]], device const ushort* w [[buffer(1)]], device float* y [[buffer(2)]],
+                       constant LinArgs& a [[buffer(3)]], uint tgid [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    const uint j = tgid * nsg + sg;
+    if (j >= a.n) return;  // the whole simdgroup
+    device const ushort* wr = w + ulong(j) * a.ldw;
+    float acc[16];
+    for (uint r = 0; r < 16; ++r) acc[r] = 0.f;
+    if (a.vec != 0) {
+        device const ushort4* w4 = reinterpret_cast<device const ushort4*>(wr);
+        for (uint i = lane; i < a.k / 8; i += 32) {
+            const float4 lo = as_type<float4>(uint4(w4[2 * i]) << 16), hi = as_type<float4>(uint4(w4[2 * i + 1]) << 16);
+            for (uint r = 0; r < 16 && r < a.m; ++r) {
+                device const float4* xr = reinterpret_cast<device const float4*>(x + ulong(r) * a.lda);
+                acc[r] += dot(xr[2 * i], lo) + dot(xr[2 * i + 1], hi);
+            }
+        }
+    } else {
+        for (uint i = lane; i < a.k; i += 32) {
+            const float wv = kvf(wr[i]);
+            for (uint r = 0; r < 16 && r < a.m; ++r) acc[r] += x[ulong(r) * a.lda + i] * wv;
+        }
+    }
+    for (uint r = 0; r < 16 && r < a.m; ++r) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0) y[ulong(r) * a.ldc + j] = total;
+    }
+}
+
+// dst (rows, cols), contiguous, = src (rows, cols) with row stride ld, bf16 widened to float32.
+struct WidenArgs { uint rows, cols, ld; };
+kernel void widen_bf16_k(device const ushort* src [[buffer(0)]], device float* dst [[buffer(1)]], constant WidenArgs& a [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= a.rows * a.cols) return;
+    dst[i] = kvf(src[ulong(i / a.cols) * a.ld + i % a.cols]);
+}
 )";
 
 struct ActArgs { uint32_t n; int32_t kind; float k; };
 struct BiasArgs { uint32_t n, cols; };
 struct NormArgs { uint32_t d; float eps; uint32_t layernorm, has_b; };
 struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; float scale; };
+struct LinArgs { uint32_t m, n, k, lda, ldw, ldc, vec; };
+struct WidenArgs { uint32_t rows, cols, ld; };
 struct PassArgs { uint32_t D, rot, n; };
 struct KvArgs { uint32_t rows, heads, D, cap, start; };
 constexpr int64_t kSplitKeys = 256;  // as the kernel's
@@ -865,18 +932,20 @@ struct Gpu::Impl {
     std::unordered_map<const void*, id<MTLBuffer>> shared;
     std::vector<id<MTLBuffer>> pool;  // free scratch buffers
 
-    // Where a multiply reads a weight from, and whether those values are fp16.
+    // Where a multiply reads a weight from, and whether those values are fp16 or bf16.
     struct WBuf {
         id<MTLBuffer> buf = nil;
         bool half = false;
+        bool bf16 = false;  // multiplied by encode_bf16, with float32 inputs (in fp16 runs too)
     };
-    // A matrix is read in place, float32 or fp16. In an fp16 run, a float32 matrix gives an fp16
+    // A matrix is read in place, float32, fp16 or bf16. In an fp16 run, a float32 matrix gives an fp16
     // copy instead when every value fits.
     WBuf weight_for(const Weight& W, bool fp16) {
         if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
+        if (W.is_bf16()) return {shared_buffer(W), false, true};
         if (fp16 && !W.is_fp16())
-            if (id<MTLBuffer> b = copy_buffer(W.f32_data(), W.numel(), true)) return {b, true};
-        return {shared_buffer(W), W.is_fp16()};
+            if (id<MTLBuffer> b = copy_buffer(W.f32_data(), W.numel(), true)) return {b, true, false};
+        return {shared_buffer(W), W.is_fp16(), false};
     }
 
     id<MTLBuffer> shared_buffer(const Weight& W) {
@@ -940,6 +1009,8 @@ struct Gpu::Impl {
     id<MTLComputePipelineState> kv_append_k, attn_split_k, attn_combine_k;
     // ... with earlier positions' keys and values in fp16 (a KV cache kept in fp16), and the rounding to it
     id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, attn_mma_k_h, round_half_k;
+    // ... in bf16; and multiplies with bf16 weights
+    id<MTLComputePipelineState> kv_append_k_b, attn_k_b, attn_split_k_b, attn_mma_k_b, round_bf16_k, lin_bf16_k, widen_bf16_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
         block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
 
@@ -966,6 +1037,13 @@ struct Gpu::Impl {
                 kv_append_k = make("kv_append_k");
                 kv_append_k_h = make("kv_append_k_h");
                 round_half_k = make("round_half_k");
+                kv_append_k_b = make("kv_append_k_b");
+                round_bf16_k = make("round_bf16_k");
+                attn_k_b = make("attn_k_b");
+                attn_split_k_b = make("attn_split_k_b");
+                attn_mma_k_b = make("attn_mma_k_b");
+                lin_bf16_k = make("lin_bf16_k");
+                widen_bf16_k = make("widen_bf16_k");
                 bias_k = make("bias_k");
                 half_k = make("half_k");
                 norm_k = make("norm_k");
@@ -990,6 +1068,101 @@ struct Gpu::Impl {
                 attn_apply_k = make("attn_apply_k");
             }
         });
+    }
+
+    // The pipelines of a KV cache kept as `format`: appending, attention (per row, split keys, tiled).
+    id<MTLComputePipelineState> kv_append_for(WeightFormat f) { return f == WeightFormat::fp16 ? kv_append_k_h : f == WeightFormat::bf16 ? kv_append_k_b : kv_append_k; }
+    id<MTLComputePipelineState> attn_for(WeightFormat f) { return f == WeightFormat::fp16 ? attn_k_h : f == WeightFormat::bf16 ? attn_k_b : attn_k; }
+    id<MTLComputePipelineState> attn_split_for(WeightFormat f) { return f == WeightFormat::fp16 ? attn_split_k_h : f == WeightFormat::bf16 ? attn_split_k_b : attn_split_k; }
+    id<MTLComputePipelineState> attn_mma_for(WeightFormat f) { return f == WeightFormat::fp16 ? attn_mma_k_h : f == WeightFormat::bf16 ? attn_mma_k_b : attn_mma_k; }
+
+    static uint32_t u32(int64_t n) {
+        if (n < 0 || n > static_cast<int64_t>(UINT32_MAX)) throw std::length_error("GPU: operation too large");
+        return static_cast<uint32_t>(n);
+    }
+
+    // A matrix in a buffer: its first element and row stride, in elements.
+    struct MRef {
+        id<MTLBuffer> buf;
+        int64_t offset, ld;
+    };
+    // Room for a bf16 weight widened to float32, a block of its rows at a time (encode_bf16). Buffers it
+    // replaced go to `old`: command buffers may still read them. release() once they have all finished.
+    struct Scratch {
+        id<MTLBuffer> buf = nil;
+        std::vector<id<MTLBuffer>> old;
+    };
+    static constexpr int64_t kWidenFloats = int64_t(1) << 22;  // a block: 16 MB of float32
+    void release(Scratch& s, bool all) {
+        for (id<MTLBuffer> b : s.old) release(b);
+        s.old.clear();
+        if (all && s.buf) release(s.buf);
+        if (all) s.buf = nil;
+    }
+
+    // C (m, n) = A (m, k) B^T for B (n, k), or without trans_b A B for B (k, n), into cmd (no encoder open):
+    // B bf16 bit patterns (a model weight, in place), A and C float32, summed in float32. Up to 16 rows of A
+    // times B^T (a generated token's pass): lin_bf16_k reads B as it is. Otherwise B is widened to float32 a
+    // block of its rows at a time into `scratch`, and MPS multiplies the blocks (C's columns, or with
+    // trans_b off, its sum over B's rows).
+    void encode_bf16(id<MTLCommandBuffer> cmd, MRef A, MRef B, MRef C, int64_t m, int64_t n, int64_t k, bool trans_b, Scratch& scratch) {
+        load_kernels();
+        if (m == 0 || n == 0) return;
+        if (k == 0) throw std::logic_error("GPU: a bf16 multiply over an empty inner dimension");
+        if (trans_b && m <= 16) {
+            const bool vec = k % 8 == 0 && A.offset % 4 == 0 && A.ld % 4 == 0 && B.offset % 8 == 0 && B.ld % 8 == 0;
+            const LinArgs args{u32(m), u32(n), u32(k), u32(A.ld), u32(B.ld), u32(C.ld), vec ? 1u : 0u};
+            id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+            [e setComputePipelineState:lin_bf16_k];
+            [e setBuffer:A.buf offset:static_cast<NSUInteger>(A.offset) * sizeof(float) atIndex:0];
+            [e setBuffer:B.buf offset:static_cast<NSUInteger>(B.offset) * sizeof(uint16_t) atIndex:1];
+            [e setBuffer:C.buf offset:static_cast<NSUInteger>(C.offset) * sizeof(float) atIndex:2];
+            [e setBytes:&args length:sizeof args atIndex:3];
+            const NSUInteger tg = std::max<NSUInteger>(32, std::min<NSUInteger>(256, lin_bf16_k.maxTotalThreadsPerThreadgroup) / 32 * 32);
+            const NSUInteger cols = tg / 32;  // output columns per threadgroup
+            [e dispatchThreadgroups:MTLSizeMake((static_cast<NSUInteger>(n) + cols - 1) / cols, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            [e endEncoding];
+            return;
+        }
+        const int64_t rows = trans_b ? n : k, cols = trans_b ? k : n;  // B's
+        const int64_t nb = std::max<int64_t>(1, std::min(rows, kWidenFloats / cols));
+        const size_t bytes = static_cast<size_t>(nb * cols) * sizeof(float);
+        if (!scratch.buf || scratch.buf.length < bytes) {
+            if (scratch.buf) scratch.old.push_back(scratch.buf);
+            scratch.buf = acquire(bytes);
+        }
+        auto matrix = [](id<MTLBuffer> buf, int64_t offset, int64_t r, int64_t c, int64_t ld) {
+            MPSMatrixDescriptor* d = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(r)
+                                                                           columns:static_cast<NSUInteger>(c)
+                                                                          rowBytes:static_cast<NSUInteger>(ld) * sizeof(float)
+                                                                          dataType:MPSDataTypeFloat32];
+            return [[MPSMatrix alloc] initWithBuffer:buf offset:static_cast<NSUInteger>(offset) * sizeof(float) descriptor:d];
+        };
+        for (int64_t j = 0; j < rows; j += nb) {
+            const int64_t nj = std::min(nb, rows - j);
+            const WidenArgs args{u32(nj), u32(cols), u32(B.ld)};
+            id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+            [e setComputePipelineState:widen_bf16_k];
+            [e setBuffer:B.buf offset:static_cast<NSUInteger>(B.offset + j * B.ld) * sizeof(uint16_t) atIndex:0];
+            [e setBuffer:scratch.buf offset:0 atIndex:1];
+            [e setBytes:&args length:sizeof args atIndex:2];
+            const NSUInteger tg = std::min<NSUInteger>(256, widen_bf16_k.maxTotalThreadsPerThreadgroup);
+            [e dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(u32(nj * cols)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            [e endEncoding];
+            // A kernel object per block: MPS kernels must not be shared between threads.
+            MPSMatrixMultiplication* mm = [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                                                            transposeLeft:NO
+                                                                           transposeRight:trans_b ? YES : NO
+                                                                               resultRows:static_cast<NSUInteger>(m)
+                                                                            resultColumns:static_cast<NSUInteger>(trans_b ? nj : n)
+                                                                          interiorColumns:static_cast<NSUInteger>(trans_b ? k : nj)
+                                                                                    alpha:1.0
+                                                                                     beta:(!trans_b && j > 0) ? 1.0 : 0.0];
+            MPSMatrix* a = trans_b ? matrix(A.buf, A.offset, m, k, A.ld) : matrix(A.buf, A.offset + j, m, nj, A.ld);
+            MPSMatrix* b = matrix(scratch.buf, 0, nj, cols, cols);
+            MPSMatrix* c = trans_b ? matrix(C.buf, C.offset + j, m, nj, C.ld) : matrix(C.buf, C.offset, m, n, C.ld);
+            [mm encodeToCommandBuffer:cmd leftMatrix:a rightMatrix:b resultMatrix:c];
+        }
     }
 };
 
@@ -1057,11 +1230,16 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const We
             }
         }
         std::vector<id<MTLBuffer>> yb(nw, nil);
+        Impl::Scratch scratch;
         id<MTLCommandBuffer> cmd = [g.queue commandBuffer];
         for (size_t i = 0; i < nw; ++i) {
             const int64_t n = Ws[i]->shape[0];
             if (n == 0) continue;
             yb[i] = g.acquire(static_cast<size_t>(m * n) * sizeof(float));
+            if (wb[i].bf16) {
+                g.encode_bf16(cmd, {xf, 0, k}, {wb[i].buf, 0, k}, {yb[i], 0, n}, m, n, k, true, scratch);
+                continue;
+            }
             const MPSDataType in_type = half[i] ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             const NSUInteger in_size = half[i] ? sizeof(__fp16) : sizeof(float);
             const MPSDataType w_type = wb[i].half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
@@ -1089,6 +1267,7 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const We
         }
         [cmd commit];
         [cmd waitUntilCompleted];
+        g.release(scratch, true);
         const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
         for (size_t i = 0; i < nw; ++i) {
             if (!yb[i]) continue;
@@ -1139,6 +1318,7 @@ struct Gpu::Seq::Impl {
         float eps = 0.f;
         bool layernorm = false;
         bool inverse = false;  // Rope
+        WeightFormat kv = WeightFormat::fp32;  // KvAppend, RoundHalf: how the cache keeps its values
     };
     std::vector<Slot> slots;
     std::vector<Op> ops;
@@ -1146,6 +1326,7 @@ struct Gpu::Seq::Impl {
     id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
     size_t split_bytes = 0;
     std::vector<id<MTLBuffer>> retired;  // replaced during an attempt: released once its command buffers finish
+    Gpu::Impl::Scratch scratch;          // bf16 weights widened for multiplies of many rows (encode_bf16)
 
     // Encoding state of one attempt.
     id<MTLCommandBuffer> cmd = nil;
@@ -1208,6 +1389,27 @@ struct Gpu::Seq::Impl {
         need(op.c, m * n);
         if (m == 0 || n == 0) return;
         if (k == 0) throw std::logic_error("Gpu::Seq: linear with an empty input");
+        if (W.is_bf16()) {  // float32 inputs, fp16 run or not
+            end_compute();
+            g.encode_bf16(cmd, {slot(op.a).buf, 0, k}, {g.shared_buffer(W), 0, k}, {slot(op.c).buf, 0, n}, m, n, k, true, scratch);
+        } else {
+            encode_mps_linear(op, fp16);
+        }
+        if (op.lbias) {
+            if (op.lbias->numel() != n) throw std::invalid_argument("Gpu::Seq: bias does not match the weight");
+            const BiasArgs args{u32(m * n), u32(n)};
+            id<MTLComputeCommandEncoder> e = compute();
+            [e setComputePipelineState:g.bias_k];
+            [e setBuffer:slot(op.c).buf offset:0 atIndex:0];
+            [e setBuffer:g.weight_buffer(op.lbias->f32(), false) offset:0 atIndex:1];
+            [e setBytes:&args length:sizeof args atIndex:2];
+            dispatch(g.bias_k, m * n);
+        }
+    }
+
+    void encode_mps_linear(const Op& op, bool fp16) {
+        const Weight& W = *op.lw;
+        const int64_t m = op.rows, n = W.shape[0], k = W.shape[1];
         Gpu::Impl::WBuf wb = fp16 ? g.weight_for(W, true) : Gpu::Impl::WBuf{};
         const bool half = wb.buf && wb.half;  // fp16 inputs
         id<MTLBuffer> in = slot(op.a).buf;
@@ -1247,16 +1449,6 @@ struct Gpu::Seq::Impl {
         MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb.buf descriptor:dw];
         MPSMatrix* my = [[MPSMatrix alloc] initWithBuffer:slot(op.c).buf descriptor:dy];
         [mm(m, n, k) encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mw resultMatrix:my];
-        if (op.lbias) {
-            if (op.lbias->numel() != n) throw std::invalid_argument("Gpu::Seq: bias does not match the weight");
-            const BiasArgs args{u32(m * n), u32(n)};
-            id<MTLComputeCommandEncoder> e = compute();
-            [e setComputePipelineState:g.bias_k];
-            [e setBuffer:slot(op.c).buf offset:0 atIndex:0];
-            [e setBuffer:g.weight_buffer(op.lbias->f32(), false) offset:0 atIndex:1];
-            [e setBytes:&args length:sizeof args atIndex:2];
-            dispatch(g.bias_k, m * n);
-        }
     }
 
     // dx (m, k) = dy (m, n) W, W (n, k).
@@ -1268,6 +1460,10 @@ struct Gpu::Seq::Impl {
         if (m == 0 || k == 0) return;
         if (n == 0) throw std::logic_error("Gpu::Seq: linear_t with an empty input");
         end_compute();
+        if (W.is_bf16()) {  // dx = dy W: W's rows are the sum's
+            g.encode_bf16(cmd, {slot(op.a).buf, 0, n}, {g.shared_buffer(W), 0, k}, {slot(op.c).buf, 0, k}, m, k, n, false, scratch);
+            return;
+        }
         MPSMatrixDescriptor* ddy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:n * sizeof(float)
                                                                         dataType:MPSDataTypeFloat32];
         const Gpu::Impl::WBuf wb = g.weight_for(W, false);
@@ -1376,21 +1572,22 @@ struct Gpu::Seq::Impl {
                 if (op.n == 0) break;
                 const uint32_t cnt = u32(op.n);
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:g.round_half_k];
+                id<MTLComputePipelineState> p = op.kv == WeightFormat::bf16 ? g.round_bf16_k : g.round_half_k;
+                [e setComputePipelineState:p];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                 [e setBytes:&cnt length:sizeof cnt atIndex:1];
-                dispatch(g.round_half_k, op.n);
+                dispatch(p, op.n);
                 break;
             }
-            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, inverse = an fp16 cache
+            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, kv = the cache's format
                 const int64_t n = op.rows * op.heads * op.D;
                 need(op.a, op.offset + n);
-                need(op.c, op.inverse ? (op.heads * op.n * op.D + 1) / 2 : op.heads * op.n * op.D);  // inverse: an fp16 cache
+                need(op.c, op.kv != WeightFormat::fp32 ? (op.heads * op.n * op.D + 1) / 2 : op.heads * op.n * op.D);  // 2 values a float
                 if (op.rot + op.rows > op.n) throw std::logic_error("Gpu::Seq: kv_append past the cache's capacity");
                 if (n == 0) break;
                 const KvArgs args{u32(op.rows), u32(op.heads), u32(op.D), u32(op.n), u32(op.rot)};
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:op.inverse ? g.kv_append_k_h : g.kv_append_k];
+                [e setComputePipelineState:g.kv_append_for(op.kv)];
                 [e setBuffer:slot(op.a).buf offset:static_cast<NSUInteger>(op.offset) * sizeof(float) atIndex:0];
                 [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
                 [e setBytes:&args length:sizeof args atIndex:2];
@@ -1435,7 +1632,7 @@ struct Gpu::Seq::Impl {
                 need(op.b, A.rows * A.Hkv * A.D);
                 need(op.d, A.rows * A.Hkv * A.D);
                 need(op.c, A.rows * A.H * A.D);
-                const int64_t prefix = A.half_prefix ? (A.Hkv * A.Tp * A.D + 1) / 2 : A.Hkv * A.Tp * A.D;  // in floats
+                const int64_t prefix = A.prefix != WeightFormat::fp32 ? (A.Hkv * A.Tp * A.D + 1) / 2 : A.Hkv * A.Tp * A.D;  // in floats
                 need(op.e, std::max<int64_t>(prefix, 1));
                 need(op.f, std::max<int64_t>(prefix, 1));
                 need(op.g, 4 * A.rows);
@@ -1458,7 +1655,7 @@ struct Gpu::Seq::Impl {
                     }
                     const uint32_t ns = u32(nsplit);
                     id<MTLComputeCommandEncoder> e = compute();
-                    [e setComputePipelineState:A.half_prefix ? g.attn_split_k_h : g.attn_split_k];
+                    [e setComputePipelineState:g.attn_split_for(A.prefix)];
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                     [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
                     [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
@@ -1485,7 +1682,7 @@ struct Gpu::Seq::Impl {
                 const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
                 if (tiled) need(op.i, 4 * A.blocks);
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:tiled ? (A.half_prefix ? g.attn_mma_k_h : g.attn_mma_k) : (A.half_prefix ? g.attn_k_h : g.attn_k)];
+                [e setComputePipelineState:tiled ? g.attn_mma_for(A.prefix) : g.attn_for(A.prefix)];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                 [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
                 [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
@@ -1659,6 +1856,7 @@ struct Gpu::Seq::Impl {
                 }
                 for (id<MTLBuffer> b : retired) g.release(b);  // no command buffer reads them any more
                 retired.clear();
+                g.release(scratch, false);
                 return ok;
             };
             const int64_t every = commit_linears();
@@ -1702,6 +1900,7 @@ Gpu::Seq::~Seq() {
     }
     if (s.flag) s.g.release(s.flag);
     if (s.split) s.g.release(s.split);
+    s.g.release(s.scratch, true);
 }
 
 float* Gpu::Seq::reserve(int slot, int64_t floats) {
@@ -1803,19 +2002,21 @@ void Gpu::Seq::norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& 
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::round_half(int x, int64_t n) {
+void Gpu::Seq::round_kv(int x, int64_t n, WeightFormat format) {
+    if (format == WeightFormat::fp32) return;
     Impl::Op op{Impl::Op::RoundHalf};
     op.a = x;
     op.n = n;
+    op.kv = format;
     impl_->ops.push_back(op);
 }
 
 void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row,
-                         bool half) {
+                         WeightFormat format) {
     if (src == dst) throw std::invalid_argument("Gpu::Seq: kv_append into the slot it reads");
     if (src_row < 0) throw std::invalid_argument("Gpu::Seq: negative kv_append row");
     Impl::Op op{Impl::Op::KvAppend};
-    op.inverse = half;
+    op.kv = format;
     op.offset = src_row * heads * D;
     op.a = src;
     op.c = dst;
@@ -1959,6 +2160,7 @@ struct Gpu::Batch::Impl {
     struct Buf {
         id<MTLBuffer> buf = nil;
         bool half = false;   // fp16 values (a weight)
+        bool bf16 = false;   // bf16 values (a weight): multiplied by encode_bf16
         bool owned = false;  // from the pool (released at the end), not a weight's own memory
     };
     struct Op {
@@ -1975,6 +2177,7 @@ struct Gpu::Batch::Impl {
     std::vector<std::vector<Op>> groups;
     std::vector<Op> current;
     std::map<std::tuple<int64_t, int64_t, int64_t, bool>, MPSMatrixMultiplication*> mms;
+    Gpu::Impl::Scratch scratch;  // bf16 weights widened for multiplies (encode_bf16)
 
     explicit Impl(Gpu::Impl& gpu) : g(gpu) {}
 
@@ -1994,7 +2197,7 @@ struct Gpu::Batch::Impl {
     // Checks that rows x cols at m.offset with stride m.ld fit the buffer.
     void check(const Mat& m, int64_t rows, int64_t cols) {
         Buf& b = at(m.buf);
-        const int64_t size = b.half ? 2 : 4;
+        const int64_t size = b.half || b.bf16 ? 2 : 4;
         if (rows < 0 || cols < 0 || m.offset < 0 || (rows && m.ld < cols))
             throw std::invalid_argument("Gpu::Batch: bad matrix layout");
         if (rows && cols && static_cast<uint64_t>((m.offset + (rows - 1) * m.ld + cols) * size) > b.buf.length)
@@ -2042,6 +2245,11 @@ struct Gpu::Batch::Impl {
         }
         if (op.kind == Op::MatMul) {
             if (op.m == 0 || op.n == 0) return;
+            if (at(op.b.buf).bf16) {
+                auto ref = [&](const Mat& x) { return Gpu::Impl::MRef{at(x.buf).buf, x.offset, x.ld}; };
+                g.encode_bf16(cmd, ref(op.a), ref(op.b), ref(op.c), op.m, op.n, op.k, op.trans_b, scratch);
+                return;
+            }
             MPSMatrix* A = matrix(op.a, op.m, op.k);
             MPSMatrix* B = op.trans_b ? matrix(op.b, op.n, op.k) : matrix(op.b, op.k, op.n);
             MPSMatrix* C = matrix(op.c, op.m, op.n);
@@ -2104,6 +2312,7 @@ Gpu::Batch::~Batch() {
     for (Impl::Buf& b : impl_->bufs)
         if (b.buf && b.owned) impl_->g.release(b.buf);
     if (impl_->flag) impl_->g.release(impl_->flag);
+    impl_->g.release(impl_->scratch, true);
 }
 
 int Gpu::Batch::buffer(int64_t count, bool fp16) {
@@ -2151,6 +2360,7 @@ int Gpu::Batch::weight(const Weight& W, bool fp16) {
     Impl::Buf b;
     b.buf = w.buf;
     b.half = w.half;
+    b.bf16 = w.bf16;
     impl_->bufs.push_back(b);
     return static_cast<int>(impl_->bufs.size() - 1);
 }
@@ -2169,6 +2379,8 @@ void Gpu::Batch::matmul(Mat A, Mat B, Mat C, int64_t m, int64_t n, int64_t k, bo
     s.check(C, m, n);
     s.writable(C.buf);
     if (s.at(C.buf).half) throw std::invalid_argument("Gpu::Batch: multiplies write float32 (to_half converts)");
+    if (s.at(A.buf).bf16) throw std::invalid_argument("Gpu::Batch: a bf16 weight goes on the right of a multiply");
+    if (s.at(B.buf).bf16 && s.at(A.buf).half) throw std::invalid_argument("Gpu::Batch: a bf16 weight multiplies float32 values");
     Impl::Op op{Impl::Op::MatMul};
     op.a = A;
     op.b = B;
@@ -2241,6 +2453,7 @@ void Gpu::Batch::run() {
         Impl::Backend backend(s);
         run_chunks(backend, pack_chunks(flops, gpu_chunk_flops()));
     }
+    s.g.release(s.scratch, false);  // every command buffer has finished
 }
 
 }  // namespace detail
