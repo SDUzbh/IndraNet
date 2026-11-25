@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <format>
 #include <stdexcept>
 
 namespace tfi::json {
@@ -58,7 +59,7 @@ class Parser {
     size_t i_ = 0;
 
     [[noreturn]] void fail(const std::string& msg) const {
-        throw std::runtime_error("JSON parse error at offset " + std::to_string(i_) + ": " + msg);
+        throw std::runtime_error(std::format("JSON parse error at offset {}: {}", i_, msg));
     }
 
     void skip_ws() {

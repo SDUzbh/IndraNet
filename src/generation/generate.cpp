@@ -5,8 +5,9 @@
 #include "trace.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
-#include <cstring>
+#include <concepts>
 #include <limits>
 #include <map>
 #include <memory>
@@ -78,12 +79,13 @@ float exp_weight(float x) {
     y = y + r;
     y = y + 1.f;
     const uint32_t bits = static_cast<uint32_t>(static_cast<int32_t>(fx) + 127) << 23;  // 2^n
-    float scale;
-    std::memcpy(&scale, &bits, sizeof scale);
-    return y * scale;
+    return y * std::bit_cast<float>(bits);
 }
 
-void exp_weights(const float* logits, int64_t n, float top, float scale, float* w) {
+void exp_weights(std::span<const float> l, float top, float scale, std::span<float> out) {
+    const float* logits = l.data();
+    float* w = out.data();
+    const int64_t n = std::ssize(l);
     int64_t i = 0;
 #if defined(__aarch64__)
     const float32x4_t vtop = vdupq_n_f32(top), vscale = vdupq_n_f32(scale), vmin = vdupq_n_f32(kMinExp);
@@ -128,7 +130,9 @@ void exp_weights(const float* logits, int64_t n, float top, float scale, float* 
 namespace {
 
 // Sum of float weights in double, in a fixed order (four running sums), so the same on every platform.
-double sum_weights(const float* w, size_t n) {
+double sum_weights(std::span<const float> weights) {
+    const float* w = weights.data();
+    const size_t n = weights.size();
     double s[4] = {0, 0, 0, 0};
     size_t i = 0;
     for (; i + 4 <= n; i += 4)
@@ -140,8 +144,7 @@ double sum_weights(const float* w, size_t n) {
 // A logit's bits as an unsigned key in the logits' order (key 0 is left for "never").
 uint32_t logit_key(float l) {
     const float v = l + 0.f;  // -0 as +0: equal logits, equal keys
-    uint32_t u;
-    std::memcpy(&u, &v, sizeof u);
+    const auto u = std::bit_cast<uint32_t>(v);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
@@ -157,7 +160,7 @@ struct Cut {
     bool keeps(uint32_t k, int64_t& taken) const { return k > key || (k == key && k != 0 && taken++ < m); }
 };
 
-template <typename Key, typename Amount>
+template <std::invocable<int64_t> Key, std::invocable<int64_t> Amount>
 Cut cut_at(int64_t n, Key key, Amount amount, double target, std::vector<double>& hist, std::vector<int64_t>& sel) {
     hist.assign(4096, 0.0);
     for (int64_t i = 0; i < n; ++i) {
@@ -200,7 +203,9 @@ Cut cut_at(int64_t n, Key key, Amount amount, double target, std::vector<double>
 }
 
 // The largest logit (NaN ignored), -inf if none; four lanes at a time on ARM (max is exact, so the same).
-float max_logit(const float* l, int64_t n) {
+float max_logit(std::span<const float> logits) {
+    const float* l = logits.data();
+    const int64_t n = std::ssize(logits);
     float top = -INFINITY;
     int64_t i = 0;
 #if defined(__aarch64__)
@@ -215,9 +220,10 @@ float max_logit(const float* l, int64_t n) {
 
 }  // namespace
 
-bool Sampler::select(const float* logits, int64_t n, int64_t& best, double& total) {
+bool Sampler::select(std::span<const float> logits, int64_t& best, double& total) {
+    const int64_t n = std::ssize(logits);
     // Greedy: the largest logit, the lowest id among equal ones.
-    const float top = max_logit(logits, n);
+    const float top = max_logit(logits);
     if (top == -INFINITY) throw std::runtime_error("generate: no logit to choose a token from (all NaN or -inf)");
     best = 0;
     while (!(logits[best] == top)) ++best;
@@ -237,21 +243,17 @@ bool Sampler::select(const float* logits, int64_t n, int64_t& best, double& tota
         gathered_.resize(ids_.size());
         for (size_t j = 0; j < ids_.size(); ++j) gathered_[j] = logits[ids_[j]];
         w_.resize(ids_.size());
-        detail::exp_weights(gathered_.data(), static_cast<int64_t>(ids_.size()), top, scale, w_.data());
+        detail::exp_weights(gathered_, top, scale, w_);
     } else {
         w_.resize(static_cast<size_t>(n));
-        detail::exp_weights(logits, n, top, scale, w_.data());
+        detail::exp_weights(logits, top, scale, w_);
     }
     if (top_p_ < 1) {  // the nucleus: a weight's bits order as its value (weights are >= 0; 0: never)
         const size_t m = w_.size();
-        auto key = [&](int64_t j) {
-            uint32_t k;
-            std::memcpy(&k, &w_[static_cast<size_t>(j)], sizeof k);
-            return k;
-        };
+        auto key = [&](int64_t j) { return std::bit_cast<uint32_t>(w_[static_cast<size_t>(j)]); };
         const Cut c = cut_at(
             static_cast<int64_t>(m), key, [&](int64_t j) { return static_cast<double>(w_[static_cast<size_t>(j)]); },
-            top_p_ * sum_weights(w_.data(), m), hist_, sel_);
+            top_p_ * sum_weights(w_), hist_, sel_);
         const bool dense = ids_.empty();
         size_t kept = 0;
         int64_t taken = 0;
@@ -264,14 +266,14 @@ bool Sampler::select(const float* logits, int64_t n, int64_t& best, double& tota
         ids_.resize(kept);
         w_.resize(kept);
     }
-    total = sum_weights(w_.data(), w_.size());
+    total = sum_weights(w_);
     return true;
 }
 
-int64_t Sampler::operator()(const float* logits, int64_t n) {
+int64_t Sampler::operator()(std::span<const float> logits) {
     int64_t best;
     double total;
-    if (!select(logits, n, best, total)) return best;
+    if (!select(logits, best, total)) return best;
     const double u = uniform() * total;
     // The token where the running sum passes u: whole blocks' sums first, then within the block.
     constexpr size_t kBlock = 64;
@@ -279,7 +281,7 @@ int64_t Sampler::operator()(const float* logits, int64_t n) {
     int64_t last = best;
     for (size_t b = 0; b < w_.size(); b += kBlock) {
         const size_t e = std::min(w_.size(), b + kBlock);
-        const double block = sum_weights(w_.data() + b, e - b);
+        const double block = sum_weights(std::span(w_).subspan(b, e - b));
         if (u >= sum + block && e < w_.size()) {
             sum += block;
             continue;
@@ -294,11 +296,11 @@ int64_t Sampler::operator()(const float* logits, int64_t n) {
     return last;  // rounding left u at the very end
 }
 
-void Sampler::distribution(const float* logits, int64_t n, std::vector<double>& p) {
+void Sampler::distribution(std::span<const float> logits, std::vector<double>& p) {
     int64_t best;
     double total;
-    const bool sampled = select(logits, n, best, total);
-    p.assign(static_cast<size_t>(n), 0.0);
+    const bool sampled = select(logits, best, total);
+    p.assign(logits.size(), 0.0);
     if (!sampled) {
         p[static_cast<size_t>(best)] = 1;
         return;
@@ -350,11 +352,7 @@ struct PerSequenceHooks {
     Hooks all;
 
     static bool heads_first(const std::string& n) {
-        auto ends = [&](const char* e) {
-            const size_t l = std::strlen(e);
-            return n.size() >= l && n.compare(n.size() - l, l, e) == 0;
-        };
-        return ends("attn.hook_q") || ends("attn.hook_k") || ends("attn.hook_v");
+        return n.ends_with("attn.hook_q") || n.ends_with("attn.hook_k") || n.ends_with("attn.hook_v");
     }
     void each(const std::string& name, Tensor& act, bool write) {
         const int dim = heads_first(name) ? 1 : 0;
@@ -442,7 +440,7 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
         if (traces) {
             recs[i].emplace(model, options.trace);
             detail::TraceRecorder* r = &*recs[i];
-            ph.of[i].add_capture([r](const std::string& nm) { return r->points.count(nm) > 0; },
+            ph.of[i].add_capture([r](const std::string& nm) { return r->points.contains(nm); },
                                  [r](const std::string& nm, Tensor& a) { r->capture(nm, a); });
             any_hooks = true;
         }
@@ -469,12 +467,10 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
         for (size_t i = 0; i < n; ++i) {
             if (step[i].empty()) continue;
             const Tensor& lg = logits[i];
-            const int64_t t = samplers[i](lg.ptr(), lg.shape[1]);
-            if (traces)
-                (*traces)[i].push_back(
-                    recs[i]->step(lg.ptr(), lg.shape[1], t, batch[static_cast<int64_t>(i)].size() - 1));
+            const int64_t t = samplers[i](lg.data);
+            if (traces) (*traces)[i].push_back(recs[i]->step(lg.data, t, batch[static_cast<int64_t>(i)].size() - 1));
             out[i].push_back(t);
-            const bool more = !stop.count(t) && static_cast<int64_t>(out[i].size()) < options.max_new_tokens;
+            const bool more = !stop.contains(t) && static_cast<int64_t>(out[i].size()) < options.max_new_tokens;
             step[i] = more ? Tokens{t} : Tokens{};
         }
     }

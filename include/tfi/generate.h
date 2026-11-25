@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <random>
+#include <span>
 #include <vector>
 
 #include "tfi/analysis.h"
@@ -95,10 +96,10 @@ struct GenerateOptions {
 class Sampler {
   public:
     explicit Sampler(const GenerateOptions& options);
-    int64_t operator()(const float* logits, int64_t n);
-    // The distribution operator() samples from, over all n tokens: zero outside the candidates, one-hot
+    int64_t operator()(std::span<const float> logits);
+    // The distribution operator() samples from, over every token: zero outside the candidates, one-hot
     // when it would pick the most likely token (greedy). For speculative decoding's acceptance rule.
-    void distribution(const float* logits, int64_t n, std::vector<double>& p);
+    void distribution(std::span<const float> logits, std::vector<double>& p);
     double uniform();                            // in [0, 1), from the generator's top 53 bits
     int64_t draw(const std::vector<double>& w);  // index i with probability w[i] / sum(w)
     // Whether every pick is the most likely token, whatever the logits: temperature 0, top_k 1, or a
@@ -109,7 +110,7 @@ class Sampler {
     // The tokens that can be picked, lowest id first: their weights in w_ and ids in ids_ (empty: every
     // token, w_ then holding one weight per id), and in `total` the weights' sum. False when the pick is
     // `best` alone (greedy, top_k 1, a temperature whose reciprocal overflows a float, or an infinite logit).
-    bool select(const float* logits, int64_t n, int64_t& best, double& total);
+    bool select(std::span<const float> logits, int64_t& best, double& total);
     int64_t id(size_t j) const { return ids_.empty() ? static_cast<int64_t>(j) : ids_[j]; }
     double temperature_, top_p_;
     int64_t top_k_;

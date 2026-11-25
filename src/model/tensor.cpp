@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -36,13 +37,13 @@ Tensor::Tensor(Shape s, float fill) : shape(std::move(s)), data(shape_numel(shap
 
 Tensor::Tensor(Shape s, std::vector<float> d) : shape(std::move(s)), data(std::move(d)) {
     if (shape_numel(shape) != numel())
-        throw std::invalid_argument("tensor data size " + std::to_string(numel()) + " does not match shape " +
-                                    shape_str(shape));
+        throw std::invalid_argument(
+            std::format("tensor data size {} does not match shape {}", numel(), shape_str(shape)));
 }
 
 int64_t Tensor::size(int64_t i) const {
     if (i < 0) i += dim();
-    if (i < 0 || i >= dim()) throw std::out_of_range("dim " + std::to_string(i) + " for shape " + shape_str(shape));
+    if (i < 0 || i >= dim()) throw std::out_of_range(std::format("dim {} for shape {}", i, shape_str(shape)));
     return shape[i];
 }
 
@@ -92,7 +93,8 @@ void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t
     if (trans_b) {
         for (int64_t i = 0; i < m; ++i)
             for (int64_t j = 0; j < n; ++j)
-                C[i * ldc + j] = (accumulate ? C[i * ldc + j] : 0.f) + dot(A + i * lda, B + j * ldb, k);
+                C[i * ldc + j] =
+                    (accumulate ? C[i * ldc + j] : 0.f) + dot(std::span(A + i * lda, k), std::span(B + j * ldb, k));
     } else {
         for (int64_t i = 0; i < m; ++i) {
             float* c = C + i * ldc;
@@ -210,9 +212,9 @@ Tensor row(const Tensor& A, int64_t i) {
     return r;
 }
 
-float dot(const float* a, const float* b, int64_t n) {
+float dot(std::span<const float> a, std::span<const float> b) {
     float s = 0.f;
-    for (int64_t i = 0; i < n; ++i) s += a[i] * b[i];
+    for (size_t i = 0; i < a.size(); ++i) s += a[i] * b[i];
     return s;
 }
 
@@ -241,17 +243,18 @@ float max_abs(const Tensor& a) {
     return m;
 }
 
-void softmax_(float* v, int64_t n) { vm::softmax(v, n); }
+void softmax_(std::span<float> v) { vm::softmax(v); }
 
-float log_softmax_at(const float* v, int64_t n, int64_t idx) {
+float log_softmax_at(std::span<const float> v, int64_t idx) {
     float mx = -std::numeric_limits<float>::infinity();
-    for (int64_t i = 0; i < n; ++i) mx = std::max(mx, v[i]);
+    for (float x : v) mx = std::max(mx, x);
     double sum = 0;
-    for (int64_t i = 0; i < n; ++i) sum += std::exp(double(v[i] - mx));
-    return v[idx] - mx - static_cast<float>(std::log(sum));
+    for (float x : v) sum += std::exp(double(x - mx));
+    return v[static_cast<size_t>(idx)] - mx - static_cast<float>(std::log(sum));
 }
 
-std::vector<int64_t> topk(const float* v, int64_t n, int64_t k) {
+std::vector<int64_t> topk(std::span<const float> v, int64_t k) {
+    const int64_t n = std::ssize(v);
     k = std::min(k, n);
     std::vector<int64_t> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
@@ -260,10 +263,9 @@ std::vector<int64_t> topk(const float* v, int64_t n, int64_t k) {
     return idx;
 }
 
-int64_t rank_of(const float* v, int64_t n, int64_t idx) {
-    int64_t r = 0;
-    for (int64_t i = 0; i < n; ++i) r += v[i] > v[idx];
-    return r;
+int64_t rank_of(std::span<const float> v, int64_t idx) {
+    const float x = v[static_cast<size_t>(idx)];
+    return std::ranges::count_if(v, [x](float y) { return y > x; });
 }
 
 }  // namespace tfi

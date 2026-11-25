@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -101,7 +102,7 @@ struct Args {
     std::string command, model;
     std::map<std::string, std::string> opts;
 
-    bool has(const std::string& k) const { return opts.count(k) > 0; }
+    bool has(const std::string& k) const { return opts.contains(k); }
     std::string get(const std::string& k, const std::string& def = "") const {
         auto it = opts.find(k);
         return it == opts.end() ? def : it->second;
@@ -120,10 +121,10 @@ Args parse_args(int argc, char** argv) {
     a.model = argv[2];
     for (int i = 3; i < argc; ++i) {
         std::string k = argv[i];
-        if (k.rfind("--", 0) != 0) throw std::invalid_argument("unexpected argument '" + k + "'");
+        if (!k.starts_with("--")) throw std::invalid_argument("unexpected argument '" + k + "'");
         k = k.substr(2);
         // A flag with no value (e.g. --raw) is followed by another --option or nothing.
-        if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0) a.opts[k] = "1";
+        if (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--")) a.opts[k] = "1";
         else a.opts[k] = argv[++i];
     }
     return a;
@@ -209,13 +210,13 @@ void print_matrix(const Tensor& t, const std::vector<std::string>& rows, const s
 
 std::vector<std::string> layer_labels(const Model& m) {
     std::vector<std::string> l;
-    for (int64_t i = 0; i < m.cfg().n_layers; ++i) l.push_back("L" + std::to_string(i));
+    for (int64_t i = 0; i < m.cfg().n_layers; ++i) l.push_back(std::format("L{}", i));
     return l;
 }
 
 std::vector<std::string> head_labels(const Model& m) {
     std::vector<std::string> l;
-    for (int64_t h = 0; h < m.max_heads(); ++h) l.push_back("H" + std::to_string(h));
+    for (int64_t h = 0; h < m.max_heads(); ++h) l.push_back(std::format("H{}", h));
     return l;
 }
 
@@ -297,20 +298,20 @@ int cmd_info(const Args&, const Model& m) {
     const auto names = m.hook_names();
     std::printf("\n%zu hook points (layer 0 shown):\n", names.size());
     for (const auto& n : names)
-        if (n.find("blocks.") != 0 || n.find("blocks.0.") == 0) std::printf("  %s\n", n.c_str());
+        if (!n.starts_with("blocks.") || n.starts_with("blocks.0.")) std::printf("  %s\n", n.c_str());
     return 0;
 }
 
 int cmd_run(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
     const Tensor logits = m.forward(t);
-    const int64_t V = m.cfg().vocab_size, k = a.get_int("top", 3);
+    const int64_t k = a.get_int("top", 3);
     std::printf("%5s %7s   top-%lld next tokens (prob)\n", "pos", "token", static_cast<long long>(k));
     for (int64_t p = 0; p < static_cast<int64_t>(t.size()); ++p) {
         Tensor probs = rows(logits, p, p + 1);
-        softmax_(probs.ptr(), V);
+        softmax_(probs.data);
         std::printf("%5lld %7s  ", (long long)p, tok(m, t[p]).c_str());
-        for (int64_t id : topk(probs.ptr(), V, k)) std::printf("  %6s (%.3f)", tok(m, id).c_str(), probs.data[id]);
+        for (int64_t id : topk(probs.data, k)) std::printf("  %6s (%.3f)", tok(m, id).c_str(), probs.data[id]);
         if (p + 1 < static_cast<int64_t>(t.size()))
             std::printf("   | actual next %s: p=%.3f", tok(m, t[p + 1]).c_str(), probs.data[t[p + 1]]);
         std::printf("\n");
@@ -346,8 +347,7 @@ int cmd_dla(const Args& a, const Model& m) {
     const DLAResult r = direct_logit_attribution(m, t, pos, target, other);
     std::vector<size_t> order(r.values.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(),
-              [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
+    std::ranges::sort(order, [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
     const size_t top = std::min<size_t>(order.size(), static_cast<size_t>(a.get_int("top", 15)));
     std::printf("direct logit attribution at position %lld: logit[%s]%s\n", (long long)pos, tok(m, target).c_str(),
                 other >= 0 ? (" - logit[" + tok(m, other) + "]").c_str() : "");
@@ -441,14 +441,14 @@ int cmd_patch(const Args& a, const Model& m) {
         std::printf(
             "linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
             "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
-    const int64_t n_exact = std::count(r.exact.begin(), r.exact.end(), uint8_t(1));
+    const int64_t n_exact = std::ranges::count(r.exact, uint8_t(1));
     if (method == "mixed")
         std::printf(
             "* = measured by exact patching (the %lld largest estimates); other entries are attribution estimates\n",
             (long long)n_exact);
     std::printf("\n");
     print_matrix(*shown, r.row_labels, r.col_labels, "%7.3f", method == "mixed" ? &r.exact : nullptr);
-    if (std::any_of(shown->data.begin(), shown->data.end(), [](float v) { return std::isnan(v); }))
+    if (std::ranges::any_of(shown->data, [](float v) { return std::isnan(v); }))
         std::printf("(. = no such site in that layer)\n");
     if (method == "mixed" && n_exact > 0) {
         // How far off were the estimates where we checked, and how large is the biggest one left unchecked?
@@ -492,7 +492,7 @@ int cmd_patch(const Args& a, const Model& m) {
         std::printf("\nexact patching for comparison:\n\n");
         print_matrix(want, exact.row_labels, exact.col_labels);
         std::printf("\nagreement over %.0f sites: correlation %s, largest error %.3f", n,
-                    vx > 0 && vy > 0 ? std::to_string(cov / std::sqrt(vx * vy)).substr(0, 5).c_str() : "n/a", worst);
+                    vx > 0 && vy > 0 ? std::format("{:.3f}", cov / std::sqrt(vx * vy)).c_str() : "n/a", worst);
         if (worst_i >= 0) {
             const int64_t cols = static_cast<int64_t>(r.col_labels.size());
             std::printf(" at %s %s (estimate %.3f, exact %.3f)", r.row_labels[worst_i / cols].c_str(),
@@ -510,7 +510,7 @@ int cmd_attn(const Args& a, const Model& m) {
     const int64_t H = m.layer_cfg(layer).n_heads, head = a.get_int("head", -1);
     if (head >= H) throw std::invalid_argument("--head is out of range");
     const int64_t k = a.get_int("top", head >= 0 ? 3 : 1);
-    const std::string name = "blocks." + std::to_string(layer) + ".attn.hook_pattern";
+    const std::string name = std::format("blocks.{}.attn.hook_pattern", layer);
     ActivationCache cache;
     m.run_with_cache(t, cache, [&name](const std::string& n) { return n == name; });
     const Tensor& P = cache.at(name);  // (H, T, T)
@@ -522,7 +522,7 @@ int cmd_attn(const Args& a, const Model& m) {
         std::printf("%3lld %5s |", (long long)q, tok(m, t[q]).c_str());
         for (int64_t h = head >= 0 ? head : 0; h < (head >= 0 ? head + 1 : H); ++h) {
             if (head < 0) std::printf(" H%lld", (long long)h);
-            for (int64_t key : topk(P.ptr() + (h * T + q) * T, T, k))
+            for (int64_t key : topk(P.row_view(h * T + q), k))
                 std::printf(" %lld:%s %.2f", (long long)key,
                             m.vocab().empty() ? std::to_string(t[key]).c_str() : m.token_str(t[key]).c_str(),
                             P.data[(h * T + q) * T + key]);
@@ -588,8 +588,7 @@ int cmd_ablate(const Args& a, const Model& m) {
         std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of around 1e-4 to each value\n",
                     use_gpu() && m.gpu() ? " and the GPU's multiplies take fp16 inputs" : "");
     if (mode == "mean") {
-        const bool per_pos =
-            std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
+        const bool per_pos = std::ranges::all_of(refs, [T](const Tokens& r) { return (int64_t)r.size() == T; });
         std::printf("means over %zu reference sequences, %s\n", refs.size(),
                     per_pos ? "one per position" : "one over all positions (reference lengths differ from the input)");
     }
@@ -616,7 +615,7 @@ int cmd_circuits(const Args& a, const Model& m) {
             all.push_back({c.k.data[i * N + j], "K", i, j});
             all.push_back({c.v.data[i * N + j], "V", i, j});
         }
-    std::sort(all.begin(), all.end(), [](const Entry& x, const Entry& y) { return x.score > y.score; });
+    std::ranges::sort(all, [](const Entry& x, const Entry& y) { return x.score > y.score; });
     std::printf("composition scores (weights only; random-head baseline %.3f)\n", base);
     if (m.cfg().positional == "rope")
         std::printf("note: RoPE rotates q/k by position, so Q/K scores ignore the rotation\n");
@@ -644,7 +643,7 @@ int cmd_circuits(const Args& a, const Model& m) {
                 for (int64_t i = first[la]; i < first[la + 1]; ++i)
                     for (int64_t j = first[lb]; j < first[lb + 1]; ++j)
                         paths.push_back({pair.data[i * N + j], c.labels[i] + " -> " + c.labels[j]});
-        std::sort(paths.begin(), paths.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        std::ranges::sort(paths, [](const auto& x, const auto& y) { return x.first > y.first; });
         std::printf("\ntwo-head OV path copying (writer OV, then reader OV), top %lld:\n", (long long)top);
         for (size_t n = 0; n < std::min<size_t>(paths.size(), static_cast<size_t>(top)); ++n)
             std::printf("  %s   %.3f\n", paths[n].second.c_str(), paths[n].first);
@@ -710,7 +709,7 @@ int cmd_generate(const Args& a, const Model& m) {
     }
     for (int64_t id : o.stop_tokens)
         if (id < 0 || id >= m.cfg().vocab_size)
-            throw std::invalid_argument("--stop token " + std::to_string(id) + " is outside the vocabulary");
+            throw std::invalid_argument(std::format("--stop token {} is outside the vocabulary", id));
     const bool text = m.has_tokenizer() || !m.vocab().empty();
     Tokens all = prompt;
     size_t printed = 0;
@@ -761,25 +760,18 @@ int cmd_generate(const Args& a, const Model& m) {
             std::string alts;
             for (size_t i = 0; i < st.top_tokens.size(); ++i) {
                 if (st.top_tokens[i] == st.token) continue;
-                char buf[64];
-                std::snprintf(buf, sizeof buf, "%.2f", st.top_probs[i]);
-                alts += (alts.empty() ? "" : ", ") + tok(m, st.top_tokens[i]) + " " + buf;
+                alts += std::format("{}{} {:.2f}", alts.empty() ? "" : ", ", tok(m, st.top_tokens[i]), st.top_probs[i]);
             }
             std::string parts;
             if (additive) {
                 std::vector<size_t> order(st.dla.values.size());
                 for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-                std::sort(order.begin(), order.end(),
-                          [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
+                std::ranges::sort(order, [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
                 for (size_t i = 0; i < std::min<size_t>(3, order.size()); ++i) {
-                    char buf[64];
-                    std::snprintf(buf, sizeof buf, "%s %+.1f", st.dla.labels[order[i]].c_str(),
-                                  st.dla.values[order[i]]);
-                    parts += (parts.empty() ? "" : "  ") + std::string(buf);
+                    parts += std::format("{}{} {:+.1f}", parts.empty() ? "" : "  ", st.dla.labels[order[i]],
+                                         st.dla.values[order[i]]);
                 }
-                char buf[48];
-                std::snprintf(buf, sizeof buf, "  (of %.1f)", st.dla.actual);
-                parts += buf;
+                parts += std::format("  (of {:.1f})", st.dla.actual);
             }
             std::printf("%5lld  %s %6.3f  %-12s %s %s\n", static_cast<long long>(st.position + 1),
                         pad(tok(m, st.token), 14).c_str(), st.prob, from.c_str(), pad(alts, 40).c_str(), parts.c_str());

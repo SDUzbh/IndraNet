@@ -1,5 +1,6 @@
 #include "regex.h"
 
+#include <format>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -92,7 +93,7 @@ class Parser {
     size_t i_ = 0;
 
     [[noreturn]] void fail(const std::string& why) const {
-        throw std::runtime_error("tokenizer regex: " + why + " at offset " + std::to_string(i_) + " in " + src_);
+        throw std::runtime_error(std::format("tokenizer regex: {} at offset {} in {}", why, i_, src_));
     }
     bool more() const { return i_ < p_.size(); }
     char32_t peek() const { return p_[i_]; }

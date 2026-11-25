@@ -118,8 +118,8 @@ class KVCache {
     // or for an fp16 cache fp16 bit patterns (h): half the memory, as the GPU's copy.
     struct Store {
         int64_t H = 0, cap = 0, D = 0;
-        std::vector<float> f;
-        std::vector<uint16_t> h;
+        std::vector<float> f{};
+        std::vector<uint16_t> h{};
     };
     // Per layer. Mutable: reading the CPU side brings it up to date from the GPU first.
     mutable std::vector<Store> k_, v_;

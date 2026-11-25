@@ -2,6 +2,7 @@
 // Not part of the public API.
 #pragma once
 
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -106,7 +107,7 @@ bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool st
 // at most `top`; 0 where that exponent is below -87 (exp under fp32's smallest normal), and for NaN and
 // -inf. The same bits on every platform: exp_weight's operations, four at a time on ARM.
 float exp_weight(float x);  // exp(x) for x <= 0, 0 below -87 and for NaN
-void exp_weights(const float* logits, int64_t n, float top, float scale, float* w);
+void exp_weights(std::span<const float> logits, float top, float scale, std::span<float> w);
 
 // One layer's earlier keys or values for attention, (H, T, D) row-major: float32 (a cached run's hook_k /
 // hook_v, a float32 KV cache) or fp16 bit patterns (a KV cache kept in fp16, read as it is). From a Tensor

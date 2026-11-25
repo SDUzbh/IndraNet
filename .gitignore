@@ -10,3 +10,5 @@ dist/
 build-cmake/
 python/tfi/_tfi*.so
 python/tfi/_tfi*.pyd
+build-asan/
+build-tsan/

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <stdexcept>
 #include <vector>
 
@@ -19,17 +20,16 @@ U32String utf8_decode(const std::string& s) {
     for (size_t i = 0; i < n;) {
         const unsigned char b = p[i];
         int len = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 0;
-        if (len == 0 || i + len > n)
-            throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i) + ")");
+        if (len == 0 || i + len > n) throw std::runtime_error(std::format("text is not valid UTF-8 (byte {})", i));
         char32_t c = len == 1 ? b : len == 2 ? (b & 0x1F) : len == 3 ? (b & 0x0F) : (b & 0x07);
         for (int k = 1; k < len; ++k) {
             if ((p[i + k] & 0xC0) != 0x80)
-                throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i + k) + ")");
+                throw std::runtime_error(std::format("text is not valid UTF-8 (byte {})", i + k));
             c = (c << 6) | (p[i + k] & 0x3F);
         }
         static const char32_t kMin[] = {0, 0, 0x80, 0x800, 0x10000};
         if (c < kMin[len] || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF))
-            throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i) + ")");
+            throw std::runtime_error(std::format("text is not valid UTF-8 (byte {})", i));
         out.push_back(c);
         i += len;
     }
@@ -156,7 +156,7 @@ U32String unicode_nfd(const U32String& s) {
 
 U32String unicode_nfc(const U32String& s) {
     // Text below U+0300 has nothing to decompose or compose: the common case, unchanged.
-    if (std::all_of(s.begin(), s.end(), [](char32_t c) { return c < 0x300; })) return s;
+    if (std::ranges::all_of(s, [](char32_t c) { return c < 0x300; })) return s;
     U32String d = unicode_nfd(s), out;
     out.reserve(d.size());
     size_t starter = std::string::npos;  // index in out of the last starter

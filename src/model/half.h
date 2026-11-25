@@ -1,8 +1,8 @@
 // IEEE half precision (fp16) <-> float32 conversion, scalar and in bulk. Internal.
 #pragma once
 
+#include <bit>
 #include <cstdint>
-#include <cstring>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -26,15 +26,12 @@ inline float half_to_float(uint16_t h) {
         }
     } else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
     else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
+    return std::bit_cast<float>(bits);
 }
 
 // Round to nearest, ties to even (as the hardware conversion); beyond fp16's range gives infinity.
 inline uint16_t float_to_half(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
+    const auto x = std::bit_cast<uint32_t>(f);
     const uint32_t sign = (x >> 16) & 0x8000, ax = x & 0x7FFFFFFF;
     if (ax >= 0x7F800000) return static_cast<uint16_t>(sign | 0x7C00 | (ax > 0x7F800000 ? 0x200 : 0));  // inf, NaN
     if (ax >= 0x477FF000) return static_cast<uint16_t>(sign | 0x7C00);  // >= 65520 rounds to infinity

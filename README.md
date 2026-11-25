@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SDUzbh/IndraNet/actions/workflows/ci.yml/badge.svg)](https://github.com/SDUzbh/IndraNet/actions/workflows/ci.yml)
 
-IndraNet takes trained decoder-only transformers apart. Its core is **tfi**, a dependency-free C++17
+IndraNet takes trained decoder-only transformers apart. Its core is **tfi**, a dependency-free C++20
 engine with named hook points, which runs the standard reverse-engineering methods: logit lens,
 direct logit attribution, head scores, activation patching, ablation and weight-only circuit
 analysis. It also generates text, with hooks at every step, to see what an intervention does to

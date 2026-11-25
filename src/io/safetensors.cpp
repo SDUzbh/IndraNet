@@ -1,5 +1,6 @@
 #include "tfi/safetensors.h"
 
+#include <bit>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -17,12 +18,7 @@ namespace tfi {
 
 namespace {
 
-float bf16_to_f32(uint16_t h) {
-    const uint32_t bits = uint32_t(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+float bf16_to_f32(uint16_t h) { return std::bit_cast<float>(uint32_t(h) << 16); }
 
 }  // namespace
 
@@ -107,7 +103,7 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
             for (size_t m = 0; m < info.keys.size(); ++m) out.metadata[info.keys[m]] = info.values[m].as_string();
             continue;
         }
-        if (name.rfind("__padding", 0) == 0) continue;  // alignment filler (see the header)
+        if (name.starts_with("__padding")) continue;  // alignment filler (see the header)
         const std::string& dtype = info.at("dtype").as_string();
         Shape shape;
         for (const auto& d : info.at("shape").array) shape.push_back(d.as_int());

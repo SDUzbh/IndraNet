@@ -1,5 +1,6 @@
 #include "tfi/config.h"
 
+#include <concepts>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -8,7 +9,7 @@ namespace tfi {
 
 namespace {
 
-template <typename T>
+template <std::integral T>
 std::optional<T> opt_int(const json::Value& v) {
     if (v.is_null()) return std::nullopt;
     return static_cast<T>(v.as_int());
@@ -35,8 +36,8 @@ Biases& Biases::operator=(bool all) {
 }
 
 bool Biases::has(const std::string& part) const {
-    if (!all_parts().count(part)) throw std::logic_error("Biases: unknown part '" + part + "'");
-    return parts.count(part) > 0;
+    if (!all_parts().contains(part)) throw std::logic_error("Biases: unknown part '" + part + "'");
+    return parts.contains(part);
 }
 
 std::string Biases::str() const {
@@ -44,7 +45,7 @@ std::string Biases::str() const {
     if (parts.empty()) return "none";
     std::string out;
     for (const char* p : {"qkv", "o", "mlp", "norm"})
-        if (parts.count(p)) out += (out.empty() ? "" : ",") + std::string(p);
+        if (parts.contains(p)) out += (out.empty() ? "" : ",") + std::string(p);
     return out;
 }
 
@@ -54,7 +55,7 @@ Biases Biases::from_json(const json::Value& v) {
     if (!v.is_array()) throw std::runtime_error("config: bias must be true, false or a list of parts");
     for (const json::Value& p : v.array) {
         const std::string& name = p.as_string();
-        if (!all_parts().count(name))
+        if (!all_parts().contains(name))
             throw std::runtime_error("config: bias part '" + name + "' is not one of qkv, o, mlp, norm");
         if (!b.parts.insert(name).second) throw std::runtime_error("config: bias part '" + name + "' given twice");
     }
@@ -84,7 +85,7 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
         const std::string& k = v.keys[i];
         const json::Value& x = v.values[i];
         if (k == "type") continue;
-        if (!it->second.first.count(k) && !it->second.second.count(k))
+        if (!it->second.first.contains(k) && !it->second.second.contains(k))
             throw std::runtime_error("config: rope_scaling '" + r.type + "' has unknown key '" + k + "'");
         if (k == "factor") r.factor = opt_num(x);
         else if (k == "original_max_position_embeddings") r.original_max_position_embeddings = x.as_int();
@@ -101,7 +102,7 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
         else if (k == "short_factor")
             for (const auto& e : x.array) r.short_factor.push_back(e.as_number());
     }
-    if (it->second.first.count("factor") && !(r.factor && *r.factor > 0))
+    if (it->second.first.contains("factor") && !(r.factor && *r.factor > 0))
         throw std::runtime_error("config: rope_scaling factor must be positive");
     if (r.type == "llama3" && !(r.low_freq_factor < r.high_freq_factor))
         throw std::runtime_error("config: rope_scaling 'llama3' needs low_freq_factor < high_freq_factor");
@@ -112,7 +113,7 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
 
 std::string ModelConfig::mlp_activation() const {
     if (mlp == "swiglu") return "silu";
-    if (mlp == "geglu") return activation.rfind("gelu", 0) == 0 ? activation : "gelu";
+    if (mlp == "geglu") return activation.starts_with("gelu") ? activation : "gelu";
     return activation;
 }
 
@@ -156,7 +157,7 @@ void ModelConfig::apply(const json::Value& f) {
         else if (k == "layer_overrides") {
             layer_overrides.clear();
             for (size_t j = 0; j < v.keys.size(); ++j) layer_overrides[std::stoll(v.keys[j])] = v.values[j];
-        } else if (!kTrainingOnly.count(k)) {
+        } else if (!kTrainingOnly.contains(k)) {
             throw std::runtime_error("config: unknown field '" + k + "' (exported by a newer indranet?)");
         }
     }
@@ -173,7 +174,7 @@ ModelConfig ModelConfig::layer_config(int64_t layer) const {
 
 void ModelConfig::validate() const {
     auto one_of = [](const std::string& field, const std::string& v, const std::set<std::string>& ok) {
-        if (!ok.count(v)) throw std::runtime_error("config: " + field + " '" + v + "' is not supported by tfi");
+        if (!ok.contains(v)) throw std::runtime_error("config: " + field + " '" + v + "' is not supported by tfi");
     };
     one_of("norm", norm, {"rmsnorm", "layernorm", "none"});
     one_of("norm_position", norm_position, {"pre", "post", "sandwich"});

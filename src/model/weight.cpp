@@ -1,7 +1,9 @@
 #include "tfi/weight.h"
 
 #include <algorithm>
+#include <concepts>
 #include <cstdlib>
+#include <format>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
@@ -146,7 +148,7 @@ void direct_range(const float* x, int64_t n_rows, const Weight& W, int64_t j0, i
 // threads than they save (measured on an M5 Pro); with several threads allowed, 4 chunks per thread,
 // so that faster cores take more of them instead of waiting for the slower ones. One thread allowed:
 // no others.
-template <typename F>
+template <std::invocable<int64_t, int64_t> F>
 void run_row_chunks(int64_t total, int64_t in, F&& rows) {
     const int64_t min_rows = std::max<int64_t>(1, (int64_t(1) << 19) / std::max<int64_t>(in, 1));
     const int64_t threads = num_threads();
@@ -211,7 +213,7 @@ Weight::Weight(Tensor t) : shape(t.shape) {
     }
     const size_t bytes = static_cast<size_t>(t.numel()) * sizeof(float);
     std::shared_ptr<void> mem = page_alloc(bytes, capacity_);
-    std::copy(t.data.begin(), t.data.end(), static_cast<float*>(mem.get()));
+    std::ranges::copy(t.data, static_cast<float*>(mem.get()));
     mat_ = std::move(mem);
 }
 
@@ -284,8 +286,7 @@ const Tensor& Weight::f32() const {
 void Weight::read_rows(int64_t begin, int64_t end, float* dst) const {
     if (dim() != 2) throw std::invalid_argument("read_rows needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[0])
-        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
-                                shape_str(shape));
+        throw std::out_of_range(std::format("rows [{}, {}) of {}", begin, end, shape_str(shape)));
     const int64_t c = shape[1];
     if (is_fp16()) detail::halves_to_floats(f16() + begin * c, dst, (end - begin) * c);
     else std::copy(f32_data() + begin * c, f32_data() + end * c, dst);
@@ -294,8 +295,7 @@ void Weight::read_rows(int64_t begin, int64_t end, float* dst) const {
 Tensor Weight::rows(int64_t begin, int64_t end) const {
     if (dim() != 2) throw std::invalid_argument("rows needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[0])
-        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
-                                shape_str(shape));
+        throw std::out_of_range(std::format("rows [{}, {}) of {}", begin, end, shape_str(shape)));
     Tensor out({end - begin, shape[1]});
     read_rows(begin, end, out.ptr());
     return out;
@@ -309,8 +309,7 @@ Tensor Weight::row(int64_t i) const {
 Tensor Weight::cols(int64_t begin, int64_t end) const {
     if (dim() != 2) throw std::invalid_argument("cols needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[1])
-        throw std::out_of_range("cols [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
-                                shape_str(shape));
+        throw std::out_of_range(std::format("cols [{}, {}) of {}", begin, end, shape_str(shape)));
     const int64_t R = shape[0], C = shape[1], n = end - begin;
     Tensor out({R, n});
     for (int64_t r = 0; r < R; ++r) {

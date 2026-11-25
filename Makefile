@@ -8,7 +8,7 @@
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
 #   make CXXFLAGS="-O1 -g -fsanitize=address,undefined" test
 CXXFLAGS ?= -O2
-override CXXFLAGS += -std=c++17 -Wall -Wextra -Iinclude -pthread
+override CXXFLAGS += -std=c++20 -Wall -Wextra -Iinclude -pthread
 LDLIBS :=
 
 BUILD := build

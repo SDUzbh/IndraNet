@@ -5,6 +5,7 @@
 // (pre-norm values, pre-softcap scores, the MLP's up projection). Only activation gradients are
 // computed, no weight gradients, so it costs about as much as one forward pass.
 #include <cmath>
+#include <format>
 #include <stdexcept>
 
 #include "ops.h"
@@ -18,7 +19,7 @@ using detail::merge_heads;
 
 namespace {
 
-std::string lp(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
+std::string lp(int64_t layer) { return std::format("blocks.{}.", layer); }
 
 // dL/dx for y = x W^T (+ b), W (out, in): dy (..., out) -> (..., in).
 Tensor linear_backward(const Tensor& dy, const Weight& W) {
@@ -104,7 +105,7 @@ AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& d
         Tensor Ph({T, T}, std::vector<float>(P.data.begin() + h * T * T, P.data.begin() + (h + 1) * T * T));
 
         Tensor dPh = matmul(dzh, vh, /*transpose_b=*/true);  // dz_h v^T
-        std::copy(dPh.data.begin(), dPh.data.end(), dP.ptr() + h * T * T);
+        std::ranges::copy(dPh.data, dP.ptr() + h * T * T);
         add_from(dv, g, matmul(transpose2d(Ph), dzh));  // P^T dz_h
 
         // Softmax backward, then the softcap's tanh and the scale. Masked entries have P = 0.
@@ -128,7 +129,7 @@ AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& d
         }
         Tensor dqh = matmul(dS, kh);               // dS k
         Tensor dkh = matmul(transpose2d(dS), qh);  // dS^T q
-        std::copy(dqh.data.begin(), dqh.data.end(), dq.ptr() + h * T * D);
+        std::ranges::copy(dqh.data, dq.ptr() + h * T * D);
         add_from(dk, g, dkh);
     }
     AttentionGrads r;

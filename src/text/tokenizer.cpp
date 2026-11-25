@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <format>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -134,7 +135,7 @@ std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& 
                 else out.push_back(p.first);
                 previous_match = p.second;
             }
-            std::reverse(out.begin(), out.end());
+            std::ranges::reverse(out);
             break;
         case Behavior::Contiguous:
             for (const auto& p : parts) {
@@ -144,7 +145,7 @@ std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& 
             }
             break;
     }
-    out.erase(std::remove_if(out.begin(), out.end(), [](const auto& r) { return r.first == r.second; }), out.end());
+    std::erase_if(out, [](const auto& r) { return r.first == r.second; });
     return out;
 }
 
@@ -155,8 +156,8 @@ const char* kGpt2Pattern = R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p
 struct Tokenizer::Impl {
     struct Normalizer {
         enum Kind { NFC, NFD, Replace, Prepend } kind;
-        Pattern pattern;
-        U32String content;  // Replace: the replacement; Prepend: what is prepended
+        Pattern pattern{};
+        U32String content{};  // Replace: the replacement; Prepend: what is prepended
     };
     struct PreTokenizer {
         enum Kind { ByteLevel, Split, Metaspace } kind;
@@ -231,12 +232,13 @@ struct Tokenizer::Impl {
         if (type == "Sequence") {
             for (const json::Value& s : n.at("normalizers").array) parse_normalizer(s);
         } else if (type == "NFC" || type == "NFD") {
-            normalizers.push_back({type == "NFC" ? Normalizer::NFC : Normalizer::NFD, {}, {}});
+            normalizers.push_back({.kind = type == "NFC" ? Normalizer::NFC : Normalizer::NFD});
         } else if (type == "Replace") {
-            normalizers.push_back(
-                {Normalizer::Replace, pattern_of(n.at("pattern")), utf8_decode(n.at("content").as_string())});
+            normalizers.push_back({.kind = Normalizer::Replace,
+                                   .pattern = pattern_of(n.at("pattern")),
+                                   .content = utf8_decode(n.at("content").as_string())});
         } else if (type == "Prepend") {
-            normalizers.push_back({Normalizer::Prepend, {}, utf8_decode(n.at("prepend").as_string())});
+            normalizers.push_back({.kind = Normalizer::Prepend, .content = utf8_decode(n.at("prepend").as_string())});
         } else {
             unsupported("normalizer '" + type + "'");
         }
@@ -495,9 +497,7 @@ struct Tokenizer::Impl {
             if (byte_fallback) {  // the character's UTF-8 bytes as <0xNN> tokens, if all exist
                 std::vector<int64_t> bytes;
                 for (unsigned char b : ch) {
-                    char name[8];
-                    std::snprintf(name, sizeof name, "<0x%02X>", b);
-                    auto bt = vocab.find(name);
+                    auto bt = vocab.find(std::format("<0x{:02X}>", b));
                     if (bt == vocab.end()) break;
                     bytes.push_back(bt->second);
                 }
@@ -586,7 +586,7 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special
     const std::string mark = m.space_mark ? utf8_encode(U32String(1, m.space_mark)) : std::string();
     std::string out;
     for (int64_t id : ids) {
-        if (id < 0) throw std::out_of_range("token " + std::to_string(id) + " is negative");
+        if (id < 0) throw std::out_of_range(std::format("token {} is negative", id));
         // Ids with no token (a model's padded vocabulary rows) give nothing, as in Hugging Face.
         if (id >= static_cast<int64_t>(m.id_kind.size()) || m.id_kind[id] < 0) continue;
         const std::string& tok = m.id_text[id];
@@ -598,8 +598,8 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special
                 if (c < byte_of.size() && byte_of[c] >= 0) out.push_back(static_cast<char>(byte_of[c]));
                 else out += utf8_encode(U32String(1, c));
             }
-        } else if (m.byte_fallback && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>' &&
-                   hex(tok[3]) >= 0 && hex(tok[4]) >= 0) {  // <0xNN>: one byte
+        } else if (m.byte_fallback && tok.size() == 6 && tok.starts_with("<0x") && tok[5] == '>' && hex(tok[3]) >= 0 &&
+                   hex(tok[4]) >= 0) {  // <0xNN>: one byte
             out.push_back(static_cast<char>(hex(tok[3]) * 16 + hex(tok[4])));
         } else if (!mark.empty()) {
             for (size_t i = 0; i < tok.size();) {

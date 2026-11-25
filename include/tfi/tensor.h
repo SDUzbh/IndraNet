@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,15 @@ struct Tensor {
     bool empty() const { return data.empty(); }
     float* ptr() { return data.data(); }
     const float* ptr() const { return data.data(); }
+    // Row i of the last dimension (the leading dimensions taken as one), as a view of the data.
+    std::span<float> row_view(int64_t i) {
+        const int64_t w = shape.empty() ? 1 : shape.back();
+        return {data.data() + i * w, static_cast<size_t>(w)};
+    }
+    std::span<const float> row_view(int64_t i) const {
+        const int64_t w = shape.empty() ? 1 : shape.back();
+        return {data.data() + i * w, static_cast<size_t>(w)};
+    }
 
     float& at(std::initializer_list<int64_t> idx);
     float at(std::initializer_list<int64_t> idx) const;
@@ -53,14 +63,14 @@ Tensor rows(const Tensor& A, int64_t begin, int64_t end);  // A[begin:end] of a 
 Tensor cols(const Tensor& A, int64_t begin, int64_t end);  // A[:, begin:end] of a 2-D tensor
 Tensor row(const Tensor& A, int64_t i);                    // A[i] as 1-D
 
-float dot(const float* a, const float* b, int64_t n);
+float dot(std::span<const float> a, std::span<const float> b);  // over a; b at least as long
 float frobenius(const Tensor& a);
 float max_abs_diff(const Tensor& a, const Tensor& b);
 float max_abs(const Tensor& a);
 
-void softmax_(float* v, int64_t n);
-float log_softmax_at(const float* v, int64_t n, int64_t idx);
-std::vector<int64_t> topk(const float* v, int64_t n, int64_t k);  // indices, largest first
-int64_t rank_of(const float* v, int64_t n, int64_t idx);          // 0 = largest
+void softmax_(std::span<float> v);
+float log_softmax_at(std::span<const float> v, int64_t idx);
+std::vector<int64_t> topk(std::span<const float> v, int64_t k);  // indices, largest first
+int64_t rank_of(std::span<const float> v, int64_t idx);          // 0 = largest
 
 }  // namespace tfi

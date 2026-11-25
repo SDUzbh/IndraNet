@@ -2,10 +2,11 @@
 // The forward pass itself is checked against PyTorch by python/tests/test_golden.py (golden tests).
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -100,7 +101,7 @@ static Model random_model(ModelConfig cfg, uint64_t seed = 0, WeightFormat forma
     if (!cfg.tie_embeddings) randn("unembed.weight", {cfg.vocab_size, d}, 0.2f);
     for (int64_t i = 0; i < cfg.n_layers; ++i) {
         const ModelConfig c = cfg.layer_config(i);
-        const std::string p = "blocks." + std::to_string(i) + ".";
+        const std::string p = std::format("blocks.{}.", i);
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
         norm(p + "ln1", c, d);
         lin(p + "attn.q_proj", c, H * D, d, 0.5f);
@@ -297,7 +298,7 @@ static void test_cache_and_hooks(const std::string& name, const Model& m) {
     ActivationCache cache;
     const Tensor logits = m.run_with_cache(t, cache);
     CHECK(cache.size() == m.hook_names().size());
-    for (const auto& n : m.hook_names()) CHECK(cache.count(n));
+    for (const auto& n : m.hook_names()) CHECK(cache.contains(n));
     CHECK(max_abs_diff(logits, m.forward(t)) == 0.f);
 
     // Causality: changing the last token leaves earlier logits untouched.
@@ -310,8 +311,7 @@ static void test_cache_and_hooks(const std::string& name, const Model& m) {
 
     // A zero-ablation hook changes the output.
     Hooks zero;
-    zero.add("blocks.1.hook_attn_out",
-             [](const std::string&, Tensor& a) { std::fill(a.data.begin(), a.data.end(), 0.f); });
+    zero.add("blocks.1.hook_attn_out", [](const std::string&, Tensor& a) { std::ranges::fill(a.data, 0.f); });
     CHECK(max_abs_diff(m.forward(t, &zero), logits) > 0.f);
     (void)V;
     (void)name;
@@ -325,9 +325,9 @@ static void test_logit_lens(const Model& m) {
     // The last stage is the model's real output distribution.
     Tensor logits = m.forward(t);
     Tensor last = rows(logits, 8, 9);
-    softmax_(last.ptr(), m.cfg().vocab_size);
+    softmax_(last.data);
     CHECK_NEAR(lens.back().target_prob, last.data[7], 1e-5);
-    CHECK(lens.back().top_tokens[0] == topk(last.ptr(), m.cfg().vocab_size, 1)[0]);
+    CHECK(lens.back().top_tokens[0] == topk(last.data, 1)[0]);
 }
 
 static void test_dla(const Model& m) {
@@ -413,8 +413,8 @@ static Tensor naive_patch(const Model& m, const Tokens& clean, const Tokens& cor
     const float base = logit_metric(m.forward(corrupt), pos, target, other);
     Tensor out({L, T}, NAN);
     for (int64_t i = 0; i < L; ++i) {
-        const std::string name = "blocks." + std::to_string(i) + ".hook_" + site;
-        if (!cc.count(name)) continue;
+        const std::string name = std::format("blocks.{}.hook_{}", i, site);
+        if (!cc.contains(name)) continue;
         const Tensor& src = cc.at(name);
         for (int64_t t = 0; t < T; ++t) {
             Hooks h;
@@ -435,7 +435,7 @@ static Tensor naive_patch_heads(const Model& m, const Tokens& clean, const Token
     const float base = logit_metric(m.forward(corrupt), pos, target, other);
     Tensor out({L, H}, NAN);
     for (int64_t i = 0; i < L; ++i) {
-        const std::string name = "blocks." + std::to_string(i) + ".attn.hook_z";
+        const std::string name = std::format("blocks.{}.attn.hook_z", i);
         const Tensor& src = cc.at(name);
         const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
         for (int64_t hd = 0; hd < Hl; ++hd) {
@@ -507,7 +507,7 @@ static std::vector<NaiveAblation> naive_ablation(const Model& m, const Tokens& t
             ActivationCache c;
             m.run_with_cache(r, c, [](const std::string& n) { return n.find("attn.hook_z") != std::string::npos; });
             for (int64_t l = 0; l < L; ++l) {
-                const Tensor& z = c.at("blocks." + std::to_string(l) + ".attn.hook_z");
+                const Tensor& z = c.at(std::format("blocks.{}.attn.hook_z", l));
                 const int64_t row = z.numel() / z.shape[0];
                 if (static_cast<int64_t>(na.means.layers.size()) <= l) {  // hook_z's shape, one row or one per position
                     Shape shape = z.shape;
@@ -592,9 +592,8 @@ static void test_optimized_patching_matches_naive(const Model& m, bool cpu_parts
         ActivationCache cache;
         const Tensor full = m.run_with_cache(t, cache);
         for (int64_t l = 0; l <= m.cfg().n_layers; ++l) {
-            const Tensor start = l < m.cfg().n_layers
-                                     ? cache.at("blocks." + std::to_string(l) + ".hook_resid_pre")
-                                     : cache.at("blocks." + std::to_string(l - 1) + ".hook_resid_post");
+            const Tensor start = l < m.cfg().n_layers ? cache.at(std::format("blocks.{}.hook_resid_pre", l))
+                                                      : cache.at(std::format("blocks.{}.hook_resid_post", l - 1));
             CHECK(max_abs_diff(m.forward_from(l, start), full) == 0.f);
         }
         CHECK_THROWS(m.forward_from(-1, cache.at("blocks.0.hook_resid_pre")));
@@ -825,7 +824,7 @@ static float direct_ov_path(const Model& m, const std::vector<std::pair<int64_t,
             for (int64_t j = 0; j < d; ++j) U.data[v * d + j] *= m.weight("ln_final.weight").f32().data[j];
     const Tensor logits = matmul(X, U, true);
     int64_t hits = 0;
-    for (int64_t i = 0; i < n; ++i) hits += topk(logits.ptr() + i * V, V, 1)[0] == i * V / n;
+    for (int64_t i = 0; i < n; ++i) hits += topk(logits.row_view(i), 1)[0] == i * V / n;
     return float(hits) / float(n);
 }
 
@@ -882,7 +881,7 @@ static void test_copying_and_positional() {
     std::map<std::string, Tensor> w;
     for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
     for (int64_t l = 0; l < 2; ++l) {
-        const std::string p = "blocks." + std::to_string(l) + ".attn.";
+        const std::string p = std::format("blocks.{}.attn.", l);
         Tensor I({16, 16});
         for (int64_t i = 0; i < 16; ++i) I.at({i, i}) = 1.f;
         w[p + "v_proj.weight"] = I;
@@ -962,9 +961,7 @@ static void test_half_conversion() {
         if (i != 5) same &= h[i] == float_to_half(f[i]);
 #if defined(__aarch64__)
         const __fp16 x = static_cast<__fp16>(f[i]);
-        uint16_t bits;
-        std::memcpy(&bits, &x, 2);
-        if (i != 5) hw &= bits == float_to_half(f[i]);
+        if (i != 5) hw &= std::bit_cast<uint16_t>(x) == float_to_half(f[i]);
 #endif
     }
     CHECK(same);
@@ -1083,7 +1080,7 @@ static void test_fp16_model(const Model& m16) {
     r.run_with_gradients(t, dlogits, gr);
     CHECK(g16.size() == gr.size());
     for (const auto& kv : gr)
-        CHECK(g16.count(kv.first) &&
+        CHECK(g16.contains(kv.first) &&
               max_abs_diff(g16.at(kv.first), kv.second) <= 1e-4f * std::max(1.f, max_abs(kv.second)));
     const Model copy = m16;  // copies share the fp16 values
     CHECK(copy.forward(t).data == a.data);
@@ -1116,9 +1113,9 @@ static void write_safetensors(const std::string& path, const std::string& cfg_js
         if (aligned && kv.second.dim() == 2 && data.size() % kAlign) {
             const size_t at = data.size(), pad = kAlign - at % kAlign;
             data.append(pad, '\0');
-            header += ", \"__padding" + std::to_string(pads++) + "\": {\"dtype\": \"U8\", \"shape\": [" +
-                      std::to_string(pad) + "], \"data_offsets\": [" + std::to_string(at) + ", " +
-                      std::to_string(data.size()) + "]}";
+            header +=
+                std::format(", \"__padding{}\": {{\"dtype\": \"U8\", \"shape\": [{}], \"data_offsets\": [{}, {}]}}",
+                            pads++, pad, at, data.size());
         }
         const size_t begin = data.size();
         for (float v : kv.second.data) {
@@ -1130,16 +1127,15 @@ static void write_safetensors(const std::string& path, const std::string& cfg_js
             if (type == "F16") {
                 hb = detail::float_to_half(v);
             } else {
-                uint32_t x;
-                std::memcpy(&x, &v, 4);
+                const auto x = std::bit_cast<uint32_t>(v);
                 hb = static_cast<uint16_t>((x + 0x7FFF + ((x >> 16) & 1)) >> 16);
             }
             data.append(reinterpret_cast<const char*>(&hb), 2);
         }
         std::string shape;
-        for (int64_t d : kv.second.shape) shape += (shape.empty() ? "" : ", ") + std::to_string(d);
-        header += ", \"" + kv.first + "\": {\"dtype\": \"" + type + "\", \"shape\": [" + shape +
-                  "], \"data_offsets\": [" + std::to_string(begin) + ", " + std::to_string(data.size()) + "]}";
+        for (int64_t d : kv.second.shape) shape += std::format("{}{}", (shape.empty() ? "" : ", "), d);
+        header += std::format(", \"{}\": {{\"dtype\": \"{}\", \"shape\": [{}], \"data_offsets\": [{}, {}]}}", kv.first,
+                              type, shape, begin, data.size());
     }
     header += "}";
     if (aligned) header.append((kAlign - (8 + header.size()) % kAlign) % kAlign, ' ');
@@ -1155,10 +1151,8 @@ static void write_safetensors(const std::string& path, const std::string& cfg_js
 static float stored(float v, const std::string& dtype) {
     if (dtype == "F16") return detail::half_to_float(detail::float_to_half(v));
     if (dtype == "BF16") {
-        uint32_t x;
-        std::memcpy(&x, &v, 4);
-        x = ((x + 0x7FFF + ((x >> 16) & 1)) >> 16) << 16;
-        std::memcpy(&v, &x, 4);
+        const auto x = std::bit_cast<uint32_t>(v);
+        v = std::bit_cast<float>(((x + 0x7FFF + ((x >> 16) & 1)) >> 16) << 16);
     }
     return v;
 }
@@ -1208,7 +1202,7 @@ static void check_load(const std::string& path, const std::string& cfg_json, con
 }
 
 static void test_fp16_load() {
-    const std::string path = "/tmp/tfi_unit_fp16_" + std::to_string(::getpid()) + ".safetensors";
+    const std::string path = std::format("/tmp/tfi_unit_fp16_{}.safetensors", ::getpid());
     const ModelConfig cfg = tiny([](ModelConfig& c) {
         c.bias = true;
         c.norm = "layernorm";
@@ -1275,14 +1269,14 @@ static void test_bias_parts() {
 
     const ModelConfig qkv = tiny([](ModelConfig& c) { c.bias = Biases::from_json(json::parse(R"(["qkv"])")); });
     const Model m = random_model(qkv, 3);
-    CHECK(m.weights().count("blocks.0.attn.k_proj.bias") && !m.weights().count("blocks.0.attn.o_proj.bias") &&
-          !m.weights().count("blocks.0.mlp.up.bias"));
+    CHECK(m.weights().contains("blocks.0.attn.k_proj.bias") && !m.weights().contains("blocks.0.attn.o_proj.bias") &&
+          !m.weights().contains("blocks.0.mlp.up.bias"));
     // q, k and v biases change the output (they are used), and match the computation spelled out
     std::map<std::string, Tensor> w;
     for (const auto& e : m.weights()) w[e.first] = e.second.to_tensor();
     auto zeroed = w;
     for (auto& e : zeroed)
-        if (e.first.find("_proj.bias") != std::string::npos) std::fill(e.second.data.begin(), e.second.data.end(), 0.f);
+        if (e.first.find("_proj.bias") != std::string::npos) std::ranges::fill(e.second.data, 0.f);
     const Tokens t = seq(9, 4);
     CHECK(max_abs_diff(Model(qkv, zeroed).forward(t), m.forward(t)) > 1e-3f);
     // a bias the config doesn't name: refused, whichever part it belongs to
@@ -1298,7 +1292,7 @@ static void test_bias_parts() {
     const ModelConfig per_layer =
         tiny([](ModelConfig& c) { c.layer_overrides[1] = json::parse(R"({"bias": ["o"]})"); });
     const Model pl = random_model(per_layer, 5);
-    CHECK(pl.weights().count("blocks.1.attn.o_proj.bias") && !pl.weights().count("blocks.0.attn.o_proj.bias"));
+    CHECK(pl.weights().contains("blocks.1.attn.o_proj.bias") && !pl.weights().contains("blocks.0.attn.o_proj.bias"));
 }
 
 // The tokenizer's parts on their own (the whole tokenizer is checked against Hugging Face's
@@ -1445,13 +1439,13 @@ static void test_gpu_chunks() {
         std::vector<size_t> ticket_chunk;  // ticket -> chunk's first group
         std::map<size_t, int> fail;        // chunk's first group -> failures left
         size_t submit(const Chunk& c) override {
-            log.push_back("s" + std::to_string(c.first));
+            log.push_back(std::format("s{}", c.first));
             ticket_chunk.push_back(c.first);
             return ticket_chunk.size() - 1;
         }
         bool wait(size_t t) override {
             const size_t c = ticket_chunk.at(t);
-            log.push_back("w" + std::to_string(c));
+            log.push_back(std::format("w{}", c));
             if (fail[c] > 0) {
                 --fail[c];
                 return false;
@@ -1532,7 +1526,7 @@ static void test_d_mlp_zero_is_default() {
 // a shape whose element count overflows 64 bits (or any product of its leading dimensions does), one
 // larger than the file, a negative dimension, a byte count that doesn't match. Zero-size tensors load.
 static void test_safetensors_bad_shapes() {
-    const std::string path = "/tmp/tfi_unit_shapes_" + std::to_string(::getpid()) + ".safetensors";
+    const std::string path = std::format("/tmp/tfi_unit_shapes_{}.safetensors", ::getpid());
     auto write = [&](const std::string& tensor_json, size_t data_bytes) {
         const std::string header = "{" + tensor_json + "}";
         std::ofstream f(path, std::ios::binary);
@@ -1582,15 +1576,12 @@ static void test_vector_math() {
     // the float k steps above zero, -k for k steps below (0 is -0.0, as nextafter from below gives),
     // so jumping 16 at a time visits them without stepping through the 15 in between.
     auto order = [](float x) {
-        uint32_t b;
-        std::memcpy(&b, &x, 4);
+        const auto b = std::bit_cast<uint32_t>(x);
         return (b >> 31) ? -static_cast<int64_t>(b & 0x7FFFFFFFu) : static_cast<int64_t>(b);
     };
     auto from_order = [](int64_t k) {
         const uint32_t b = k <= 0 ? 0x80000000u | static_cast<uint32_t>(-k) : static_cast<uint32_t>(k);
-        float x;
-        std::memcpy(&x, &b, 4);
-        return x;
+        return std::bit_cast<float>(b);
     };
     auto sweep = [&](float lo, float hi, auto f, auto ref, double max_ulp) {
         double worst = 0;
@@ -1610,7 +1601,7 @@ static void test_vector_math() {
     CHECK(std::isnan(vm::exp(nan)) && std::isnan(vm::erf(nan)) && std::isnan(vm::tanh(nan)));
     // Softmax: masked (-inf) entries are exactly 0, the rest sum to 1.
     float row[11] = {0.5f, -inf, 3.f, -1.f, -inf, 2.f, 0.f, 1.f, -2.f, 4.f, -inf};
-    softmax_(row, 11);
+    softmax_(row);
     CHECK(row[1] == 0.f && row[4] == 0.f && row[10] == 0.f);
     double total = 0;
     for (float v : row) total += v;
@@ -1716,7 +1707,7 @@ static void test_gpu_seq() {
         for (int a = 0; a < 6; ++a) {
             Tensor want = xs;
             detail::activate_(want, names[a]);
-            std::copy(xs.data.begin(), xs.data.end(), s.reserve(0, xs.numel()));
+            std::ranges::copy(xs.data, s.reserve(0, xs.numel()));
             s.activate(0, xs.numel(), static_cast<detail::GpuAct>(a));
             s.run(false);
             for (int64_t i = 0; i < xs.numel(); ++i) near(s.data(0)[i], want.data[i], 1e-6f);
@@ -1726,8 +1717,8 @@ static void test_gpu_seq() {
         Tensor gate({n}), up({n});
         for (float& v : gate.data) v = 3.f * nd(rng);
         for (float& v : up.data) v = nd(rng);
-        std::copy(gate.data.begin(), gate.data.end(), s.reserve(1, n));
-        std::copy(up.data.begin(), up.data.end(), s.reserve(2, n));
+        std::ranges::copy(gate.data, s.reserve(1, n));
+        std::ranges::copy(up.data, s.reserve(2, n));
         s.reserve(3, n);
         s.reserve(4, n);
         s.glu(1, 2, n, detail::GpuAct::Silu);
@@ -1751,7 +1742,7 @@ static void test_gpu_seq() {
         const auto g = detail::Gpu::create();
         for (const bool layernorm : {true, false}) {
             detail::Gpu::Seq s(*g);
-            std::copy(x.data.begin(), x.data.end(), s.reserve(0, rows * d));
+            std::ranges::copy(x.data, s.reserve(0, rows * d));
             s.reserve(1, rows * d);
             s.norm(0, 1, rows, w, layernorm ? &b : nullptr, layernorm, 1e-5f);
             s.run(false);
@@ -1786,7 +1777,7 @@ static void test_gpu_seq() {
         const auto g = detail::Gpu::create();
         auto run_seq = [&](const Tensor& xin, const Tensor& bias, bool fp16) {
             detail::Gpu::Seq s(*g);
-            std::copy(xin.data.begin(), xin.data.end(), s.reserve(0, R * k));
+            std::ranges::copy(xin.data, s.reserve(0, R * k));
             s.reserve(1, R * h);
             s.reserve(2, R * k);
             s.reserve(3, R * k);
@@ -1938,7 +1929,7 @@ static void test_gpu_attention_long() {
         const int64_t L = c.n_layers, d = c.d_model, T = 48;
         ActivationCache cache;
         m.run_with_cache(seq(T, 9), cache);
-        auto lp = [](int64_t i) { return "blocks." + std::to_string(i) + "."; };
+        auto lp = [](int64_t i) { return std::format("blocks.{}.", i); };
         detail::RowBatch rb;
         for (int64_t i = 0; i < L; ++i) {
             rb.prefix_k.push_back(&cache.at(lp(i) + "attn.hook_k"));
@@ -2012,7 +2003,7 @@ static void test_gpu_single_pass(const Model& m, int64_t T) {
     Tensor cpu_edited;
     std::map<std::string, int> cpu_calls;
     const Tensor cpu_logits = pass(Device::Cpu, true, cpu, cpu_edited, cpu_calls);
-    CHECK(cpu.count("blocks.0.attn.hook_pattern") == 1);
+    CHECK(cpu.contains("blocks.0.attn.hook_pattern"));
     for (bool resident : {true, false}) {
         ActivationCache gpu;
         Tensor gpu_edited;
@@ -2020,8 +2011,8 @@ static void test_gpu_single_pass(const Model& m, int64_t T) {
         near(pass(Device::Gpu, resident, gpu, gpu_edited, gpu_calls), cpu_logits);
         CHECK(gpu.size() == cpu.size());
         for (const auto& [name, want] : cpu) {
-            CHECK(gpu.count(name) == 1);
-            if (gpu.count(name)) {
+            CHECK(gpu.contains(name));
+            if (gpu.contains(name)) {
                 CHECK(gpu.at(name).shape == want.shape);
                 if (gpu.at(name).shape == want.shape)
                     CHECK(max_abs_diff(gpu.at(name), want) <= tol_for(m, 1e-3) * std::max(1.f, max_abs(want)));
@@ -2048,8 +2039,7 @@ static void test_gpu_single_pass(const Model& m, int64_t T) {
     // Both mode, default thresholds: where the rule says the CPU, the CPU, bit for bit.
     double weights = 0;
     for (const auto& kv : m.weights())
-        if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0)
-            weights += static_cast<double>(kv.second.numel());
+        if (kv.second.dim() == 2 && kv.first.starts_with("blocks.")) weights += static_cast<double>(kv.second.numel());
     const int64_t L = m.cfg().n_layers;
     if (!detail::single_pass_on_gpu(T, L, weights / static_cast<double>(L), true, detail::gpu_min_rows(),
                                     detail::gpu_min_work())) {
@@ -2080,7 +2070,7 @@ static void test_gpu_captures(const Model& m, int64_t T) {
         Hooks h;
         auto store = [&got](const std::string& n, Tensor& a) { got[n] = a; };
         if (capture_first) h.add_capture(all, store);
-        h.add_filter([](const std::string& n) { return n.find("blocks.0.") == 0; }, nudge);  // edits in block 0 only
+        h.add_filter([](const std::string& n) { return n.starts_with("blocks.0."); }, nudge);  // edits in block 0 only
         if (!capture_first) h.add_capture(all, store);
         const Tensor logits = m.forward(t, &h);
         set_device(Device::Both);
@@ -2093,8 +2083,8 @@ static void test_gpu_captures(const Model& m, int64_t T) {
         CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
         CHECK(gpu.size() == cpu.size());
         for (const auto& [name, w] : cpu) {
-            CHECK(gpu.count(name) == 1);
-            if (gpu.count(name) && gpu.at(name).shape == w.shape)
+            CHECK(gpu.contains(name));
+            if (gpu.contains(name) && gpu.at(name).shape == w.shape)
                 CHECK(max_abs_diff(gpu.at(name), w) <= 1e-3f * std::max(1.f, max_abs(w)));
             else CHECK(false);
         }
@@ -2116,7 +2106,7 @@ static void test_gpu_single_pass_defaults() {
     }
     double weights = 0;
     for (const auto& kv : m.weights())
-        if (kv.second.dim() == 2 && kv.first.rfind("blocks.0.", 0) == 0)
+        if (kv.second.dim() == 2 && kv.first.starts_with("blocks.0."))
             weights += static_cast<double>(kv.second.numel());
     CHECK(weights >= detail::kSinglePassLayerWeights);
     for (int64_t T : {1, 2}) {
@@ -2145,7 +2135,7 @@ static void test_gpu_resident(const Model& m) {
     const Tokens t = seq(T, 7);
     ActivationCache cache;
     m.run_with_cache(t, cache);
-    auto lp = [](int64_t i) { return "blocks." + std::to_string(i) + "."; };
+    auto lp = [](int64_t i) { return std::format("blocks.{}.", i); };
     const Tensor fin = m.final_norm(cache.at(lp(L - 1) + "hook_resid_post"));
     // A whole sequence and two that start later, reading earlier keys and values from the cache.
     detail::RowBatch rb;
@@ -2202,7 +2192,7 @@ static void test_gpu_resident(const Model& m) {
         calls.clear();
         check_close(a, pass(false, false, &h));
         CHECK(seen == calls);
-        CHECK(seen.count(lp(mid) + edited) == 1 && seen.count(lp(L - 1) + "attn.hook_z") == 1);
+        CHECK(seen.contains(lp(mid) + edited) && seen.contains(lp(L - 1) + "attn.hook_z"));
         CHECK(max_abs_diff(a, got) > 0.f);
         // fp16: close, and really used.
         const Tensor h16 = pass(true, true, nullptr);
@@ -2236,7 +2226,7 @@ static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens 
     for (int64_t i = 0; i < L; ++i)
         for (const char* n :
              {"hook_resid_pre", "hook_resid_mid", "hook_resid_post", "hook_attn_out", "hook_mlp_out", "attn.hook_z"})
-            names.push_back("blocks." + std::to_string(i) + "." + n);
+            names.push_back(std::format("blocks.{}.{}", i, n));
     for (const int64_t other : {int64_t(-1), int64_t(7)}) {
         // dF/dlogits of one row: log softmax at `target`, or logit[target] - logit[other].
         auto row_grad = [&](const float* logits, float* out) {
@@ -2275,8 +2265,8 @@ static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens 
                 want);
             set_device(dev);
             for (const std::string& n : names) {
-                CHECK(got[g].count(n) == want.count(n));
-                if (!got[g].count(n) || !want.count(n)) continue;
+                CHECK(got[g].contains(n) == want.contains(n));
+                if (!got[g].contains(n) || !want.contains(n)) continue;
                 const Tensor &a = got[g].at(n), &b = want.at(n);
                 CHECK(a.shape == b.shape);
                 if (a.shape == b.shape) CHECK(max_abs_diff(a, b) <= 1e-4f * std::max(1.f, max_abs(b)));
@@ -2287,7 +2277,7 @@ static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens 
     const auto only_embed = m.gradients_rows(
         x0, rb, [&](int64_t, const Tensor& l) { return Tensor(l.shape, 0.f); },
         [](const std::string& n) { return n == "hook_embed"; });
-    CHECK(only_embed[0].size() == 1 && only_embed[0].count("hook_embed") == 1);
+    CHECK(only_embed[0].size() == 1 && only_embed[0].contains("hook_embed"));
     detail::RowBatch later = rb;
     later.start[1] = 2;
     CHECK_THROWS(m.gradients_rows(x0, later, [&](int64_t, const Tensor& l) { return Tensor(l.shape, 0.f); }, nullptr));
@@ -2357,8 +2347,8 @@ static void test_heterogeneous_heads() {
 
     const DLAResult dla = direct_logit_attribution(m, t, 9, 1, 2);
     CHECK_NEAR(dla.sum, dla.actual, 1e-3 * std::max(1.f, std::fabs(dla.actual)));
-    CHECK(std::find(dla.labels.begin(), dla.labels.end(), "L2H7") != dla.labels.end());
-    CHECK(std::find(dla.labels.begin(), dla.labels.end(), "L0H2") == dla.labels.end());
+    CHECK(std::ranges::find(dla.labels, "L2H7") != dla.labels.end());
+    CHECK(std::ranges::find(dla.labels, "L0H2") == dla.labels.end());
 }
 
 // The backward pass against central finite differences of the metric, at every hook point. The
@@ -2373,8 +2363,8 @@ static void test_gradients(const Model& m) {
         std::mt19937_64 rng(11);
         std::normal_distribution<float> normal(0.f, 1.f);
         for (const std::string& n : m.hook_names()) {
-            CHECK(grads.count(n) == 1);
-            if (!grads.count(n)) continue;
+            CHECK(grads.contains(n));
+            if (!grads.contains(n)) continue;
             const Tensor& g = grads.at(n);
             CHECK(g.shape == acts.at(n).shape);
             Tensor r(g.shape);
@@ -2392,7 +2382,7 @@ static void test_gradients(const Model& m) {
             // Central differences at h and h/2, Richardson-extrapolated: error O(h^4) instead of O(h^2).
             const double h = 1e-2, fd1 = (f(h) - f(-h)) / (2 * h), fd2 = (f(h / 2) - f(-h / 2)) / h;
             const double fd = (4 * fd2 - fd1) / 3;
-            const double an = dot(g.ptr(), v.ptr(), g.numel());
+            const double an = dot(g.data, v.data);
             const bool ok = std::fabs(fd - an) <= 2e-3 * std::max({1.0, std::fabs(fd), std::fabs(an)});
             CHECK(ok);
             if (!ok)
@@ -2616,7 +2606,7 @@ static void test_gpu_fp16_matches_rounded(const Model& m16) {
     const Tokens t = seq(T, 7);
     ActivationCache cache;
     m16.run_with_cache(t, cache);
-    auto lp = [](int64_t i) { return "blocks." + std::to_string(i) + "."; };
+    auto lp = [](int64_t i) { return std::format("blocks.{}.", i); };
     detail::RowBatch b16, br;
     for (int64_t i = 0; i < L; ++i) {
         b16.prefix_k.push_back(&cache.at(lp(i) + "attn.hook_k"));
@@ -2663,7 +2653,7 @@ static void test_gpu_fp16_matches_rounded(const Model& m16) {
     CHECK(a.size() == b.size());
     for (size_t s = 0; s < a.size() && s < b.size(); ++s) {
         CHECK(a[s].size() == b[s].size() && !a[s].empty());
-        for (const auto& kv : b[s]) CHECK(a[s].count(kv.first) && a[s].at(kv.first).data == kv.second.data);
+        for (const auto& kv : b[s]) CHECK(a[s].contains(kv.first) && a[s].at(kv.first).data == kv.second.data);
     }
     detail::set_gpu_min_rows(0);
     detail::set_gpu_min_work(0);
@@ -2717,8 +2707,8 @@ static void test_gpu_batch() {
     const Weight B16 = Weight::fp16(B), B32(B);
     detail::Gpu::Batch batch(*g);
     const int a = batch.buffer(A.numel()), bk = batch.buffer(Bk.numel());
-    std::copy(A.data.begin(), A.data.end(), batch.floats(a));
-    std::copy(Bk.data.begin(), Bk.data.end(), batch.floats(bk));
+    std::ranges::copy(A.data, batch.floats(a));
+    std::ranges::copy(Bk.data, batch.floats(bk));
     const int w16 = batch.weight(B16), w32 = batch.weight(B32);
     const int c1 = batch.buffer(30 * 60), c2 = batch.buffer(30 * 60), c3 = batch.buffer(40 * 33);
     // C (30, 50) at column 5 of a 60-wide buffer = A[5:35, 10:70] B[20:70, 10:70]^T.
@@ -2756,7 +2746,7 @@ static void test_gpu_batch() {
             sums_ok &= std::fabs(batch.floats(sums)[bi * 5 + bj] - want) <= 1e-4 * std::max(1.0, want);
         }
     for (int64_t r = 0; r < 40; ++r)
-        top_ok &= int64_t(batch.uints(top)[r]) == topk(batch.floats(c3) + r * 33, 33, 1)[0];
+        top_ok &= int64_t(batch.uints(top)[r]) == topk(std::span(batch.floats(c3) + r * 33, 33), 1)[0];
     CHECK(sums_ok && top_ok);
     // Ties: the first index wins.
     const int tie = batch.buffer(2 * 600), tie_top = batch.buffer(2);
@@ -2945,7 +2935,7 @@ static void test_device_modes() {
 // Memory-mapped weights on the GPU: a model loaded in place from an aligned file (float32 and fp16)
 // gives what the CPU gives on every GPU path, the GPU using the mapping as it uses its own memory.
 static void test_gpu_mapped_weights() {
-    const std::string path = "/tmp/tfi_unit_mapped_" + std::to_string(::getpid()) + ".safetensors";
+    const std::string path = std::format("/tmp/tfi_unit_mapped_{}.safetensors", ::getpid());
     const ModelConfig cfg = tiny([](ModelConfig& c) {
         c.bias = true;
         c.norm = "layernorm";
@@ -3002,8 +2992,8 @@ static void test_gpu_wide_heads() {
         CHECK(!threw);
         if (!threw) {
             CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
-            CHECK(both.count("blocks.0.attn.hook_pattern") == 1);
-            if (both.count("blocks.0.attn.hook_pattern"))
+            CHECK(both.contains("blocks.0.attn.hook_pattern"));
+            if (both.contains("blocks.0.attn.hook_pattern"))
                 CHECK(max_abs_diff(both.at("blocks.0.attn.hook_pattern"), cpu.at("blocks.0.attn.hook_pattern")) <=
                       1e-4f);
         }
@@ -3119,8 +3109,8 @@ static void test_forward_cached(const Model& m) {
         }
         check_close(stack_rows(parts), full);
         for (int64_t l = 0; l < L; ++l) {
-            check_close(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
-            check_close(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+            check_close(cache.keys(l), acts.at(std::format("blocks.{}.attn.hook_k", l)));
+            check_close(cache.values(l), acts.at(std::format("blocks.{}.attn.hook_v", l)));
         }
     }
     KVCache cache;
@@ -3153,7 +3143,7 @@ static void test_forward_cached(const Model& m) {
                            [&](const std::string& n, Tensor& a) { seen[n] = a; });
         m.forward_cached(Tokens(t.begin() + 9, t.end()), c, &capture);
         for (int64_t l = 0; l < L; ++l) {
-            const std::string p = "blocks." + std::to_string(l) + ".";
+            const std::string p = std::format("blocks.{}.", l);
             check_close(seen.at(p + "attn.hook_pattern"), pattern_rows(acts.at(p + "attn.hook_pattern"), 9, 3));
             check_close(seen.at(p + "hook_resid_post"), rows(acts.at(p + "hook_resid_post"), 9, T));
         }
@@ -3174,7 +3164,7 @@ static void test_forward_cached(const Model& m) {
         };
         KVCache c;
         m.forward_cached(t, c);
-        const std::string top = "blocks." + std::to_string(L - 1) + ".";
+        const std::string top = std::format("blocks.{}.", L - 1);
         Hooks edit;
         edit.add(top + "attn.hook_k", [](const std::string&, Tensor& k) {
             for (float& x : k.data) x *= 1.5f;
@@ -3184,13 +3174,13 @@ static void test_forward_cached(const Model& m) {
         });
         for (int64_t b : {int64_t(0), L - 1})
             for (int64_t p : {int64_t(0), int64_t(4), T - 1}) {
-                const Tensor in = rows(acts.at("blocks." + std::to_string(b) + ".hook_resid_pre"), p, p + 1);
+                const Tensor in = rows(acts.at(std::format("blocks.{}.hook_resid_pre", b)), p, p + 1);
                 KVCache r = c;
                 check_close(m.rerun_cached(b, p, in, r), rows(full, p, p + 1));
                 CHECK(r.size() == T);
                 for (int64_t l = 0; l < L; ++l) {
-                    check_close(r.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
-                    check_close(r.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+                    check_close(r.keys(l), acts.at(std::format("blocks.{}.attn.hook_k", l)));
+                    check_close(r.values(l), acts.at(std::format("blocks.{}.attn.hook_v", l)));
                 }
                 KVCache step = c;
                 step.truncate(p);
@@ -3237,7 +3227,7 @@ static void test_forward_cached(const Model& m) {
             for (int64_t r = 0; r < z.shape[0]; ++r)
                 std::fill(z.ptr() + r * z.shape[1] * D, z.ptr() + r * z.shape[1] * D + D, 0.f);
         });
-        edit.add("blocks." + std::to_string(L - 1) + ".attn.hook_k", [](const std::string&, Tensor& k) {
+        edit.add(std::format("blocks.{}.attn.hook_k", L - 1), [](const std::string&, Tensor& k) {
             for (float& x : k.data) x *= 1.5f;
         });
         edit.add("blocks.0.attn.hook_pattern", [](const std::string&, Tensor& P) {  // the first key's weight, doubled
@@ -3394,7 +3384,7 @@ static Hooks round_kv_to_half(const Model& m) {
     Hooks h;
     for (int64_t l = 0; l < m.cfg().n_layers; ++l)
         for (const char* n : {".attn.hook_k", ".attn.hook_v"})
-            h.add("blocks." + std::to_string(l) + n, [](const std::string&, Tensor& a) {
+            h.add(std::format("blocks.{}{}", l, n), [](const std::string&, Tensor& a) {
                 for (float& v : a.data)
                     v = detail::half_to_float(detail::float_to_half(std::clamp(v, -65504.f, 65504.f)));
             });
@@ -3426,7 +3416,7 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
     close(stack_rows(parts), want);
     for (int64_t l = 0; l < m16.cfg().n_layers; ++l) {
         const Tensor k = cache.keys(l);
-        close(k, acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
+        close(k, acts.at(std::format("blocks.{}.attn.hook_k", l)));
         bool exact = true;  // every stored value an fp16 one
         for (float v : k.data) exact = exact && detail::half_to_float(detail::float_to_half(v)) == v;
         CHECK(exact);
@@ -3507,17 +3497,13 @@ static void test_kv_clamped(const Model& m16, const Model& m32) {
     int64_t must = 0, may = 0;
     Hooks seen;
     seen.extend(huge);
-    seen.add_capture(
-        [](const std::string& n) {
-            return n.size() > 7 &&
-                   (n.compare(n.size() - 7, 7, ".hook_k") == 0 || n.compare(n.size() - 7, 7, ".hook_v") == 0);
-        },
-        [&](const std::string&, Tensor& a) {
-            for (float v : a.data) {
-                must += std::fabs(v) > 65520.f;
-                may += std::fabs(v) >= 65488.f;
-            }
-        });
+    seen.add_capture([](const std::string& n) { return n.ends_with(".hook_k") || n.ends_with(".hook_v"); },
+                     [&](const std::string&, Tensor& a) {
+                         for (float v : a.data) {
+                             must += std::fabs(v) > 65520.f;
+                             may += std::fabs(v) >= 65488.f;
+                         }
+                     });
     {
         const Device d = device();
         set_device(Device::Cpu);
@@ -3590,8 +3576,7 @@ static void test_generate(const Model& m) {
     o.max_new_tokens = 8;
     // Hooks at every step: the same tokens as forward() with the hook, step by step.
     Hooks zero;
-    zero.add("blocks.0.hook_attn_out",
-             [](const std::string&, Tensor& a) { std::fill(a.data.begin(), a.data.end(), 0.f); });
+    zero.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& a) { std::ranges::fill(a.data, 0.f); });
     const Tokens hooked = generate(m, prompt, o, &zero);
     seqn = prompt;
     for (int64_t step = 0; step < 8; ++step) {
@@ -3686,7 +3671,7 @@ static void test_generate_trace(const Model& m) {
             ActivationCache acts;
             const Tensor lg = m.run_with_cache(text, acts, nullptr, hooks);
             Tensor p = rows(lg, pos, pos + 1);
-            softmax_(p.ptr(), p.shape[1]);
+            softmax_(p.data);
             CHECK_NEAR(st.prob, p.data[st.token], 1e-4);
             CHECK_NEAR(st.logprob, std::log(p.data[st.token]), 1e-3);
             CHECK(st.top_tokens.size() == 3 && st.top_probs[0] >= st.top_probs[2]);
@@ -3708,11 +3693,11 @@ static void test_generate_trace(const Model& m) {
             }
             size_t a = 0;  // the heads' most attended positions = the whole pass's pattern row
             for (int64_t l = 0; l < m.cfg().n_layers; ++l) {
-                const Tensor& P = acts.at("blocks." + std::to_string(l) + ".attn.hook_pattern");
+                const Tensor& P = acts.at(std::format("blocks.{}.attn.hook_pattern", l));
                 const int64_t H = P.shape[0], T = P.shape[1];
                 for (int64_t h = 0; h < H && a < st.attention.size(); ++h, ++a) {
                     const TraceStep::Attention& at = st.attention[a];
-                    CHECK(at.head == "L" + std::to_string(l) + "H" + std::to_string(h) && at.positions.size() == 2);
+                    CHECK(at.head == std::format("L{}H{}", l, h) && at.positions.size() == 2);
                     for (size_t j = 0; j < at.positions.size(); ++j)
                         CHECK_NEAR(at.weights[j], P.data[(h * T + pos) * T + at.positions[j]], 1e-4);
                 }
@@ -3781,7 +3766,7 @@ static void test_generate_speculative(const Model& m, const Model& other) {
         Hooks zero;
         zero.add("hook_final", [&](const std::string&, Tensor& a) {
             const int k = calls++;
-            if (k == 4 || k == 9 || k == 11) std::fill(a.data.begin(), a.data.end(), 0.f);
+            if (k == 4 || k == 9 || k == 11) std::ranges::fill(a.data, 0.f);
         });
         o.speculative.draft_tokens = 0;
         const Tokens want = generate(m, prompt, o, &zero);
@@ -3899,17 +3884,17 @@ static void test_speculative_sampling() {
         std::vector<double> want(125, 0), p1, p2, p3;
         Sampler exact(o);
         const Tensor l1 = m.forward(prompt);
-        exact.distribution(l1.ptr() + (l1.shape[0] - 1) * 5, 5, p1);
+        exact.distribution(l1.row_view(l1.shape[0] - 1), p1);
         for (int64_t a = 0; a < 5; ++a) {
             Tokens t = prompt;
             t.push_back(a);
             const Tensor l2 = m.forward(t);
-            exact.distribution(l2.ptr() + (l2.shape[0] - 1) * 5, 5, p2);
+            exact.distribution(l2.row_view(l2.shape[0] - 1), p2);
             for (int64_t b = 0; b < 5; ++b) {
                 Tokens u = t;
                 u.push_back(b);
                 const Tensor l3 = m.forward(u);
-                exact.distribution(l3.ptr() + (l3.shape[0] - 1) * 5, 5, p3);
+                exact.distribution(l3.row_view(l3.shape[0] - 1), p3);
                 for (int64_t e = 0; e < 5; ++e) want[static_cast<size_t>((a * 5 + b) * 5 + e)] = p1[a] * p2[b] * p3[e];
             }
         }
@@ -3950,7 +3935,7 @@ static void test_speculative_small_draft() {
     int left = 0;
     for (uint64_t seed = 0; seed < 20; ++seed) {
         const Tokens prompt = seq(6, seed, 20), plain = generate(m, prompt, o);
-        left += std::any_of(plain.begin(), plain.end() - 1, [](int64_t t) { return t >= 20; });
+        left += std::ranges::any_of(plain.begin(), plain.end() - 1, [](int64_t t) { return t >= 20; });
         CHECK(speculate(prompt) == plain);
         CHECK(st.steps + st.accepted == static_cast<int64_t>(plain.size()));
     }
@@ -3976,7 +3961,7 @@ struct RuntimeHookRun {
 using RuntimeHookSetup = std::function<void(RuntimeHookRun&)>;
 
 static std::vector<std::pair<std::string, RuntimeHookSetup>> runtime_hook_setups(const Model& m) {
-    const std::string first = "blocks.0.", last = "blocks." + std::to_string(m.cfg().n_layers - 1) + ".";
+    const std::string first = "blocks.0.", last = std::format("blocks.{}.", m.cfg().n_layers - 1);
     const std::string A = first + "hook_resid_post", B = last + "hook_resid_post", Z = first + "attn.hook_z",
                       K = first + "attn.hook_k", P = first + "attn.hook_pattern";
     using Edit = std::function<void(Tensor&, std::vector<float>&)>;
@@ -4511,7 +4496,7 @@ static void test_tiny_temperature() {
             o.temperature = temp;
             o.top_p = top_p;
             std::vector<double> p;
-            Sampler(o).distribution(logits.data(), 4, p);
+            Sampler(o).distribution(std::span(logits.data(), 4), p);
             CHECK(p == (std::vector<double>{0, 1, 0, 0}));
             o.speculative.draft_tokens = 0;
             CHECK(generate(m, prompt, o) == greedy);
@@ -4526,7 +4511,7 @@ static void test_tiny_temperature() {
     o = GenerateOptions{};
     o.temperature = 3e-39;
     std::vector<double> p;
-    Sampler(o).distribution(logits.data(), 4, p);
+    Sampler(o).distribution(std::span(logits.data(), 4), p);
     CHECK(p == (std::vector<double>{0, 0.5, 0, 0.5}));
 }
 
@@ -4537,12 +4522,12 @@ static void test_sampler() {
     auto freqs = [&](GenerateOptions o, int n) {
         Sampler s(o);
         std::vector<double> f(logits.size(), 0);
-        for (int i = 0; i < n; ++i) f[s(logits.data(), static_cast<int64_t>(logits.size()))] += 1.0 / n;
+        for (int i = 0; i < n; ++i) f[s(logits)] += 1.0 / n;
         return f;
     };
     auto dist = [&](GenerateOptions o) {  // what speculative decoding's acceptance rule uses
         std::vector<double> d;
-        Sampler(o).distribution(logits.data(), static_cast<int64_t>(logits.size()), d);
+        Sampler(o).distribution(logits, d);
         return d;
     };
     auto softmax = [&](std::vector<int> keep, double temp) {
@@ -4594,9 +4579,9 @@ static void test_sampler() {
     }
     const std::vector<float> tie = {3.f, 5.f, 5.f};
     Sampler greedy(o);
-    CHECK(greedy(tie.data(), 3) == 1);  // the lowest id among equal logits
+    CHECK(greedy(tie) == 1);  // the lowest id among equal logits
     const std::vector<float> none = {-INFINITY, std::nanf("")};
-    CHECK_THROWS(greedy(none.data(), 2));
+    CHECK_THROWS(greedy(none));
 
     // The sampler finds top_k and the nucleus without sorting: it picks exactly what sorting every token
     // would, on a vocabulary-sized row (peaked and flat), pick for pick from the same seed. The rule: the k
@@ -4611,8 +4596,8 @@ static void test_sampler() {
             row[static_cast<size_t>(i)] = row[static_cast<size_t>(i + 1)];  // equal logits
         row[5] = -INFINITY;
         row[6] = std::nanf("");
-        const float top = *std::max_element(
-            row.begin(), row.end(), [](float x, float y) { return std::isnan(y) ? false : std::isnan(x) || x < y; });
+        const float top = *std::ranges::max_element(
+            row, [](float x, float y) { return std::isnan(y) ? false : std::isnan(x) || x < y; });
         for (const double top_p : {0.5, 0.9, 0.99, 1.0})
             for (const int64_t top_k : {int64_t(0), int64_t(50), int64_t(5000)})
                 for (const double temp : {0.7, 1.5}) {
@@ -4627,7 +4612,7 @@ static void test_sampler() {
                     for (int64_t i = 0; i < 20000; ++i)
                         if (!std::isnan(row[static_cast<size_t>(i)]) && row[static_cast<size_t>(i)] != -INFINITY)
                             by_logit.push_back(i);
-                    std::stable_sort(by_logit.begin(), by_logit.end(), [&](int64_t x, int64_t y) {
+                    std::ranges::stable_sort(by_logit, [&](int64_t x, int64_t y) {
                         return row[static_cast<size_t>(x)] > row[static_cast<size_t>(y)];
                     });
                     if (top_k && static_cast<size_t>(top_k) < by_logit.size())
@@ -4640,8 +4625,7 @@ static void test_sampler() {
                         c.push_back({detail::exp_weight(d * scale), i});
                         mass += c.back().first;
                     }
-                    std::stable_sort(c.begin(), c.end(),
-                                     [](const auto& x, const auto& y) { return x.first > y.first; });
+                    std::ranges::stable_sort(c, [](const auto& x, const auto& y) { return x.first > y.first; });
                     size_t n = c.size();
                     if (top_p < 1) {
                         double sum = 0;
@@ -4652,7 +4636,7 @@ static void test_sampler() {
                     }
                     std::vector<std::pair<int64_t, float>> kept;  // id order
                     for (size_t i = 0; i < n; ++i) kept.push_back({c[i].second, c[i].first});
-                    std::sort(kept.begin(), kept.end());
+                    std::ranges::sort(kept);
                     for (int pick = 0; pick < 100; ++pick) {
                         double total = 0;
                         for (const auto& k : kept) total += k.second;
@@ -4666,7 +4650,7 @@ static void test_sampler() {
                                 break;
                             }
                         }
-                        CHECK(fast(row.data(), static_cast<int64_t>(row.size())) == want);
+                        CHECK(fast(row) == want);
                     }
                 }
     }
@@ -4677,7 +4661,7 @@ static void test_sampler() {
         so.top_k = k;
         so.top_p = p;
         std::vector<double> d;
-        Sampler(so).distribution(lg.data(), static_cast<int64_t>(lg.size()), d);
+        Sampler(so).distribution(lg, d);
         std::vector<int64_t> ids;
         for (size_t i = 0; i < d.size(); ++i)
             if (d[i] > 0) ids.push_back(static_cast<int64_t>(i));
@@ -4706,7 +4690,7 @@ static void test_sampler() {
                              -INFINITY, std::nanf(""), -3.25f, -10.f, -50.f};
     for (int i = 0; i < 1000; ++i) xs.push_back(-90.f * static_cast<float>(i) / 1000.f);
     std::vector<float> ws(xs.size());
-    detail::exp_weights(xs.data(), static_cast<int64_t>(xs.size()), 0.f, 1.f, ws.data());
+    detail::exp_weights(xs, 0.f, 1.f, ws);
     for (size_t i = 0; i < xs.size(); ++i) {
         const float d = xs[i] - 0.f;
         CHECK(ws[i] == detail::exp_weight(d * 1.f));
@@ -4724,7 +4708,7 @@ static void test_sampler() {
         go.seed = 4;
         Sampler gs(go);
         std::vector<int64_t> picks;
-        for (int i = 0; i < 12; ++i) picks.push_back(gs(lg.data(), 1000));
+        for (int i = 0; i < 12; ++i) picks.push_back(gs(std::span(lg.data(), 1000)));
         CHECK((picks == std::vector<int64_t>{762, 411, 537, 56, 470, 52, 831, 37, 704, 751, 618, 408}));
     }
 }
@@ -4874,8 +4858,8 @@ static void test_kv_random(const Model& m, uint64_t seed) {
         } else if (kind == 4) {  // keys() brings the CPU side up to date
             const auto acts = reference(history).second;
             const int64_t l = pick(0, L - 1);
-            near(cache.keys(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_k"));
-            near(cache.values(l), acts.at("blocks." + std::to_string(l) + ".attn.hook_v"));
+            near(cache.keys(l), acts.at(std::format("blocks.{}.attn.hook_k", l)));
+            near(cache.values(l), acts.at(std::format("blocks.{}.attn.hook_v", l)));
         } else if (kind == 5) {  // continue on a copy (it has no GPU copy of its own yet)
             cache = KVCache(cache);
         } else if (pick(0, 1) ==
@@ -4921,7 +4905,7 @@ static void test_kv_random(const Model& m, uint64_t seed) {
             const int i = static_cast<int>(pick(0, 2));
             if (!hist[i].empty()) {
                 const auto acts = reference(hist[i]).second;
-                near(batch[i].keys(L - 1), acts.at("blocks." + std::to_string(L - 1) + ".attn.hook_k"));
+                near(batch[i].keys(L - 1), acts.at(std::format("blocks.{}.attn.hook_k", L - 1)));
             }
         } else {
             batch = KVBatch(batch);  // a copy: keys and values on the CPU, no GPU copy
@@ -5049,8 +5033,7 @@ int main(int argc, char** argv) {
     }
     int selected = 0;
     auto run = [&](const std::string& group, const std::string& name, const std::function<void()>& fn) {
-        if ((!only.empty() && std::find(only.begin(), only.end(), group) == only.end()) ||
-            name.find(filter) == std::string::npos)
+        if ((!only.empty() && std::ranges::find(only, group) == only.end()) || name.find(filter) == std::string::npos)
             return;
         ++selected;
         if (list) {

@@ -5,7 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <format>
 #include <map>
 #include <memory>
 #include <optional>
@@ -302,12 +302,12 @@ struct DecodeRuntime::Impl {
         for (size_t i = 0; i < names.size(); ++i) index_of[names[i]] = i;
         // (A trace keeps each pass's activations whole: its tokens are computed again from the start.)
         resume = !trace;
-        routed.add_filter([this](const std::string& n) { return index_of.count(n) && cur.changes(n); },
+        routed.add_filter([this](const std::string& n) { return index_of.contains(n) && cur.changes(n); },
                           [this](const std::string& n, Tensor& a) { at_point(n, a); });
         routed.add_capture(
-            [this](const std::string& n) { return index_of.count(n) && !cur.changes(n) && cur.matches(n); },
+            [this](const std::string& n) { return index_of.contains(n) && !cur.changes(n) && cur.matches(n); },
             [this](const std::string& n, Tensor& a) { at_point(n, a); });
-        routed.add_capture([this](const std::string& n) { return record.count(n) > 0; },
+        routed.add_capture([this](const std::string& n) { return record.contains(n); },
                            [this](const std::string& n, Tensor& a) {
                                if (kind == PassKind::Speculative) recorded[record.at(n)] = a;
                            });
@@ -323,7 +323,7 @@ struct DecodeRuntime::Impl {
             started = true;
             ctx.push_back(t);
             ++emitted;
-            if (stop.count(t) || emitted >= o.max_new_tokens) finished = true;
+            if (stop.contains(t) || emitted >= o.max_new_tokens) finished = true;
             if (speculate && o.speculative.stats) *o.speculative.stats = stats;
             return t;
         } catch (...) {
@@ -334,7 +334,7 @@ struct DecodeRuntime::Impl {
 
     void add_trace(Hooks& h) {
         TraceRecorder* r = &*rec;
-        h.add_capture([r](const std::string& n) { return r->points.count(n) > 0; },
+        h.add_capture([r](const std::string& n) { return r->points.contains(n); },
                       [r](const std::string& n, Tensor& a) { r->capture(n, a); });
     }
 
@@ -353,15 +353,11 @@ struct DecodeRuntime::Impl {
         Point s;
         s.name = n;
         s.index = i;
-        auto ends = [&](const char* e) {
-            const size_t l = std::strlen(e);
-            return n.size() >= l && n.compare(n.size() - l, l, e) == 0;
-        };
-        s.pattern = ends("attn.hook_pattern");
-        s.row_dim = s.pattern || ends("attn.hook_q") || ends("attn.hook_k") || ends("attn.hook_v") ? 1 : 0;
-        if (n.compare(0, 7, "blocks.") == 0) s.block = std::stoll(n.substr(7));
+        s.pattern = n.ends_with("attn.hook_pattern");
+        s.row_dim = s.pattern || n.ends_with("attn.hook_q") || n.ends_with("attn.hook_k") || n.ends_with("attn.hook_v");
+        if (n.starts_with("blocks.")) s.block = std::stoll(n.substr(7));
         else if (n == "hook_final") s.block = n_layers - 1;
-        s.resume = ends(".hook_resid_post") && s.block + 1 < n_layers ? s.block + 1 : s.block;
+        s.resume = n.ends_with(".hook_resid_post") && s.block + 1 < n_layers ? s.block + 1 : s.block;
         return points.emplace(n, std::move(s)).first->second;
     }
 
@@ -373,8 +369,8 @@ struct DecodeRuntime::Impl {
         L = model.forward_cached(prompt, cache, plain_pass(), /*last_only=*/true);
         V = L.shape[1];
         if (speculate) stats.steps = 1;
-        const int64_t t = sample(L.ptr(), V);
-        if (trace) trace->push_back(rec->step(L.ptr(), V, t, cache.size() - 1));
+        const int64_t t = sample(L.data);
+        if (trace) trace->push_back(rec->step(L.data, t, cache.size() - 1));
         if (rec && speculate) rec->all_rows = true;
         return t;
     }
@@ -435,7 +431,7 @@ struct DecodeRuntime::Impl {
             if (!kv.second.expected) continue;
             for (int64_t b : {kv.second.block, kv.second.resume}) {
                 if (b < 0) continue;
-                const std::string n = "blocks." + std::to_string(b) + ".hook_resid_pre";
+                const std::string n = std::format("blocks.{}.hook_resid_pre", b);
                 const auto p = points.find(n);
                 if (p == points.end() || !p->second.expected) record[n] = b;
             }
@@ -461,25 +457,23 @@ struct DecodeRuntime::Impl {
         if (k <= 0) return;
         if (draft) {
             if (!greedy && q.size() < static_cast<size_t>(k)) q.resize(static_cast<size_t>(k));
-            const int64_t dv = draft->cfg().vocab_size;
             Tensor dl =
                 draft->forward_cached(Tokens(ctx.begin() + draft_cache.size(), ctx.end()), draft_cache, nullptr, true);
             for (int64_t i = 0; i < k; ++i) {
                 if (greedy) {  // its distribution would be one-hot at this token
-                    proposals.push_back((*draft_sample)(dl.ptr(), dv));
+                    proposals.push_back((*draft_sample)(dl.data));
                 } else {
-                    draft_sample->distribution(dl.ptr(), dv, q[static_cast<size_t>(i)]);
+                    draft_sample->distribution(dl.data, q[static_cast<size_t>(i)]);
                     proposals.push_back(draft_sample->draw(q[static_cast<size_t>(i)]));
                 }
                 // A token past the model's vocabulary (a draft with more rows) ends the proposals: the model
                 // can't run it, and it is rejected below, as its probability under the model is 0.
-                if (proposals.back() >= model.cfg().vocab_size || stop.count(proposals.back())) break;
+                if (proposals.back() >= model.cfg().vocab_size || stop.contains(proposals.back())) break;
                 if (i + 1 < k) dl = draft->forward_cached({proposals.back()}, draft_cache, nullptr, true);
             }
         } else if (!o.speculative.draft) {
             proposals = lookup_draft(ctx, o.speculative.ngram, k);
-            const auto s =
-                std::find_if(proposals.begin(), proposals.end(), [&](int64_t t) { return stop.count(t) > 0; });
+            const auto s = std::ranges::find_if(proposals, [&](int64_t t) { return stop.contains(t); });
             if (s != proposals.end()) proposals.erase(s + 1, proposals.end());
         }
     }
@@ -488,7 +482,7 @@ struct DecodeRuntime::Impl {
     // from max(0, p - q); past the last proposal, the model's own.
     int64_t choose() {
         V = L.shape[1];
-        const float* lg = L.ptr() + row * V;
+        const std::span<const float> lg = L.row_view(row);
         int64_t t;
         bool accepted = false;
         if (row < static_cast<int64_t>(proposals.size())) {
@@ -496,11 +490,11 @@ struct DecodeRuntime::Impl {
             t = proposals[r];
             if (greedy) {  // p and q are one-hot: the proposal is kept if it is the model's pick, which replaces it if
                            // not
-                const int64_t best = sample(lg, V);
+                const int64_t best = sample(lg);
                 accepted = best == t;
                 t = best;
             } else {
-                sample.distribution(lg, V, p);
+                sample.distribution(lg, p);
                 const std::vector<double>* qi = draft ? &q[r] : nullptr;
                 const double pt = t < V ? p[static_cast<size_t>(t)] : 0, qt = qi ? (*qi)[static_cast<size_t>(t)] : 1;
                 accepted = pt > 0 && (pt >= qt || sample.uniform() * qt < pt);
@@ -515,9 +509,9 @@ struct DecodeRuntime::Impl {
                 }
             }
         } else {
-            t = sample(lg, V);
+            t = sample(lg);
         }
-        if (trace) trace->push_back(rec->step(lg, V, t, pos + row, row));
+        if (trace) trace->push_back(rec->step(lg, t, pos + row, row));
         if (accepted) {
             ++stats.accepted;
             ++kept;
@@ -598,7 +592,7 @@ struct DecodeRuntime::Impl {
     // Row `row`'s input to block b, (1, d_model), from this pass; empty if not kept.
     Tensor input_to(int64_t b) const {
         if (b < 0 || b >= n_layers) return {};
-        const std::string n = "blocks." + std::to_string(b) + ".hook_resid_pre";
+        const std::string n = std::format("blocks.{}.hook_resid_pre", b);
         const auto p = points.find(n);
         if (p != points.end() && seen[p->second.index])
             return static_cast<size_t>(row) <= p->second.in.size() ? p->second.in[static_cast<size_t>(row) - 1]

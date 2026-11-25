@@ -8,19 +8,16 @@
 // The reductions use 8 independent accumulators so they vectorize without -ffast-math.
 #pragma once
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <limits>
+#include <span>
 
 namespace tfi {
 namespace vm {
 
-inline float from_bits(int32_t i) {
-    float f;
-    std::memcpy(&f, &i, sizeof f);
-    return f;
-}
+inline float from_bits(int32_t i) { return std::bit_cast<float>(i); }
 
 // 2^n as a float, for integer n in [-126, 127].
 inline float pow2i(int32_t n) { return from_bits((n + 127) << 23); }
@@ -92,7 +89,9 @@ inline float tanh(float x) {
 }
 
 // Sum of v[0..n), accumulated in 8 lanes.
-inline float sum(const float* v, int64_t n) {
+inline float sum(std::span<const float> values) {
+    const float* v = values.data();
+    const int64_t n = std::ssize(values);
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int64_t i = 0;
     for (; i + 8 <= n; i += 8)
@@ -103,7 +102,9 @@ inline float sum(const float* v, int64_t n) {
 }
 
 // Sum of (v[i] - c)^2 over v[0..n), accumulated in 8 lanes.
-inline float sum_sq_dev(const float* v, int64_t n, float c) {
+inline float sum_sq_dev(std::span<const float> values, float c) {
+    const float* v = values.data();
+    const int64_t n = std::ssize(values);
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int64_t i = 0;
     for (; i + 8 <= n; i += 8)
@@ -117,7 +118,9 @@ inline float sum_sq_dev(const float* v, int64_t n, float c) {
 }
 
 // Largest of v[0..n), skipping NaN (like a std::max loop); -inf for n = 0.
-inline float max(const float* v, int64_t n) {
+inline float max(std::span<const float> values) {
+    const float* v = values.data();
+    const int64_t n = std::ssize(values);
     const float ninf = -std::numeric_limits<float>::infinity();
     float acc[8] = {ninf, ninf, ninf, ninf, ninf, ninf, ninf, ninf};
     int64_t i = 0;
@@ -130,12 +133,12 @@ inline float max(const float* v, int64_t n) {
 }
 
 // In-place softmax of v[0..n).
-inline void softmax(float* v, int64_t n) {
-    if (n <= 0) return;
-    const float mx = vm::max(v, n);
-    for (int64_t i = 0; i < n; ++i) v[i] = vm::exp(v[i] - mx);
-    const float total = vm::sum(v, n);
-    for (int64_t i = 0; i < n; ++i) v[i] /= total;
+inline void softmax(std::span<float> v) {
+    if (v.empty()) return;
+    const float mx = vm::max(v);
+    for (float& x : v) x = vm::exp(x - mx);
+    const float total = vm::sum(v);
+    for (float& x : v) x /= total;
 }
 
 }  // namespace vm

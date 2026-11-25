@@ -10,8 +10,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <map>
 #include <mutex>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -1201,11 +1203,11 @@ struct Gpu::Seq::Impl {
 
     Slot& slot(int i) {
         if (i < 0 || static_cast<size_t>(i) >= slots.size() || !slots[i].buf)
-            throw std::logic_error("Gpu::Seq: slot " + std::to_string(i) + " was not reserved");
+            throw std::logic_error(std::format("Gpu::Seq: slot {} was not reserved", i));
         return slots[i];
     }
     void need(int i, int64_t floats) {
-        if (slot(i).floats < floats) throw std::logic_error("Gpu::Seq: slot " + std::to_string(i) + " is too small");
+        if (slot(i).floats < floats) throw std::logic_error(std::format("Gpu::Seq: slot {} is too small", i));
     }
     id<MTLComputeCommandEncoder> compute() {
         if (!enc) enc = [cmd computeCommandEncoder];
@@ -1377,7 +1379,7 @@ struct Gpu::Seq::Impl {
                     need(op.e, op.n);
                 }
                 if (op.n == 0) break;
-                const ActArgs args{u32(op.n), static_cast<int32_t>(op.act), std::sqrt(2.f / 3.14159265358979323846f)};
+                const ActArgs args{u32(op.n), static_cast<int32_t>(op.act), std::sqrt(2.f / std::numbers::pi_v<float>)};
                 id<MTLComputeCommandEncoder> e = compute();
                 [e setComputePipelineState:glu ? g.glu_bwd_k : g.act_bwd_k];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
@@ -1416,7 +1418,7 @@ struct Gpu::Seq::Impl {
                 need(op.a, op.n);
                 if (op.kind == Op::Glu) need(op.b, op.n);
                 if (op.n == 0) break;
-                const ActArgs args{u32(op.n), static_cast<int32_t>(op.act), std::sqrt(2.f / 3.14159265358979323846f)};
+                const ActArgs args{u32(op.n), static_cast<int32_t>(op.act), std::sqrt(2.f / std::numbers::pi_v<float>)};
                 id<MTLComputeCommandEncoder> e = compute();
                 [e setComputePipelineState:op.kind == Op::Act ? g.act_k : g.glu_k];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
@@ -1485,8 +1487,8 @@ struct Gpu::Seq::Impl {
             case Op::Attention: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
-                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " +
-                                                std::to_string(kMaxHeadDim));
+                    throw std::invalid_argument(
+                        std::format("Gpu::Seq: attention needs a head size of 1 to {}", kMaxHeadDim));
                 if (A.Hkv <= 0 || A.H % A.Hkv)
                     throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 need(op.a, A.rows * A.H * A.D);
@@ -1623,8 +1625,8 @@ struct Gpu::Seq::Impl {
             case Op::AttentionBwd: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
-                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " +
-                                                std::to_string(kMaxHeadDim));
+                    throw std::invalid_argument(
+                        std::format("Gpu::Seq: attention needs a head size of 1 to {}", kMaxHeadDim));
                 if (A.Hkv <= 0 || A.H % A.Hkv)
                     throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 const int64_t nq = A.rows * A.H * A.D, nkv = A.rows * A.Hkv * A.D;
@@ -2064,7 +2066,7 @@ struct Gpu::Batch::Impl {
 
     Buf& at(int i) {
         if (i < 0 || static_cast<size_t>(i) >= bufs.size() || !bufs[i].buf)
-            throw std::logic_error("Gpu::Batch: no buffer " + std::to_string(i));
+            throw std::logic_error(std::format("Gpu::Batch: no buffer {}", i));
         return bufs[i];
     }
     static uint32_t u32(int64_t n) {

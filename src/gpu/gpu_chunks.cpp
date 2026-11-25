@@ -1,6 +1,7 @@
 #include "gpu_chunks.h"
 
 #include <atomic>
+#include <format>
 #include <string>
 
 namespace tfi {
@@ -63,7 +64,7 @@ void run_chunks(ChunkBackend& backend, const std::vector<Chunk>& chunks, int ret
     for (size_t i : failed) {
         bool ok = false;
         for (int attempt = 0; attempt < retries && !ok; ++attempt) ok = finished_ok(backend, backend.submit(chunks[i]));
-        if (!ok) throw GpuFailure("GPU: a chunk of work failed " + std::to_string(retries + 1) + " times");
+        if (!ok) throw GpuFailure(std::format("GPU: a chunk of work failed {} times", retries + 1));
     }
 }
 

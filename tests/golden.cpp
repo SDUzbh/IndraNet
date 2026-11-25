@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
         int failures = 0, checked = 0;
         for (const auto& kv : ref.tensors) {
             std::string name = kv.first;
-            if (name.rfind("cache.", 0) == 0) name = name.substr(6);
+            if (name.starts_with("cache.")) name = name.substr(6);
             auto it = cache.find(name);
             if (it == cache.end()) {
                 std::printf("MISSING  %s (in reference, not produced by tfi)\n", name.c_str());
@@ -67,12 +67,12 @@ int main(int argc, char** argv) {
             }
         }
         // A partial reference (e.g. a Hugging Face model's logits and residual stream) checks only what it has.
-        const bool partial = ref.metadata.count("partial") > 0;
+        const bool partial = ref.metadata.contains("partial");
         for (const auto& kv : cache) {
             if (partial) break;
-            const bool bare = kv.first == "logits" || kv.first.rfind("grad.", 0) == 0;
+            const bool bare = kv.first == "logits" || kv.first.starts_with("grad.");
             const std::string key = bare ? kv.first : "cache." + kv.first;
-            if (!ref.tensors.count(key)) {
+            if (!ref.tensors.contains(key)) {
                 std::printf("EXTRA    %s (produced by tfi, not in reference)\n", kv.first.c_str());
                 ++failures;
             }

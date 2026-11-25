@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <concepts>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <format>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <random>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <thread>
 
@@ -32,7 +35,7 @@ std::atomic<int> g_device{-1};  // a Device, or -1: TFI_NO_GPU decides
 
 // Run fn(0..n-1) on up to num_threads() threads. Jobs are independent; the first exception any job
 // throws is re-thrown here after the workers stop.
-template <typename F>
+template <std::invocable<int64_t> F>
 void parallel_for(int64_t n, F&& fn) {
     const int64_t workers = std::min<int64_t>(num_threads(), n);
     if (workers <= 1) {
@@ -62,7 +65,7 @@ void parallel_for(int64_t n, F&& fn) {
 
 const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
-std::string head_label(int64_t layer, int64_t head) { return "L" + std::to_string(layer) + "H" + std::to_string(head); }
+std::string head_label(int64_t layer, int64_t head) { return std::format("L{}H{}", layer, head); }
 
 // (n_layers, widest layer's head count), `fill` where a head exists and NaN where a layer has
 // fewer heads (layer_overrides may change n_heads per layer).
@@ -73,16 +76,16 @@ Tensor per_head_matrix(const Model& m, float fill) {
         for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) t.data[i * H + h] = fill;
     return t;
 }
-std::string lp(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
+std::string lp(int64_t layer) { return std::format("blocks.{}.", layer); }
 
 // A cache filter accepting exactly these hook names, so a tool copies only what it reads.
 NameFilter only(std::set<std::string> names) {
-    return [names = std::move(names)](const std::string& n) { return names.count(n) > 0; };
+    return [names = std::move(names)](const std::string& n) { return names.contains(n); };
 }
 
 void check_pos(const Tokens& tokens, int64_t pos) {
     if (pos < 0 || pos >= static_cast<int64_t>(tokens.size()))
-        throw std::out_of_range("position " + std::to_string(pos) + " is outside the sequence");
+        throw std::out_of_range(std::format("position {} is outside the sequence", pos));
 }
 
 void check_token(const Model& m, int64_t t, const char* what) {
@@ -193,14 +196,14 @@ int num_threads() {
 float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
     const int64_t V = logits.shape[1];
     const float* l = logits.ptr() + pos * V;
-    return other >= 0 ? l[target] - l[other] : log_softmax_at(l, V, target);
+    return other >= 0 ? l[target] - l[other] : log_softmax_at(logits.row_view(pos), target);
 }
 
 float next_token_loss(const Tensor& logits, const Tokens& tokens) {
-    const int64_t T = static_cast<int64_t>(tokens.size()), V = logits.shape[1];
+    const int64_t T = static_cast<int64_t>(tokens.size());
     if (T < 2) throw std::invalid_argument("loss needs at least two tokens");
     double s = 0;
-    for (int64_t t = 0; t + 1 < T; ++t) s -= log_softmax_at(logits.ptr() + t * V, V, tokens[t + 1]);
+    for (int64_t t = 0; t + 1 < T; ++t) s -= log_softmax_at(logits.row_view(t), tokens[t + 1]);
     return static_cast<float>(s / (T - 1));
 }
 
@@ -211,7 +214,7 @@ namespace {
 std::vector<std::pair<std::string, std::string>> lens_stages(const Model& m) {
     std::vector<std::pair<std::string, std::string>> stages = {{"embed", "blocks.0.hook_resid_pre"}};
     for (int64_t i = 0; i < m.cfg().n_layers; ++i) {
-        const std::string L = "L" + std::to_string(i);
+        const std::string L = std::format("L{}", i);
         if (m.layer_cfg(i).has_mlp()) {
             stages.push_back({L + ".attn", lp(i) + "hook_resid_mid"});
             stages.push_back({L + ".mlp", lp(i) + "hook_resid_post"});
@@ -233,27 +236,27 @@ std::vector<LensEntry> logit_lens_from(const Model& m, const ActivationCache& ca
                                        int64_t k) {
     if (target >= 0) check_token(m, target, "target");
     const std::vector<std::pair<std::string, std::string>> stages = lens_stages(m);
-    const int64_t V = m.cfg().vocab_size, d = m.cfg().d_model, S = static_cast<int64_t>(stages.size());
+    const int64_t d = m.cfg().d_model, S = static_cast<int64_t>(stages.size());
     // Every stage's row, decoded together: one pass over the unembedding instead of one per stage.
     Tensor stack({S, d});
     for (int64_t s = 0; s < S; ++s) {
         const Tensor& a = cache.at(stages[s].second);
         if (a.dim() != 2 || a.shape[1] != d || row < 0 || row >= a.shape[0])
-            throw std::out_of_range("logit lens: row " + std::to_string(row) + " is outside " + stages[s].second);
+            throw std::out_of_range(std::format("logit lens: row {} is outside {}", row, stages[s].second));
         std::copy(a.ptr() + row * d, a.ptr() + (row + 1) * d, stack.ptr() + s * d);
     }
     Tensor probs = m.logits_from_final(m.final_norm(stack));
     std::vector<LensEntry> out;
     for (int64_t s = 0; s < S; ++s) {
-        float* p = probs.ptr() + s * V;
-        softmax_(p, V);
+        const std::span<float> p = probs.row_view(s);
+        softmax_(p);
         LensEntry e;
         e.stage = stages[s].first;
-        e.top_tokens = topk(p, V, k);
+        e.top_tokens = topk(p, k);
         for (int64_t t : e.top_tokens) e.top_probs.push_back(p[t]);
         if (target >= 0) {
             e.target_prob = p[target];
-            e.target_rank = rank_of(p, V, target);
+            e.target_rank = rank_of(p, target);
         }
         out.push_back(std::move(e));
     }
@@ -279,8 +282,8 @@ void check_dla_model(const Model& m) {
             "direct logit attribution needs an additive residual stream; post-norm models have none");
     for (int64_t i = 0; i < m.cfg().n_layers; ++i)  // a single post-norm layer (via layer_overrides) breaks it too
         if (m.layer_cfg(i).norm_position == "post")
-            throw std::runtime_error("direct logit attribution needs an additive residual stream; layer " +
-                                     std::to_string(i) + " is post-norm");
+            throw std::runtime_error(
+                std::format("direct logit attribution needs an additive residual stream; layer {} is post-norm", i));
 }
 }  // namespace
 
@@ -306,14 +309,14 @@ DLAResult direct_logit_attribution_from(const Model& m, const ActivationCache& c
     auto at_row = [&](const std::string& name, int64_t width) {  // row `row` of a (rows, width...) activation
         const Tensor& a = cache.at(name);
         if (a.dim() < 2 || row < 0 || row >= a.shape[0] || a.numel() / a.shape[0] != width)
-            throw std::out_of_range("direct logit attribution: row " + std::to_string(row) + " is outside " + name);
-        return a.ptr() + row * width;
+            throw std::out_of_range(std::format("direct logit attribution: row {} is outside {}", row, name));
+        return std::span<const float>(a.ptr() + row * width, static_cast<size_t>(width));
     };
     const std::vector<float> u = logit_direction(m, target, other);
 
     // Final norm as a fixed linear map: f(c) = gamma * (c - mean(c)) / sigma for LayerNorm,
     // gamma * c / rms for RMSNorm, with sigma / rms taken from the real final residual.
-    const float* resid = at_row(lp(L - 1) + "hook_resid_post", d);
+    const std::span<const float> resid = at_row(lp(L - 1) + "hook_resid_post", d);
     std::vector<float> w(u);  // u * gamma / scale
     bool center = false;
     float bias_term = 0;
@@ -330,7 +333,7 @@ DLAResult direct_logit_attribution_from(const Model& m, const ActivationCache& c
         }
         const float inv = 1.0f / std::sqrt(static_cast<float>(sq / d) + static_cast<float>(cfg.norm_eps));
         for (int64_t j = 0; j < d; ++j) w[j] = u[j] * gamma.data[j] * inv;
-        if (const Weight* beta = m.weight_or_null("ln_final.bias")) bias_term = dot(u.data(), beta->f32().ptr(), d);
+        if (const Weight* beta = m.weight_or_null("ln_final.bias")) bias_term = dot(u, beta->f32().data);
     }
     // LayerNorm's centring is linear too: w . (c - mean(c)) = (w - mean(w)) . c.
     if (center) {
@@ -339,7 +342,7 @@ DLAResult direct_logit_attribution_from(const Model& m, const ActivationCache& c
         wm /= d;
         for (float& v : w) v -= static_cast<float>(wm);
     }
-    auto contribution = [&](const float* c) { return dot(w.data(), c, d); };
+    auto contribution = [&](std::span<const float> c) { return dot(w, c); };
 
     DLAResult res;
     auto push = [&](const std::string& label, float v) {
@@ -348,26 +351,27 @@ DLAResult direct_logit_attribution_from(const Model& m, const ActivationCache& c
         res.sum += v;
     };
     push("embed", contribution(at_row("hook_embed", d)));
-    if (cache.count("hook_pos_embed")) push("pos_embed", contribution(at_row("hook_pos_embed", d)));
+    if (cache.contains("hook_pos_embed")) push("pos_embed", contribution(at_row("hook_pos_embed", d)));
     const Tensor wrow({1, d}, w);
     for (int64_t i = 0; i < L; ++i) {
         const ModelConfig& c = m.layer_cfg(i);
         if (c.norm_position == "sandwich") {  // per-head outputs pass through a norm; attribute the layer
-            push("L" + std::to_string(i) + ".attn", contribution(at_row(lp(i) + "hook_attn_out", d)));
+            push(std::format("L{}.attn", i), contribution(at_row(lp(i) + "hook_attn_out", d)));
         } else {
             // Head h writes o_proj's columns h*D..(h+1)*D times z_h, so its part is (w W_O)[h*D..] . z_h:
             // one pass over W_O for the layer, then a dot of D per head.
             const int64_t H = c.n_heads, D = c.head_dim();
-            const float* z = at_row(lp(i) + "attn.hook_z", H * D);                  // (H, D) at this row
+            const std::span<const float> z = at_row(lp(i) + "attn.hook_z", H * D);  // (H, D) at this row
             const Tensor g = matmul(wrow, m.weight(lp(i) + "attn.o_proj.weight"));  // (1, H*D)
-            for (int64_t h = 0; h < H; ++h) push(head_label(i, h), dot(g.ptr() + h * D, z + h * D, D));
+            for (int64_t h = 0; h < H; ++h)
+                push(head_label(i, h), dot(std::span(g.data).subspan(h * D, D), z.subspan(h * D)));
             if (const Weight* bo = m.weight_or_null(lp(i) + "attn.o_proj.bias"))
-                push("L" + std::to_string(i) + ".attn_bias", contribution(bo->f32().ptr()));
+                push(std::format("L{}.attn_bias", i), contribution(bo->f32().data));
         }
-        if (c.has_mlp()) push("L" + std::to_string(i) + ".mlp", contribution(at_row(lp(i) + "hook_mlp_out", d)));
+        if (c.has_mlp()) push(std::format("L{}.mlp", i), contribution(at_row(lp(i) + "hook_mlp_out", d)));
     }
     if (bias_term != 0) push("final_norm_bias", bias_term);
-    res.actual = dot(u.data(), at_row("hook_final", d), d);
+    res.actual = dot(u, at_row("hook_final", d));
     return res;
 }
 
@@ -444,8 +448,7 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
                 for (int64_t hb = 0; hb < heads(b); ++hb)
                     s.top_two_hop.push_back(
                         {head_label(a, ha), head_label(b, hb), two_hop[((a * H + ha) * L + b) * H + hb]});
-    std::sort(s.top_two_hop.begin(), s.top_two_hop.end(),
-              [](const TwoHop& x, const TwoHop& y) { return x.score > y.score; });
+    std::ranges::sort(s.top_two_hop, [](const TwoHop& x, const TwoHop& y) { return x.score > y.score; });
     if (s.top_two_hop.size() > 5) s.top_two_hop.resize(5);
     return s;
 }
@@ -538,9 +541,9 @@ int64_t gradient_batch_rows(int64_t steps, int64_t P) {
 #endif
 
 struct Batch {
-    int64_t layer;               // where its passes start
-    std::vector<int64_t> items;  // positions (residual stream) or heads
-    int64_t rows, cost;          // stacked rows; rows x layers run
+    int64_t layer;                 // where its passes start
+    std::vector<int64_t> items{};  // positions (residual stream) or heads
+    int64_t rows, cost;            // stacked rows; rows x layers run
 };
 
 // Each layer's items in batches of at most max_rows rows (rows(item) each), most expensive first
@@ -550,12 +553,12 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
     const int64_t L = static_cast<int64_t>(items_per_layer.size());
     std::vector<Batch> batches;
     for (int64_t i = 0; i < L; ++i) {
-        std::sort(items_per_layer[i].begin(), items_per_layer[i].end());  // batches depend only on the set of sites
-        Batch b{i, {}, 0, 0};
+        std::ranges::sort(items_per_layer[i]);  // batches depend only on the set of sites
+        Batch b{.layer = i, .rows = 0, .cost = 0};
         auto flush = [&] {
             b.cost = b.rows * (L - i);
             batches.push_back(std::move(b));
-            b = Batch{i, {}, 0, 0};
+            b = Batch{.layer = i, .rows = 0, .cost = 0};
         };
         for (int64_t item : items_per_layer[i]) {
             if (!b.items.empty() && b.rows + rows(item) > max_rows) flush();
@@ -564,7 +567,7 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
         }
         if (!b.items.empty()) flush();
     }
-    std::stable_sort(batches.begin(), batches.end(), [](const Batch& a, const Batch& b) { return a.cost > b.cost; });
+    std::ranges::stable_sort(batches, [](const Batch& a, const Batch& b) { return a.cost > b.cost; });
     return batches;
 }
 
@@ -573,7 +576,7 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
 double block_weights_per_layer(const Model& m) {
     double n = 0;
     for (const auto& kv : m.weights())
-        if (kv.second.dim() == 2 && kv.first.rfind("blocks.", 0) == 0) n += static_cast<double>(kv.second.numel());
+        if (kv.second.dim() == 2 && kv.first.starts_with("blocks.")) n += static_cast<double>(kv.second.numel());
     return n / static_cast<double>(std::max<int64_t>(1, m.cfg().n_layers));
 }
 
@@ -603,7 +606,7 @@ detail::Gpu* gpu_for(const Model& m, const std::vector<Batch>& batches) {
     return nullptr;
 }
 
-bool same_floats(const float* a, const float* b, int64_t n) { return std::memcmp(a, b, n * sizeof(float)) == 0; }
+bool same_floats(std::span<const float> a, const float* b) { return std::memcmp(a.data(), b, a.size_bytes()) == 0; }
 
 // Exact patching of every site, or with `selected` only those sites: the others are left NaN
 // (except positions after `pos`, whose effect is exactly 0 without running anything).
@@ -611,8 +614,7 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
                                  int64_t pos, int64_t target, int64_t other, const std::vector<Site>* selected,
                                  const PatchRuns* runs = nullptr) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
-    if (std::find(sites.begin(), sites.end(), site) == sites.end())
-        throw std::invalid_argument("unknown patch site '" + site + "'");
+    if (std::ranges::find(sites, site) == sites.end()) throw std::invalid_argument("unknown patch site '" + site + "'");
     check_patch_inputs(m, clean, corrupt, pos, target, other);
     const int64_t L = m.cfg().n_layers, T = static_cast<int64_t>(clean.size()), d = m.cfg().d_model, P = pos + 1;
     auto hook_name = [&](int64_t i) { return lp(i) + "hook_" + site; };
@@ -627,7 +629,7 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
     const PatchRuns& p = runs ? *runs : own;
     PatchResult r = p.result;
     r.effect = Tensor({L, T}, kNaN);
-    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back(std::format("L{}", i));
     for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
 
     // Sites to run, per layer. A layer without the site (e.g. mlp_out on an attention-only layer) stays NaN.
@@ -635,7 +637,7 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
     std::vector<std::vector<int64_t>> todo(L);
     auto consider = [&](int64_t i, int64_t t) {
         const Tensor& cor = p.corrupt_cache.at(hook_name(i));
-        if (same_floats(src[i]->ptr() + t * d, cor.ptr() + t * d, d) || (i == L - 1 && site != "resid_pre" && t < pos))
+        if (same_floats(src[i]->row_view(t), cor.ptr() + t * d) || (i == L - 1 && site != "resid_pre" && t < pos))
             r.effect.data[i * T + t] = 0.f;
         else todo[i].push_back(t);
     };
@@ -698,8 +700,8 @@ PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens&
     const PatchRuns& p = runs ? *runs : own;
     PatchResult r = p.result;
     r.effect = Tensor({L, H}, kNaN);
-    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
-    for (int64_t h = 0; h < H; ++h) r.col_labels.push_back("H" + std::to_string(h));
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back(std::format("L{}", i));
+    for (int64_t h = 0; h < H; ++h) r.col_labels.push_back(std::format("H{}", h));
 
     std::vector<const Tensor*> src(L), start(L);
     std::vector<std::vector<int64_t>> todo(L);
@@ -708,7 +710,7 @@ PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens&
         const Tensor& cor = p.corrupt_cache.at(lp(i) + "attn.hook_z");
         bool same = true;
         for (int64_t t = 0; t < P && same; ++t)
-            same = same_floats(src[i]->ptr() + (t * Hl + h) * D, cor.ptr() + (t * Hl + h) * D, D);
+            same = same_floats(std::span(src[i]->data).subspan((t * Hl + h) * D, D), cor.ptr() + (t * Hl + h) * D);
         if (same) r.effect.data[i * H + h] = 0.f;
         else todo[i].push_back(h);
     };
@@ -786,7 +788,7 @@ Tensor metric_dlogits(const Tensor& logits, int64_t pos, int64_t target, int64_t
         row[other] -= 1.f;
     } else {  // d log_softmax(l)[target] / dl = onehot(target) - softmax(l)
         std::copy(logits.ptr() + pos * V, logits.ptr() + (pos + 1) * V, row);
-        softmax_(row, V);
+        softmax_(std::span(row, V));
         for (int64_t j = 0; j < V; ++j) row[j] = -row[j];
         row[target] += 1.f;
     }
@@ -879,7 +881,7 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
 #else
     cpu_steps = all_steps;
 #endif
-    const bool corrupt_on_cpu = std::find(cpu_steps.begin(), cpu_steps.end(), 0) != cpu_steps.end();
+    const bool corrupt_on_cpu = std::ranges::find(cpu_steps, 0) != cpu_steps.end();
     std::vector<ActivationCache> step_grads(steps);
     // Jobs: the clean run, the corrupted run (with step 0's gradients when that is on the CPU), the
     // GPU batches, then the other CPU steps.
@@ -898,7 +900,7 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
                 a.runs.result.corrupt_metric =
                     metric_gradients(m, x, pos, target, other, step_grads[0], only(names), &all);
                 for (const auto& n : corrupt_extra)
-                    if (all.count(n)) a.runs.corrupt_cache[n] = std::move(all[n]);
+                    if (all.contains(n)) a.runs.corrupt_cache[n] = std::move(all[n]);
             } else {
                 a.runs.result.corrupt_metric =
                     logit_metric(m.run_with_cache(x, a.runs.corrupt_cache, only(corrupt_extra)), pos, target, other);
@@ -937,8 +939,7 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
 
 std::set<std::string> residual_names(const Model& m, const std::string& site) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
-    if (std::find(sites.begin(), sites.end(), site) == sites.end())
-        throw std::invalid_argument("unknown patch site '" + site + "'");
+    if (std::ranges::find(sites, site) == sites.end()) throw std::invalid_argument("unknown patch site '" + site + "'");
     std::set<std::string> names;
     for (int64_t i = 0; i < m.cfg().n_layers; ++i) names.insert(lp(i) + "hook_" + site);
     return names;
@@ -966,11 +967,11 @@ PatchResult attribution_residual_result(const Model& m, const AttributionRuns& a
     const int64_t L = m.cfg().n_layers, d = m.cfg().d_model;
     PatchResult r = a.runs.result;
     r.effect = Tensor({L, T}, kNaN);
-    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back(std::format("L{}", i));
     for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
     for (int64_t i = 0; i < L; ++i) {
         const std::string n = lp(i) + "hook_" + site;
-        if (!a.runs.clean_cache.count(n)) continue;  // site doesn't exist in this layer: stays NaN
+        if (!a.runs.clean_cache.contains(n)) continue;  // site doesn't exist in this layer: stays NaN
         const Tensor &cl = a.runs.clean_cache.at(n), &co = a.runs.corrupt_cache.at(n), &g = a.grads.at(n);
         for (int64_t t = 0; t < T; ++t) {
             double s = 0;
@@ -988,8 +989,8 @@ PatchResult attribution_heads_result(const Model& m, const AttributionRuns& a) {
     const int64_t L = m.cfg().n_layers, H = m.max_heads();
     PatchResult r = a.runs.result;
     r.effect = Tensor({L, H}, kNaN);
-    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
-    for (int64_t h = 0; h < H; ++h) r.col_labels.push_back("H" + std::to_string(h));
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back(std::format("L{}", i));
+    for (int64_t h = 0; h < H; ++h) r.col_labels.push_back(std::format("H{}", h));
     for (int64_t i = 0; i < L; ++i) {
         const std::string n = lp(i) + "attn.hook_z";  // (pos+1, H, D)
         const Tensor &cl = a.runs.clean_cache.at(n), &co = a.runs.corrupt_cache.at(n), &g = a.grads.at(n);
@@ -1030,15 +1031,15 @@ namespace {
 
 // Rows x cols site of each of the `verify` largest finite |estimates|, ties broken by position in the
 // table so the choice is deterministic. `usable(row, col)` excludes sites that need no measurement.
-template <typename Usable>
+template <std::predicate<int64_t, int64_t> Usable>
 std::vector<Site> top_sites(const Tensor& estimate, int64_t verify, Usable usable) {
     if (verify < 0) throw std::invalid_argument("mixed patching: verify must be >= 0");
     const int64_t cols = estimate.shape[1];
     std::vector<int64_t> idx;
     for (int64_t i = 0; i < estimate.numel(); ++i)
         if (!std::isnan(estimate.data[i]) && usable(i / cols, i % cols)) idx.push_back(i);
-    std::stable_sort(idx.begin(), idx.end(),
-                     [&](int64_t a, int64_t b) { return std::fabs(estimate.data[a]) > std::fabs(estimate.data[b]); });
+    std::ranges::stable_sort(
+        idx, [&](int64_t a, int64_t b) { return std::fabs(estimate.data[a]) > std::fabs(estimate.data[b]); });
     if (static_cast<int64_t>(idx.size()) > verify) idx.resize(static_cast<size_t>(verify));
     std::vector<Site> sites;
     for (int64_t i : idx) sites.emplace_back(i / cols, i % cols);
@@ -1092,8 +1093,8 @@ PatchResult mixed_patch_heads(const Model& m, const Tokens& clean, const Tokens&
 HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64_t T) {
     if (reference.empty()) throw std::invalid_argument("mean ablation needs at least one reference sequence");
     const int64_t L = m.cfg().n_layers, R = static_cast<int64_t>(reference.size());
-    const bool per_position = std::all_of(reference.begin(), reference.end(),
-                                          [T](const Tokens& r) { return static_cast<int64_t>(r.size()) == T; });
+    const bool per_position =
+        std::ranges::all_of(reference, [T](const Tokens& r) { return static_cast<int64_t>(r.size()) == T; });
     HeadMeans means;
     std::vector<double> counts(L, 0.0);
     for (int64_t i = 0; i < L; ++i)
@@ -1117,7 +1118,7 @@ HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64
         }
         Tensor x({rb.rows(), m.cfg().d_model});
         for (size_t s = 0; s < inputs.size(); ++s)
-            std::copy(inputs[s].data.begin(), inputs[s].data.end(), x.ptr() + rb.offset[s] * m.cfg().d_model);
+            std::ranges::copy(inputs[s].data, x.ptr() + rb.offset[s] * m.cfg().d_model);
         Hooks hooks;  // captures: they only read, so a GPU pass need not stop for them
         for (int64_t i = 0; i < L; ++i) {
             auto keep_z = [&, i](const std::string&, Tensor& z) {  // (rows, H, D)
@@ -1163,8 +1164,8 @@ Hooks ablate_head(const Model& m, int64_t layer, int64_t head, Ablation mode, co
     hooks.add(lp(layer) + "attn.hook_z", [head, Hl, D, mean](const std::string&, Tensor& z) {
         const int64_t T = z.shape[0];
         if (mean && mean->shape[0] != 1 && mean->shape[0] != T)
-            throw std::invalid_argument("per-position reference means were computed for length " +
-                                        std::to_string(mean->shape[0]) + ", input has length " + std::to_string(T));
+            throw std::invalid_argument(std::format(
+                "per-position reference means were computed for length {}, input has length {}", mean->shape[0], T));
         for (int64_t t = 0; t < T; ++t) {
             float* dst = z.ptr() + (t * Hl + head) * D;
             if (!mean) std::fill(dst, dst + D, 0.f);
@@ -1232,7 +1233,7 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
         for (int64_t h = 0; h < Hl; ++h) {
             bool same = true;
             for (int64_t t = 0; t < T && same; ++t)
-                same = same_floats(z.ptr() + (t * Hl + h) * D, replacement(i, h, t), D);
+                same = same_floats(std::span(z.data).subspan((t * Hl + h) * D, D), replacement(i, h, t));
             if (same) out.data[i * H + h] = 0.f;
             else todo[i].push_back(h);
         }
@@ -1276,7 +1277,7 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
             for (int64_t s = 0; s < n; ++s) {
                 double loss = 0;
                 for (int64_t t = 0; t + 1 < T; ++t)
-                    loss -= log_softmax_at(logits.ptr() + (s * (T - 1) + t) * V, V, tokens[t + 1]);
+                    loss -= log_softmax_at(logits.row_view(s * (T - 1) + t), tokens[t + 1]);
                 out.data[i * H + b.items[s0 + s]] = static_cast<float>(loss / (T - 1)) - base;
             }
         }
@@ -1559,12 +1560,12 @@ struct OvPaths {
     Tensor finish(const HeadWeights& w) const { return matmul(U, w.W_O); }
     // Fraction of sampled tokens whose logits A UO^T rank the token itself first.
     float hits(const Tensor& A, const Tensor& UO) const {
-        const int64_t n = A.shape[0], V = UO.shape[0], chunk = 256;
+        const int64_t n = A.shape[0], chunk = 256;
         int64_t hit = 0;
         for (int64_t s = 0; s < n; s += chunk) {
             const int64_t e = std::min(n, s + chunk);
             const Tensor logits = matmul(rows(A, s, e), UO, true);  // (chunk, V)
-            for (int64_t r = 0; r < e - s; ++r) hit += topk(logits.ptr() + r * V, V, 1)[0] == toks[s + r];
+            for (int64_t r = 0; r < e - s; ++r) hit += topk(logits.row_view(r), 1)[0] == toks[s + r];
         }
         return float(hit) / float(n);
     }
@@ -1883,7 +1884,7 @@ Tensor positional_qk(const Model& m, int64_t layer, int64_t head, int64_t T) {
     Tensor pattern({T, T});
     for (int64_t i = 0; i < T; ++i) {
         for (int64_t j = 0; j < T; ++j) pattern.data[i * T + j] = j <= i ? S.data[i * T + j] * scale : -INFINITY;
-        softmax_(pattern.ptr() + i * T, T);
+        softmax_(pattern.row_view(i));
     }
     return pattern;
 }

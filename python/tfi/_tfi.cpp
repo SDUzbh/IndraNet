@@ -7,6 +7,7 @@
 //
 // Threads: every engine call runs with the GIL released, so other Python threads (a web server's)
 // keep running; Python hook functions take it back while they run.
+#include <format>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/map.h>
@@ -78,7 +79,7 @@ NameFilter names_filter(const Model& m, const std::optional<std::vector<std::str
     const std::vector<std::string> all = m.hook_names();
     const std::set<std::string> known(all.begin(), all.end());
     for (const auto& n : *names)
-        if (!known.count(n))
+        if (!known.contains(n))
             throw std::invalid_argument("no hook point named '" + n + "' (Model.hook_names() lists them)");
     auto wanted = std::make_shared<std::set<std::string>>(names->begin(), names->end());
     return [wanted](const std::string& n) { return wanted->count(n) > 0; };
@@ -87,9 +88,10 @@ NameFilter names_filter(const Model& m, const std::optional<std::vector<std::str
 // A RuntimeWarning when an fp16 KV cache cut values off at fp16's limit (KVCache::clamped), as the CLI's warning.
 void warn_kv_clamped(int64_t n) {
     if (n == 0) return;
-    const std::string msg = std::to_string(n) +
-                            " numbers in the KV cache were beyond fp16's range and were cut off at +-65504, so the "
-                            "output may differ from the model's; loading with fp16=False keeps them";
+    const std::string msg =
+        std::format("{} numbers in the KV cache were beyond fp16's range and were cut off at +-65504, so the output "
+                    "may differ from the model's; loading with fp16=False keeps them",
+                    n);
     if (PyErr_WarnEx(PyExc_RuntimeWarning, msg.c_str(), 1) != 0) throw nb::python_error();
 }
 
@@ -109,7 +111,7 @@ std::optional<Hooks> python_hooks(const Model& m, const std::optional<nb::dict>&
     auto each = [&](const nb::dict& fns, const char* what, auto&& add) {
         for (auto [key, value] : fns) {
             const std::string name = nb::cast<std::string>(key);
-            if (!known.count(name))
+            if (!known.contains(name))
                 throw std::invalid_argument("no hook point named '" + name + "' (Model.hook_names() lists them)");
             if (!PyCallable_Check(value.ptr()))
                 throw std::invalid_argument(std::string("the ") + what + " for '" + name + "' is not callable");
@@ -152,7 +154,7 @@ nb::str utf8_str(const std::string& bytes) {
 int64_t resolve_pos(const Tokens& t, int64_t pos) {
     const int64_t T = static_cast<int64_t>(t.size());
     if (pos < 0) pos += T;
-    if (pos < 0 || pos >= T) throw std::out_of_range("pos is out of range for " + std::to_string(T) + " tokens");
+    if (pos < 0 || pos >= T) throw std::out_of_range(std::format("pos is out of range for {} tokens", T));
     return pos;
 }
 
@@ -222,7 +224,7 @@ nb::list trace_list(std::vector<TraceStep>& steps, const TraceOptions& opt) {
 std::vector<std::pair<std::string, std::string>> lens_stages(const Model& m) {
     std::vector<std::pair<std::string, std::string>> stages = {{"embed", "blocks.0.hook_resid_pre"}};
     for (int64_t i = 0; i < m.cfg().n_layers; ++i) {
-        const std::string L = "L" + std::to_string(i), p = "blocks." + std::to_string(i) + ".";
+        const std::string L = std::format("L{}", i), p = std::format("blocks.{}.", i);
         if (m.layer_cfg(i).has_mlp()) {
             stages.push_back({L + ".attn", p + "hook_resid_mid"});
             stages.push_back({L + ".mlp", p + "hook_resid_post"});
@@ -657,7 +659,7 @@ NB_MODULE(_tfi, mod) {
                 std::set<std::string> needed;
                 for (const auto& st : stages) needed.insert(st.second);
                 ActivationCache cache;
-                m.run_with_cache(tokens, cache, [&needed](const std::string& n) { return needed.count(n) > 0; });
+                m.run_with_cache(tokens, cache, [&needed](const std::string& n) { return needed.contains(n); });
                 const int64_t block = 64;  // rows unembedded at once: (block, V) logits at a time
                 for (int64_t s = 0; s < S; ++s) {
                     const Tensor normed = m.final_norm(cache.at(stages[s].second));
@@ -665,16 +667,16 @@ NB_MODULE(_tfi, mod) {
                         const int64_t r1 = std::min(T, r0 + block);
                         Tensor probs = m.logits_from_final(rows(normed, r0, r1));
                         for (int64_t p = r0; p < r1; ++p) {
-                            float* v = probs.ptr() + (p - r0) * V;
-                            softmax_(v, V);
-                            const std::vector<int64_t> best = topk(v, V, k);
+                            const std::span<float> v = probs.row_view(p - r0);
+                            softmax_(v);
+                            const std::vector<int64_t> best = topk(v, k);
                             for (int64_t j = 0; j < k; ++j) {
                                 top[(s * T + p) * k + j] = best[j];
                                 prob[(s * T + p) * k + j] = v[best[j]];
                             }
                             if (p + 1 < T) {
                                 next[s * T + p] = v[tokens[p + 1]];
-                                rank[s * T + p] = rank_of(v, V, tokens[p + 1]);
+                                rank[s * T + p] = rank_of(v, tokens[p + 1]);
                             }
                         }
                     }
