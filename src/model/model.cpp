@@ -1468,6 +1468,19 @@ detail::KVRef KVCache::ref(int64_t layer, bool values) const {
     return r;
 }
 
+int64_t KVCache::clamped() const {
+    if (!half_ || len_ == 0) return 0;
+    sync_cpu();
+    int64_t n = 0;
+    for (int pass = 0; pass < 2; ++pass)
+        for (const Store& s : pass ? v_ : k_)
+            for (int64_t h = 0; h < s.H; ++h) {
+                const uint16_t* p = s.h.data() + h * s.cap * s.D;
+                for (int64_t i = 0; i < len_ * s.D; ++i) n += (p[i] & 0x7fff) == 0x7bff;  // +-65504
+            }
+    return n;
+}
+
 void KVCache::sync_cpu() const {
     if (cpu_len_ >= len_) return;
 #ifdef TFI_USE_ACCELERATE

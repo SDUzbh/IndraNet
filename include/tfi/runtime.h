@@ -33,6 +33,7 @@ class DecodeRuntime {
     DecodeRuntime(const DecodeRuntime&) = delete;
     DecodeRuntime& operator=(const DecodeRuntime&) = delete;
     std::optional<int64_t> next();
+    int64_t kv_clamped() const;  // the KV cache's KVCache::clamped() so far
 
   private:
     struct Impl;

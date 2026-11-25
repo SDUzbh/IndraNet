@@ -334,6 +334,7 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
         out.push_back(*t);
         if (options.on_token && !options.on_token(*t)) break;
     }
+    if (options.kv_clamped) *options.kv_clamped = runtime.kv_clamped();
     return out;
 }
 
@@ -427,6 +428,7 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
     std::set<int64_t> stop(options.stop_tokens.begin(), options.stop_tokens.end());
     if (options.stop_at_eos) stop.insert(model.eos_tokens().begin(), model.eos_tokens().end());
     std::vector<Tokens> out(n);
+    if (options.kv_clamped) *options.kv_clamped = 0;
     if (n == 0 || options.max_new_tokens == 0) return out;
 
     PerSequenceHooks ph(n);
@@ -457,7 +459,11 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
                 ph.segs.push_back({static_cast<int64_t>(i), {row, static_cast<int64_t>(step[i].size())}});
                 row += static_cast<int64_t>(step[i].size());
             }
-        if (ph.segs.empty()) return out;
+        if (ph.segs.empty()) {
+            if (options.kv_clamped)
+                for (int64_t i = 0; i < batch.size(); ++i) *options.kv_clamped += batch[i].clamped();
+            return out;
+        }
         const std::vector<Tensor> logits =
             model.forward_cached(step, batch, any_hooks ? &ph.all : nullptr, /*last_only=*/true);
         for (size_t i = 0; i < n; ++i) {

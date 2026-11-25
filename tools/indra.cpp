@@ -744,6 +744,8 @@ int cmd_generate(const Args& a, const Model& m) {
     o.trace.top_k = 3;
     o.trace.dla = additive;
     std::vector<TraceStep> steps;
+    int64_t clamped = 0;
+    o.kv_clamped = &clamped;
     const Tokens out = generate(m, prompt, o, nullptr, tracing ? &steps : nullptr);
     std::printf("\n");
     if (tracing) {
@@ -789,6 +791,11 @@ int cmd_generate(const Args& a, const Model& m) {
         std::fprintf(stderr, "speculative: %lld steps for %zu tokens; %lld of %lld proposed tokens accepted\n",
                      static_cast<long long>(stats.steps), out.size(), static_cast<long long>(stats.accepted),
                      static_cast<long long>(stats.drafted));
+    if (clamped)
+        std::fprintf(stderr,
+                     "warning: %lld numbers in the KV cache were beyond fp16's range and were cut off at +-65504, so "
+                     "the output may differ from the model's; --fp32 keeps them\n",
+                     static_cast<long long>(clamped));
     return 0;
 }
 

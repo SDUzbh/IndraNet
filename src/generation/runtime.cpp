@@ -717,5 +717,6 @@ DecodeRuntime::DecodeRuntime(const Model& model, const Tokens& prompt, const Gen
     : impl_(std::make_unique<Impl>(model, prompt, options, hooks, trace)) {}
 DecodeRuntime::~DecodeRuntime() = default;
 std::optional<int64_t> DecodeRuntime::next() { return impl_->next(); }
+int64_t DecodeRuntime::kv_clamped() const { return impl_->cache.clamped(); }
 
 }  // namespace tfi

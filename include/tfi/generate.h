@@ -81,6 +81,9 @@ struct GenerateOptions {
     std::function<bool(int64_t token)> on_token;
     TraceOptions trace;              // what generate() records when given a trace to fill
     SpeculativeOptions speculative;  // generate() only
+    // If set, receives the KV cache's KVCache::clamped() once generation stops (generate_batch: summed over the
+    // sequences): with an fp16 model, keys and values cut off at fp16's limit, which can change the output.
+    int64_t* kv_clamped = nullptr;
 };
 
 // Picks the next token from a row of logits by GenerateOptions' rules: temperature, then top_k, then

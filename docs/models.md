@@ -29,6 +29,13 @@ activations rounded to fp16, sums in float32), several times faster, with errors
 relative; a run with a value beyond fp16's range is repeated with float32 inputs. Weights in float32
 always multiply in float32.
 
+The KV cache of an fp16 model holds its keys and values in fp16 too. A value beyond fp16's range
+(above 65,504 in size) can't be kept: it is cut off to ±65,504, which can change the output by far
+more than rounding. Ordinary models rarely get there, but models without norms, models with outlier
+activations, or a hook scaling `hook_k` or `hook_v` can. `KVCache::clamped()` (Python:
+`KVCache.clamped`) counts the values at that limit. `indra generate` prints a warning when it isn't
+0, and Python's `generate` and `generate_batch` give a `RuntimeWarning`. `--fp32` keeps them exact.
+
 The engine memory-maps model files. Some matrices are used in place, with no copy, the GPU
 included: those stored in the type the engine keeps them in (F16 with `--fp16`, F32 otherwise) and
 starting on a page boundary, as files from the Hugging Face converter do. Loading then reads

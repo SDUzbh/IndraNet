@@ -84,6 +84,15 @@ NameFilter names_filter(const Model& m, const std::optional<std::vector<std::str
     return [wanted](const std::string& n) { return wanted->count(n) > 0; };
 }
 
+// A RuntimeWarning when an fp16 KV cache cut values off at fp16's limit (KVCache::clamped), as the CLI's warning.
+void warn_kv_clamped(int64_t n) {
+    if (n == 0) return;
+    const std::string msg = std::to_string(n) +
+                            " numbers in the KV cache were beyond fp16's range and were cut off at +-65504, so the "
+                            "output may differ from the model's; loading with fp16=False keeps them";
+    if (PyErr_WarnEx(PyExc_RuntimeWarning, msg.c_str(), 1) != 0) throw nb::python_error();
+}
+
 // Engine hooks calling Python functions fn(activation, name). Each gets a float32 copy of the
 // activation. A hook's return value (an array of the same shape), or else the copy as it left it,
 // replaces the activation. A capture only reads: its return value is ignored, and a pass on the GPU
@@ -279,6 +288,9 @@ NB_MODULE(_tfi, mod) {
         .def("__len__", &KVCache::size)
         .def("clear", &KVCache::clear)
         .def("truncate", &KVCache::truncate, "n"_a, "Keep positions 0..n-1.")
+        .def_prop_ro("clamped", &KVCache::clamped,
+                     "Keys and values at fp16's limit, +-65504: with fp16 weights the cache cuts values beyond fp16's "
+                     "range off to it (above 0: some changed by far more than rounding). Always 0 with float32.")
         .def(
             "keys", [](const KVCache& c, int64_t layer) { return to_numpy(c.keys(layer)); }, "layer"_a,
             "Layer's keys (kv_heads, size, d_head), as hook_k gave them.")
@@ -468,6 +480,8 @@ NB_MODULE(_tfi, mod) {
             o.speculative.draft = draft;
             o.speculative.ngram = ngram;
             o.speculative.stats = &st;
+            int64_t clamped = 0;
+            o.kv_clamped = &clamped;
             if (!on_token.is_none()) {
                 if (!PyCallable_Check(on_token.ptr())) throw std::invalid_argument("on_token is not callable");
                 nb::handle fn = on_token;  // borrowed: on_token outlives the call
@@ -484,6 +498,7 @@ NB_MODULE(_tfi, mod) {
                 nb::gil_scoped_release release;
                 out = generate(m, tokens, o, h ? &*h : nullptr, trace ? &steps : nullptr);
             }
+            warn_kv_clamped(clamped);
             if (stats) {
                 (*stats)["steps"] = st.steps;
                 (*stats)["drafted"] = st.drafted;
@@ -568,12 +583,15 @@ NB_MODULE(_tfi, mod) {
             o.trace.top_k = trace_top_k;
             o.trace.lens = trace_lens;
             o.trace.dla = trace_dla;
+            int64_t clamped = 0;
+            o.kv_clamped = &clamped;
             std::vector<std::vector<TraceStep>> traces;
             std::vector<Tokens> out;
             {
                 nb::gil_scoped_release release;
                 out = generate_batch(m, ps, o, any ? ptrs : std::vector<const Hooks*>{}, trace ? &traces : nullptr);
             }
+            warn_kv_clamped(clamped);
             if (!trace) return nb::cast(out);
             nb::list tl;
             for (auto& t : traces) tl.append(trace_list(t, o.trace));

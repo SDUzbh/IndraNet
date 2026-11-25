@@ -3493,6 +3493,71 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
     CHECK_THROWS(m32.forward_cached({Tokens{1}, Tokens{}}, batch));
 }
 
+// KVCache::clamped(): an fp16 cache counts the keys and values it cut off at fp16's limit as it stored them, from CPU
+// and GPU steps alike (on the current device); truncating drops the dropped positions' counts. A float32 cache, or
+// one whose values all fit, counts none. generate() and generate_batch() pass the count on (kv_clamped).
+static void test_kv_clamped(const Model& m16, const Model& m32) {
+    const Tokens t = seq(7, 75);
+    Hooks huge;
+    huge.add("blocks.0.attn.hook_k", [](const std::string&, Tensor& a) {
+        for (float& v : a.data) v *= 1e6f;
+    });
+    // Before rounding: values past 65520 (the first that rounds to infinity) must be cut off, and from 65488 up
+    // they may round to 65504.
+    int64_t must = 0, may = 0;
+    Hooks seen;
+    seen.extend(huge);
+    seen.add_capture(
+        [](const std::string& n) {
+            return n.size() > 7 &&
+                   (n.compare(n.size() - 7, 7, ".hook_k") == 0 || n.compare(n.size() - 7, 7, ".hook_v") == 0);
+        },
+        [&](const std::string&, Tensor& a) {
+            for (float v : a.data) {
+                must += std::fabs(v) > 65520.f;
+                may += std::fabs(v) >= 65488.f;
+            }
+        });
+    {
+        const Device d = device();
+        set_device(Device::Cpu);
+        m16.forward(t, &seen);
+        set_device(d);
+    }
+    KVCache c;
+    m16.forward_cached(Tokens(t.begin(), t.begin() + 4), c, &huge);
+    for (int64_t i : {4, 5, 6}) m16.forward_cached({t[i]}, c, &huge);
+    const int64_t n = c.clamped();
+    CHECK(must > 0 && must <= n && n <= may);
+    int64_t at_limit = 0;
+    for (int64_t l = 0; l < m16.cfg().n_layers; ++l)
+        for (const Tensor& kv : {c.keys(l), c.values(l)})
+            for (float v : kv.data) at_limit += std::fabs(v) == 65504.f;
+    CHECK(at_limit == n);
+    CHECK(KVCache(c).clamped() == n);
+    c.truncate(4);
+    CHECK(c.clamped() > 0 && c.clamped() < n);
+    c.clear();
+    CHECK(c.clamped() == 0);
+    KVCache plain, c32;
+    m16.forward_cached(t, plain);
+    m32.forward_cached(t, c32, &huge);
+    CHECK(plain.clamped() == 0 && c32.clamped() == 0);
+    GenerateOptions o;
+    o.max_new_tokens = 2;
+    int64_t got = -1;
+    o.kv_clamped = &got;
+    generate(m16, t, o, &huge);
+    CHECK(got > 0);
+    generate(m16, t, o);
+    CHECK(got == 0);
+    got = -1;
+    generate_batch(m16, {t, Tokens(t.begin(), t.begin() + 3)}, o, {nullptr, &huge});
+    CHECK(got > 0);
+    generate_batch(m16, {t, t}, o);
+    CHECK(got == 0);
+}
+
 // generate(): greedy = argmax of forward() step by step; stop tokens, max_new_tokens, on_token; hooks
 // apply at every step; sampling is reproducible from its seed and follows top_k / top_p.
 static void test_generate(const Model& m) {
@@ -3584,6 +3649,14 @@ static void test_forward_cached_many_layers() {
     const Device before = device();
     set_device(Device::Cpu);
     test_fp16_kv(m16, c);
+    test_kv_clamped(m16, m);
+#ifdef TFI_USE_ACCELERATE
+    if (detail::Gpu::create()) {  // GPU steps round and clamp on the GPU
+        set_device(Device::Gpu);
+        test_kv_clamped(m16, m);
+        CHECK(m16.has_gpu());
+    }
+#endif
     set_device(before);
 }
 
@@ -5030,7 +5103,8 @@ int main(int argc, char** argv) {
         run("analysis", "decode runtime: a wrong prediction is replaced by the real hook: " + kv.first,
             [&] { test_runtime_mispredictions(m); });
     }
-    run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16", test_forward_cached_many_layers);
+    run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16, clamped values",
+        test_forward_cached_many_layers);
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
     run("core", "sampler: temperature too small for a float's 1 / T", test_tiny_temperature);
     run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);

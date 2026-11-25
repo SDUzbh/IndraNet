@@ -78,9 +78,9 @@ class Model;
 // continues on its own: several continuations of one prompt can share its prefill.
 //
 // With a model whose weights are fp16 (WeightFormat::fp16, the indra CLI's --fp16), the keys and values are
-// rounded to fp16 where they are stored (after the hooks, clamped to fp16's finite range), and both copies
-// below hold them in fp16: half the memory, at an error about that of fp16 weights (keys() and values() give
-// them as float32). Float32 models keep them in float32, exactly.
+// rounded to fp16 where they are stored (after the hooks, clamped to fp16's finite range: clamped() counts them), and
+// both copies below hold them in fp16: half the memory, at an error about that of fp16 weights (keys() and values()
+// give them as float32). Float32 models keep them in float32, exactly.
 //
 // Two places may hold them: the CPU's tensors and (macOS, when steps run on the GPU) the GPU's buffers,
 // so that a sequence generated on the GPU isn't kept twice. Both are prefixes of the sequence, since a
@@ -105,6 +105,11 @@ class KVCache {
     // Layer `layer`'s keys or values, (Hkv, size(), D): what hook_k / hook_v gave for these positions.
     Tensor keys(int64_t layer) const;
     Tensor values(int64_t layer) const;
+    // How many keys and values sit at fp16's limit, +-65,504, over every layer and position held. An fp16 cache cuts
+    // keys and values beyond fp16's range off to that limit as it stores them (a key of 200,000 is kept as 65,504),
+    // so a count above 0 says some were changed by far more than rounding; apart from those, only values within 16 of
+    // the limit round to it. Always 0 for a float32 cache. Counted when asked, over the CPU's copy.
+    int64_t clamped() const;
 
   private:
     friend class Model;

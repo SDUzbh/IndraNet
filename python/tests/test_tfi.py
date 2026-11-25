@@ -283,6 +283,27 @@ def test_kv_cache(tfi, tmp_path):
         m.forward_cached([], c)
 
 
+def test_kv_cache_clamped(tfi, tmp_path):
+    """An fp16 cache counts the keys and values it cut off at fp16's limit; generate warns about them."""
+    _, path = exported(tmp_path)
+    m16, m32 = tfi.Model.load(str(path), fp16=True), tfi.Model.load(str(path))
+
+    def huge(a, name):
+        return a * 1e6
+
+    hooks = {"blocks.0.attn.hook_k": huge}
+    c16, c32, plain = tfi.KVCache(), tfi.KVCache(), tfi.KVCache()
+    m16.forward_cached(TOKENS, c16, hooks=hooks)
+    m32.forward_cached(TOKENS, c32, hooks=hooks)
+    m16.forward_cached(TOKENS, plain)
+    assert c16.clamped > 0 and c16.clamped == int((np.abs(c16.keys(0)) == 65504).sum())
+    assert c32.clamped == 0 and plain.clamped == 0
+    with pytest.warns(RuntimeWarning, match="cut off at"):
+        tfi.generate(m16, TOKENS, max_new_tokens=2, hooks=hooks)
+    with pytest.warns(RuntimeWarning, match="cut off at"):
+        tfi.generate_batch(m16, [TOKENS, TOKENS[:3]], max_new_tokens=2, hooks=[None, hooks])
+
+
 def test_generate_options(tfi, tmp_path):
     vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
     _, path = exported(tmp_path, vocab=vocab)
