@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
+
 #include "tfi/analysis.h"
 #include "tfi/safetensors.h"
 #include "half.h"
@@ -753,6 +757,155 @@ std::vector<Tensor> project_many(const Model& m, const Tensor& x,
     return linear_many(x, Ws, bs);  // few rows: one threaded pass over all the weights
 }
 
+// Earlier positions' keys or values of one head for HeadAttention, rows of D: float32, or fp16 bit patterns (a KV
+// cache kept in fp16, read as it is).
+struct Prefix {
+    const float* f = nullptr;
+    const uint16_t* h = nullptr;
+};
+// Head g's rows of a layer's earlier keys or values ((H, T, D)), from row `row` of the head.
+Prefix prefix_of(const detail::KVRef* r, int64_t g, int64_t row = 0) {
+    if (!r) return {};
+    const int64_t at = (g * r->T + row) * r->D;
+    return r->h ? Prefix{nullptr, r->h + at} : Prefix{r->f + at, nullptr};
+}
+
+// With fp16 earlier keys and values (a KV cache kept in fp16): up to kDirectQueryRows query rows (a generated
+// token's, a speculative step's) read them straight from the cache, widening 8 at a time in registers, so attention
+// reads half the bytes; more rows (a chunk continuing a cache) widen tiles of kPrefixTile positions into a buffer
+// that stays in the cache and multiply in the library.
+constexpr int64_t kDirectQueryRows = 16, kPrefixTile = 512;
+// ... and the key / value heads go side by side from this many cached keys (of one layer): M5 Pro, 0.9B model,
+// 1500 positions: 14.0 ms a token against 15.6 for float32; under it waking the threads costs more than it saves.
+constexpr int64_t kSideBySideValues = int64_t(1) << 19;
+std::atomic<int64_t> g_side_by_side{0};  // set_kv_side_by_side's; 0: kSideBySideValues
+int64_t side_by_side_values() {
+    const int64_t v = g_side_by_side.load();
+    return v > 0 ? v : kSideBySideValues;
+}
+
+float* prefix_buffer(int64_t floats) {
+    thread_local std::vector<float> buf;
+    if (static_cast<int64_t>(buf.size()) < floats) buf.resize(static_cast<size_t>(floats));
+    return buf.data();
+}
+
+// probs[r * ld + j] = q_r . k_j for R query rows and the `first` fp16 keys k (rows of D).
+template <int R>
+void scores_half_rows(const float* q, int64_t first, int64_t D, const uint16_t* k, float* probs, int64_t ld) {
+    for (int64_t j = 0; j < first; ++j) {
+        const uint16_t* kj = k + j * D;
+        float sum[R];
+        int64_t d = 0;
+#if defined(__aarch64__)
+        float32x4_t acc[R][2];
+        for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = vdupq_n_f32(0.f);
+        for (; d + 8 <= D; d += 8) {
+            const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(kj + d));
+            const float32x4_t lo = vcvt_f32_f16(vget_low_f16(h)), hi = vcvt_high_f32_f16(h);
+            for (int r = 0; r < R; ++r) {
+                acc[r][0] = vfmaq_f32(acc[r][0], vld1q_f32(q + r * D + d), lo);
+                acc[r][1] = vfmaq_f32(acc[r][1], vld1q_f32(q + r * D + d + 4), hi);
+            }
+        }
+        for (int r = 0; r < R; ++r) sum[r] = vaddvq_f32(vaddq_f32(acc[r][0], acc[r][1]));
+#else
+        for (int r = 0; r < R; ++r) sum[r] = 0.f;
+#endif
+        for (; d < D; ++d) {
+            const float kv = detail::half_to_float(kj[d]);
+            for (int r = 0; r < R; ++r) sum[r] += q[r * D + d] * kv;
+        }
+        for (int r = 0; r < R; ++r) probs[r * ld + j] = sum[r];
+    }
+}
+
+// out (R rows, stride ldo) = probs[:, :first] @ v for the `first` fp16 values v (rows of D).
+template <int R>
+void apply_half_rows(const float* probs, int64_t first, int64_t ld, int64_t D, const uint16_t* v, float* out, int64_t ldo) {
+    for (int r = 0; r < R; ++r) std::fill(out + r * ldo, out + r * ldo + D, 0.f);
+    for (int64_t j = 0; j < first; ++j) {
+        float p[R];
+        bool any = false;
+        for (int r = 0; r < R; ++r) any |= (p[r] = probs[r * ld + j]) != 0.f;
+        if (!any) continue;  // masked for every row (or past the window)
+        const uint16_t* vj = v + j * D;
+        int64_t d = 0;
+#if defined(__aarch64__)
+        for (; d + 8 <= D; d += 8) {
+            const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(vj + d));
+            const float32x4_t lo = vcvt_f32_f16(vget_low_f16(h)), hi = vcvt_high_f32_f16(h);
+            for (int r = 0; r < R; ++r) {
+                float* o = out + r * ldo + d;
+                vst1q_f32(o, vfmaq_n_f32(vld1q_f32(o), lo, p[r]));
+                vst1q_f32(o + 4, vfmaq_n_f32(vld1q_f32(o + 4), hi, p[r]));
+            }
+        }
+#endif
+        for (; d < D; ++d) {
+            const float vv = detail::half_to_float(vj[d]);
+            for (int r = 0; r < R; ++r) out[r * ldo + d] += p[r] * vv;
+        }
+    }
+}
+
+// f(0) .. f(n - 1) side by side on the threads (macOS: libdispatch's; one thread allowed, or elsewhere: in turn).
+template <typename F>
+void side_by_side(int64_t n, F&& f) {
+#if defined(__APPLE__)
+    if (n > 1 && num_threads() > 1) {
+        struct Job {
+            F* fn;
+        } job{&f};
+        dispatch_apply_f(static_cast<size_t>(n), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job,
+                         [](void* p, size_t i) { (*static_cast<Job*>(p)->fn)(static_cast<int64_t>(i)); });
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < n; ++i) f(i);
+}
+
+// R = 1..4 rows at a time over `rows` rows.
+template <typename F>
+void in_row_groups(int64_t rows, F&& f) {
+    for (int64_t r = 0; r < rows; r += 4) {
+        switch (std::min<int64_t>(4, rows - r)) {
+            case 1: f(r, std::integral_constant<int, 1>()); break;
+            case 2: f(r, std::integral_constant<int, 2>()); break;
+            case 3: f(r, std::integral_constant<int, 3>()); break;
+            default: f(r, std::integral_constant<int, 4>()); break;
+        }
+    }
+}
+
+// probs[r * ld + j] = q_r . k_j for the `first` fp16 keys k (rows of D).
+void scores_half(const float* q, int64_t rows, int64_t first, int64_t D, const uint16_t* k, float* probs, int64_t ld) {
+    if (rows <= kDirectQueryRows) {
+        in_row_groups(rows, [&](int64_t r, auto n) { scores_half_rows<decltype(n)::value>(q + r * D, first, D, k, probs + r * ld, ld); });
+        return;
+    }
+    float* wide = prefix_buffer(std::min(first, kPrefixTile) * D);
+    for (int64_t j = 0; j < first; j += kPrefixTile) {
+        const int64_t n = std::min(kPrefixTile, first - j);
+        detail::halves_to_floats(k + j * D, wide, n * D);
+        detail::gemm(/*trans_b=*/true, rows, n, D, q, D, wide, D, probs + j, ld);
+    }
+}
+
+// out (rows, stride ldo) = probs[:, :first] @ v for the `first` fp16 values v (rows of D).
+void apply_half(const float* probs, int64_t rows, int64_t first, int64_t ld, int64_t D, const uint16_t* v, float* out, int64_t ldo) {
+    if (rows <= kDirectQueryRows) {
+        in_row_groups(rows, [&](int64_t r, auto n) { apply_half_rows<decltype(n)::value>(probs + r * ld, first, ld, D, v, out + r * ldo, ldo); });
+        return;
+    }
+    float* wide = prefix_buffer(std::min(first, kPrefixTile) * D);
+    for (int64_t j = 0; j < first; j += kPrefixTile) {
+        const int64_t n = std::min(kPrefixTile, first - j);
+        detail::halves_to_floats(v + j * D, wide, n * D);
+        detail::gemm(/*trans_b=*/false, rows, D, n, probs + j, ld, wide, D, out, ldo, /*accumulate=*/j > 0);
+    }
+}
+
 // Attention of n queries at positions first, first+1, ... over keys 0..first+n-1 for one head.
 // Keys and values of positions before `first` come from (kp, vp), the rest from (kn, vn), all
 // rows of D floats. `probs` (n rows, stride ld >= first + n) receives the attention pattern: each
@@ -764,7 +917,7 @@ struct HeadAttention {
     float slope;       // ALiBi slope, 0 = none
     int64_t window;    // 0 = none
 
-    void pattern(const float* q, int64_t n, int64_t first, const float* kp, const float* kn, float* probs,
+    void pattern(const float* q, int64_t n, int64_t first, Prefix kp, const float* kn, float* probs,
                  int64_t ld) const {
         scores(q, n, first, n, kp, kn, probs, ld);
         for (int64_t r = 0; r < n; ++r) finish(probs + r * ld, first + r, first + n);
@@ -772,9 +925,10 @@ struct HeadAttention {
 
     // Raw scores q . k of `rows` query rows (stride D) against keys 0..first-1 (kp) and the n_new keys
     // after them (kn) into probs (stride ld). Rows may be several heads' queries sharing these keys.
-    void scores(const float* q, int64_t rows, int64_t first, int64_t n_new, const float* kp, const float* kn, float* probs,
+    void scores(const float* q, int64_t rows, int64_t first, int64_t n_new, Prefix kp, const float* kn, float* probs,
                 int64_t ld) const {
-        if (first) detail::gemm(/*trans_b=*/true, rows, first, D, q, D, kp, D, probs, ld);
+        if (first && kp.h) scores_half(q, rows, first, D, kp.h, probs, ld);
+        else if (first) detail::gemm(/*trans_b=*/true, rows, first, D, q, D, kp.f, D, probs, ld);
         detail::gemm(/*trans_b=*/true, rows, n_new, D, q, D, kn, D, probs + first, ld);
     }
 
@@ -796,15 +950,16 @@ struct HeadAttention {
     }
 
     // out (n rows, stride ldo) = probs @ values.
-    void apply(const float* probs, int64_t n, int64_t first, int64_t ld, const float* vp, const float* vn, float* out,
+    void apply(const float* probs, int64_t n, int64_t first, int64_t ld, Prefix vp, const float* vn, float* out,
                int64_t ldo) const {
         apply_rows(probs, n, first, n, ld, vp, vn, out, ldo);
     }
 
     // apply for `rows` rows of weights over keys 0..first-1 (vp) and the n_new after them (vn).
-    void apply_rows(const float* probs, int64_t rows, int64_t first, int64_t n_new, int64_t ld, const float* vp, const float* vn,
+    void apply_rows(const float* probs, int64_t rows, int64_t first, int64_t n_new, int64_t ld, Prefix vp, const float* vn,
                     float* out, int64_t ldo) const {
-        if (first) detail::gemm(/*trans_b=*/false, rows, D, first, probs, ld, vp, D, out, ldo);
+        if (first && vp.h) apply_half(probs, rows, first, ld, D, vp.h, out, ldo);
+        else if (first) detail::gemm(/*trans_b=*/false, rows, D, first, probs, ld, vp.f, D, out, ldo);
         detail::gemm(/*trans_b=*/false, rows, D, n_new, probs + first, ld, vn, D, out, ldo, /*accumulate=*/first > 0);
     }
 };
@@ -872,12 +1027,12 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         for (int64_t h = 0; h < H; ++h) {
             ha.slope = slopes.empty() ? 0.f : slopes[h];
             const float* kh = k.ptr() + (h / rep) * T * D;
-            ha.pattern(q.ptr() + h * T * D, T, 0, nullptr, kh, pattern.ptr() + h * T * T, T);
+            ha.pattern(q.ptr() + h * T * D, T, 0, Prefix{}, kh, pattern.ptr() + h * T * T, T);
         }
         hook(hooks, hook_name(layer, kHookPattern), pattern);
         for (int64_t h = 0; h < H; ++h) {
             const float* vh = v.ptr() + (h / rep) * T * D;
-            ha.apply(pattern.ptr() + h * T * T, T, 0, T, nullptr, vh, z + h * D, H * D);
+            ha.apply(pattern.ptr() + h * T * T, T, 0, T, Prefix{}, vh, z + h * D, H * D);
         }
     } else if (batch->cached) {
         // One segment continuing a cached sequence (forward_cached). The rep query heads sharing a key /
@@ -885,23 +1040,22 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         // applied as one matrix: each key / value head's cached positions are read once, not rep times.
         // A hook on hook_pattern gets the new queries' pattern over every key, (H, T, first + T).
         const int64_t first = batch->start.at(0), nk = first + T, GR = rep * T;
-        const Tensor* pk = first ? batch->prefix_k.at(layer) : nullptr;
-        const Tensor* pv = first ? batch->prefix_v.at(layer) : nullptr;
-        const int64_t Tp = pk ? pk->shape[1] : 0;
+        const detail::KVRef* pk = first ? &batch->prefix_k.at(layer) : nullptr;
+        const detail::KVRef* pv = first ? &batch->prefix_v.at(layer) : nullptr;
         const bool want = hooks && hooks->matches(hook_name(layer, kHookPattern));
         Tensor pattern = want ? Tensor({H, T, nk}) : Tensor();
         std::vector<float> group_probs(want ? 0 : static_cast<size_t>(GR * nk)), out(static_cast<size_t>(GR * D));
         auto probs_of = [&](int64_t g) { return want ? pattern.ptr() + g * GR * nk : group_probs.data(); };
         auto score = [&](int64_t g) {
             float* P = probs_of(g);
-            ha.scores(q.ptr() + g * GR * D, GR, first, T, pk ? pk->ptr() + g * Tp * D : nullptr, k.ptr() + g * T * D, P, nk);
+            ha.scores(q.ptr() + g * GR * D, GR, first, T, prefix_of(pk, g), k.ptr() + g * T * D, P, nk);
             for (int64_t j = 0; j < rep; ++j) {
                 ha.slope = slopes.empty() ? 0.f : slopes[g * rep + j];
                 for (int64_t r = 0; r < T; ++r) ha.finish(P + (j * T + r) * nk, first + r, nk);
             }
         };
         auto apply = [&](int64_t g) {  // into `out` (head j, row r) = row j T + r, then to z (T, H, D)
-            ha.apply_rows(probs_of(g), GR, first, T, nk, pv ? pv->ptr() + g * Tp * D : nullptr, v.ptr() + g * T * D, out.data(), D);
+            ha.apply_rows(probs_of(g), GR, first, T, nk, prefix_of(pv, g), v.ptr() + g * T * D, out.data(), D);
             for (int64_t j = 0; j < rep; ++j)
                 for (int64_t r = 0; r < T; ++r)
                     std::copy(out.data() + (j * T + r) * D, out.data() + (j * T + r + 1) * D, z + (r * H + g * rep + j) * D);
@@ -911,6 +1065,24 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
             hook(hooks, hook_name(layer, kHookPattern), pattern);
             if (pattern.numel() != H * T * nk) throw std::runtime_error(hook_name(layer, kHookPattern) + ": a hook changed the activation's size");
             for (int64_t g = 0; g < Hkv; ++g) apply(g);
+        } else if (pk && pk->h && first * D * Hkv >= side_by_side_values()) {
+            // An fp16 cache: its prefix is read by kernels running on one core each (the library's float32 multiply
+            // uses the matrix units), so over a long prefix the key / value heads go side by side, each with buffers
+            // of its own (a short one costs less than waking the threads). Each head's arithmetic is the same
+            // whatever the threads.
+            side_by_side(Hkv, [&](int64_t g) {
+                HeadAttention hg = ha;  // (its slope changes per head)
+                std::vector<float> P(static_cast<size_t>(GR * nk)), o(static_cast<size_t>(GR * D));
+                hg.scores(q.ptr() + g * GR * D, GR, first, T, prefix_of(pk, g), k.ptr() + g * T * D, P.data(), nk);
+                for (int64_t j = 0; j < rep; ++j) {
+                    hg.slope = slopes.empty() ? 0.f : slopes[g * rep + j];
+                    for (int64_t r = 0; r < T; ++r) hg.finish(P.data() + (j * T + r) * nk, first + r, nk);
+                }
+                hg.apply_rows(P.data(), GR, first, T, nk, prefix_of(pv, g), v.ptr() + g * T * D, o.data(), D);
+                for (int64_t j = 0; j < rep; ++j)
+                    for (int64_t r = 0; r < T; ++r)
+                        std::copy(o.data() + (j * T + r) * D, o.data() + (j * T + r + 1) * D, z + (r * H + g * rep + j) * D);
+            });
         } else {
             for (int64_t g = 0; g < Hkv; ++g) {
                 score(g);
@@ -921,17 +1093,14 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         std::vector<float> probs;
         for (size_t s = 0; s < batch->start.size(); ++s) {
             const int64_t first = batch->start[s], n = batch->len[s], off = batch->offset[s], nk = first + n;
-            const Tensor* pk = first ? batch->prefix_k_of(s, layer) : nullptr;
-            const Tensor* pv = first ? batch->prefix_v_of(s, layer) : nullptr;
-            const int64_t Tp = pk ? pk->shape[1] : 0;
+            const detail::KVRef* pk = first ? &batch->prefix_k_of(s, layer) : nullptr;
+            const detail::KVRef* pv = first ? &batch->prefix_v_of(s, layer) : nullptr;
             probs.resize(n * nk);
             for (int64_t h = 0; h < H; ++h) {
                 const int64_t g = h / rep;
                 ha.slope = slopes.empty() ? 0.f : slopes[h];
-                ha.pattern(q.ptr() + (h * T + off) * D, n, first, pk ? pk->ptr() + g * Tp * D : nullptr,
-                           k.ptr() + (g * T + off) * D, probs.data(), nk);
-                ha.apply(probs.data(), n, first, nk, pv ? pv->ptr() + g * Tp * D : nullptr, v.ptr() + (g * T + off) * D,
-                         z + (off * H + h) * D, H * D);
+                ha.pattern(q.ptr() + (h * T + off) * D, n, first, prefix_of(pk, g), k.ptr() + (g * T + off) * D, probs.data(), nk);
+                ha.apply(probs.data(), n, first, nk, prefix_of(pv, g), v.ptr() + (g * T + off) * D, z + (off * H + h) * D, H * D);
             }
         }
     }
@@ -1137,15 +1306,15 @@ void add_kv_rounding(Hooks& h, int64_t layers) {
 #ifdef TFI_USE_ACCELERATE
 // Floats a KV slot needs for n values: n, or for fp16 values half that.
 int64_t kv_floats(bool half, int64_t n) { return half ? (n + 1) / 2 : n; }
-// Positions [from, to) of a CPU cache tensor (H, c, D) into GPU slot `slot` (H, Tp, D) at position base + j:
-// copied, or for an fp16 cache converted (exactly: the values are already fp16 ones).
-void upload_rows(detail::GpuKV& kv, int slot, const Tensor& cpu, int64_t Tp, int64_t base, int64_t from, int64_t to) {
-    const int64_t H = cpu.shape[0], c = cpu.shape[1], D = cpu.shape[2], n = (to - from) * D;
+// Positions [from, to) of a CPU cache layer (H, c, D: float32 f, or for an fp16 cache fp16 bits h) into GPU slot
+// `slot` (H, Tp, D) at position base + j, copied as they are (both copies hold the cache's type).
+void upload_rows(detail::GpuKV& kv, int slot, const float* f, const uint16_t* bits, int64_t H, int64_t c, int64_t D, int64_t Tp,
+                 int64_t base, int64_t from, int64_t to) {
+    const int64_t n = (to - from) * D;
     for (int64_t h = 0; h < H; ++h) {
-        const float* src = cpu.ptr() + (h * c + from) * D;
-        const int64_t at = (h * Tp + base + from) * D;
-        if (kv.half) detail::floats_to_halves(src, reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at, n);
-        else std::copy(src, src + n, kv.seq->data(slot) + at);
+        const int64_t src = (h * c + from) * D, at = (h * Tp + base + from) * D;
+        if (kv.half) std::copy(bits + src, bits + src + n, reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at);
+        else std::copy(f + src, f + src + n, kv.seq->data(slot) + at);
     }
 }
 #endif
@@ -1188,23 +1357,47 @@ void KVCache::truncate(int64_t n) {
 void KVCache::shapes(const std::vector<int64_t>& heads, const std::vector<int64_t>& dims) {
     if (!k_.empty()) return;
     for (size_t l = 0; l < heads.size(); ++l) {
-        k_.push_back(Tensor({heads[l], 0, dims[l]}));
-        v_.push_back(Tensor({heads[l], 0, dims[l]}));
+        k_.push_back(Store{heads[l], 0, dims[l], {}, {}});
+        v_.push_back(Store{heads[l], 0, dims[l], {}, {}});
     }
 }
 
 void KVCache::reserve_cpu(int64_t n) const {
     for (int pass = 0; pass < 2; ++pass)
-        for (Tensor& t : pass ? v_ : k_) {
-            const int64_t H = t.shape[0], cap = t.shape[1], D = t.shape[2];
-            if (n <= cap) continue;
+        for (Store& t : pass ? v_ : k_) {
+            if (n <= t.cap) continue;
             // geometrically, with room after a prompt, so that appending one position at a time stays linear
-            const int64_t grown = std::max({n + std::max<int64_t>(16, n / 2), 2 * cap});
-            Tensor g({H, grown, D});
-            for (int64_t h = 0; h < H; ++h)
-                std::copy(t.ptr() + h * cap * D, t.ptr() + (h * cap + cpu_len_) * D, g.ptr() + h * grown * D);
-            t = std::move(g);
+            const int64_t grown = std::max({n + std::max<int64_t>(16, n / 2), 2 * t.cap});
+            auto regrow = [&](auto& old) {
+                std::remove_reference_t<decltype(old)> g(static_cast<size_t>(t.H * grown * t.D));
+                for (int64_t h = 0; h < t.H; ++h)
+                    std::copy(old.begin() + h * t.cap * t.D, old.begin() + (h * t.cap + cpu_len_) * t.D, g.begin() + h * grown * t.D);
+                old = std::move(g);
+            };
+            if (half_) regrow(t.h);
+            else regrow(t.f);
+            t.cap = grown;
         }
+}
+
+void KVCache::put(Store& s, const float* src, int64_t n, int64_t at) const {
+    for (int64_t h = 0; h < s.H; ++h) {
+        const float* from = src + h * n * s.D;
+        const int64_t to = (h * s.cap + at) * s.D;
+        if (half_) detail::floats_to_halves(from, s.h.data() + to, n * s.D);  // fp16 values already (add_kv_rounding)
+        else std::copy(from, from + n * s.D, s.f.data() + to);
+    }
+}
+
+detail::KVRef KVCache::ref(int64_t layer, bool values) const {
+    const Store& s = (values ? v_ : k_).at(static_cast<size_t>(layer));
+    detail::KVRef r;
+    if (half_) r.h = s.h.data();
+    else r.f = s.f.data();
+    r.H = s.H;
+    r.T = s.cap;
+    r.D = s.D;
+    return r;
 }
 
 void KVCache::sync_cpu() const {
@@ -1215,15 +1408,17 @@ void KVCache::sync_cpu() const {
     const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
     auto gpu_halves = [&](int slot) { return reinterpret_cast<const uint16_t*>(gpu_->seq->data(slot)); };
     for (size_t l = 0; l < k_.size(); ++l) {
-        const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
+        const int64_t H = k_[l].H, c = k_[l].cap, D = k_[l].D;
         for (int64_t h = 0; h < H; ++h) {
-            const int64_t from = (h * Tp + base + cpu_len_) * D, n = (len_ - cpu_len_) * D;
-            float* dk = k_[l].ptr() + (h * c + cpu_len_) * D;
-            float* dv = v_[l].ptr() + (h * c + cpu_len_) * D;
-            if (gpu_->half) {  // fp16 values, exactly as float32
-                detail::halves_to_floats(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, dk, n);
-                detail::halves_to_floats(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, dv, n);
+            const int64_t from = (h * Tp + base + cpu_len_) * D, n = (len_ - cpu_len_) * D, to = (h * c + cpu_len_) * D;
+            if (gpu_->half) {  // fp16 on both sides: copied as they are
+                const uint16_t* gk = gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
+                const uint16_t* gv = gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
+                std::copy(gk, gk + n, k_[l].h.data() + to);
+                std::copy(gv, gv + n, v_[l].h.data() + to);
             } else {
+                float* dk = k_[l].f.data() + to;
+                float* dv = v_[l].f.data() + to;
                 const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l)));
                 const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l)));
                 std::copy(gk + from, gk + from + n, dk);
@@ -1242,6 +1437,7 @@ std::atomic<int> g_check_kv{-1};  // -1: TFI_CHECK_KV decides
 }  // namespace
 
 void detail::set_check_kv(bool on) { g_check_kv = on ? 1 : 0; }
+void detail::set_kv_side_by_side(int64_t values) { g_side_by_side = values; }
 
 void KVCache::check() const {
     if (g_check_kv.load() < 0) {
@@ -1258,64 +1454,61 @@ void KVCache::check() const {
     const int64_t Tp = gpu_->cap * gpu_->regions, base = region_ * gpu_->cap;
     auto gpu_halves = [&](int slot) { return reinterpret_cast<const uint16_t*>(gpu_->seq->data(slot)); };
     for (size_t l = 0; l < k_.size(); ++l) {
-        const int64_t H = k_[l].shape[0], c = k_[l].shape[1], D = k_[l].shape[2];
-        std::vector<float> gk(static_cast<size_t>(both * D)), gv(static_cast<size_t>(both * D));
+        const int64_t H = k_[l].H, c = k_[l].cap, D = k_[l].D;
         for (int64_t h = 0; h < H; ++h) {
-            const int64_t from = (h * Tp + base) * D;
-            if (gpu_->half) {
-                detail::halves_to_floats(gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from, gk.data(), both * D);
-                detail::halves_to_floats(gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from, gv.data(), both * D);
+            const int64_t from = (h * Tp + base) * D, to = h * c * D, n = both * D;
+            bool same;
+            if (gpu_->half) {  // bit for bit
+                const uint16_t* gk = gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
+                const uint16_t* gv = gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
+                same = std::equal(gk, gk + n, k_[l].h.data() + to) && std::equal(gv, gv + n, v_[l].h.data() + to);
             } else {
-                const float* k = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
-                const float* v = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
-                std::copy(k, k + both * D, gk.begin());
-                std::copy(v, v + both * D, gv.begin());
+                const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
+                const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
+                same = std::equal(gk, gk + n, k_[l].f.data() + to) && std::equal(gv, gv + n, v_[l].f.data() + to);
             }
-            if (!std::equal(gk.begin(), gk.end(), k_[l].ptr() + h * c * D) || !std::equal(gv.begin(), gv.end(), v_[l].ptr() + h * c * D))
-                throw std::logic_error("KVCache: the CPU and GPU copies differ in layer " + std::to_string(l));
+            if (!same) throw std::logic_error("KVCache: the CPU and GPU copies differ in layer " + std::to_string(l));
         }
     }
 #endif
 }
 
-namespace {
-// Positions [0, n) of a cache tensor (H, capacity, D).
-Tensor cache_prefix(const std::vector<Tensor>& t, int64_t layer, int64_t n) {
-    if (layer < 0 || layer >= static_cast<int64_t>(t.size()))
-        throw std::out_of_range("KVCache: no layer " + std::to_string(layer) + (t.empty() ? " (the cache is empty)" : ""));
-    const Tensor& c = t[layer];
-    const int64_t H = c.shape[0], cap = c.shape[1], D = c.shape[2];
-    Tensor out({H, n, D});
-    for (int64_t h = 0; h < H; ++h) std::copy(c.ptr() + h * cap * D, c.ptr() + (h * cap + n) * D, out.ptr() + h * n * D);
-    return out;
-}
-}  // namespace
-
 Tensor KVCache::keys(int64_t layer) const {
     sync_cpu();
-    return cache_prefix(k_, layer, len_);
+    if (layer < 0 || layer >= static_cast<int64_t>(k_.size()))
+        throw std::out_of_range("KVCache: no layer " + std::to_string(layer) + (k_.empty() ? " (the cache is empty)" : ""));
+    const detail::KVRef r = ref(layer, false);
+    Tensor out({r.H, len_, r.D});
+    for (int64_t h = 0; h < r.H; ++h) {  // positions [0, len_) of each head, as float32 (fp16 values widened exactly)
+        if (r.h) detail::halves_to_floats(r.h + h * r.T * r.D, out.ptr() + h * len_ * r.D, len_ * r.D);
+        else std::copy(r.f + h * r.T * r.D, r.f + (h * r.T + len_) * r.D, out.ptr() + h * len_ * r.D);
+    }
+    return out;
 }
 Tensor KVCache::values(int64_t layer) const {
     sync_cpu();
-    return cache_prefix(v_, layer, len_);
+    if (layer < 0 || layer >= static_cast<int64_t>(v_.size()))
+        throw std::out_of_range("KVCache: no layer " + std::to_string(layer) + (v_.empty() ? " (the cache is empty)" : ""));
+    const detail::KVRef r = ref(layer, true);
+    Tensor out({r.H, len_, r.D});
+    for (int64_t h = 0; h < r.H; ++h) {
+        if (r.h) detail::halves_to_floats(r.h + h * r.T * r.D, out.ptr() + h * len_ * r.D, len_ * r.D);
+        else std::copy(r.f + h * r.T * r.D, r.f + (h * r.T + len_) * r.D, out.ptr() + h * len_ * r.D);
+    }
+    return out;
 }
 
 void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n) {
     if (cpu_len_ != len_) throw std::logic_error("KVCache::append: the CPU side is not up to date");
     if (k_.empty())
         for (size_t l = 0; l < k.size(); ++l) {
-            k_.push_back(Tensor({k[l].shape[0], 0, k[l].shape[2]}));
-            v_.push_back(Tensor({v[l].shape[0], 0, v[l].shape[2]}));
+            k_.push_back(Store{k[l].shape[0], 0, k[l].shape[2], {}, {}});
+            v_.push_back(Store{v[l].shape[0], 0, v[l].shape[2], {}, {}});
         }
     reserve_cpu(len_ + n);
-    for (int pass = 0; pass < 2; ++pass) {
-        std::vector<Tensor>& dst = pass ? v_ : k_;
-        const std::vector<Tensor>& src = pass ? v : k;
-        for (size_t l = 0; l < src.size(); ++l) {
-            const int64_t H = src[l].shape[0], D = src[l].shape[2], c = dst[l].shape[1];
-            for (int64_t h = 0; h < H; ++h)
-                std::copy(src[l].ptr() + h * n * D, src[l].ptr() + (h + 1) * n * D, dst[l].ptr() + (h * c + len_) * D);
-        }
+    for (size_t l = 0; l < k.size(); ++l) {
+        put(k_[l], k[l].ptr(), n, len_);
+        put(v_[l], v[l].ptr(), n, len_);
     }
     len_ += n;
     cpu_len_ = len_;
@@ -1326,8 +1519,7 @@ void Model::check_cache(const KVCache& cache) const {
     if (cache.len_) {  // the cache must be this model's: a tensor per layer, each with the layer's heads
         bool ok = static_cast<int64_t>(cache.k_.size()) == L;
         for (int64_t l = 0; ok && l < L; ++l)
-            ok = cache.k_[l].dim() == 3 && cache.k_[l].shape[0] == layer_cfgs_[l].kv_heads() &&
-                 cache.k_[l].shape[2] == layer_cfgs_[l].head_dim();
+            ok = cache.k_[l].H == layer_cfgs_[l].kv_heads() && cache.k_[l].D == layer_cfgs_[l].head_dim();
         if (!ok) throw std::invalid_argument("forward_cached: the cache holds another model's keys and values");
     }
     // fp16 values for a model with fp16 weights; a cache keeps the precision of its first step.
@@ -1386,8 +1578,9 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
     // Positions only the CPU holds (CPU steps, a copy, the buffers growing): up to the GPU. The CPU
     // holds them all whenever the GPU lacks any (the invariant).
     for (int64_t l = 0; l < L && cache.gpu_len_ < upload_to; ++l) {
-        upload_rows(kv, detail::GpuKV::keys(l), cache.k_[l], kv.cap, 0, cache.gpu_len_, upload_to);
-        upload_rows(kv, detail::GpuKV::values(l), cache.v_[l], kv.cap, 0, cache.gpu_len_, upload_to);
+        const KVCache::Store &ck = cache.k_[l], &cv = cache.v_[l];
+        upload_rows(kv, detail::GpuKV::keys(l), ck.f.data(), ck.h.data(), ck.H, ck.cap, ck.D, kv.cap, 0, cache.gpu_len_, upload_to);
+        upload_rows(kv, detail::GpuKV::values(l), cv.f.data(), cv.h.data(), cv.H, cv.cap, cv.D, kv.cap, 0, cache.gpu_len_, upload_to);
     }
     cache.gpu_len_ = std::max(cache.gpu_len_, upload_to);
     rb.gpu = g;
@@ -1410,8 +1603,8 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
     if (!on_gpu && start) {
         cache.sync_cpu();
         for (int64_t l = 0; l < L; ++l) {
-            rb.prefix_k.push_back(&cache.k_[l]);
-            rb.prefix_v.push_back(&cache.v_[l]);
+            rb.prefix_k.push_back(cache.ref(l, false));
+            rb.prefix_v.push_back(cache.ref(l, true));
         }
     }
     // On the CPU: the new positions' keys and values, as the pass leaves them after any hooks, appended at the end.
@@ -1495,8 +1688,8 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
     if (!on_gpu) {
         cache.sync_cpu();
         for (int64_t l = 0; l < L; ++l) {
-            rb.prefix_k.push_back(&cache.k_[l]);
-            rb.prefix_v.push_back(&cache.v_[l]);
+            rb.prefix_k.push_back(cache.ref(l, false));
+            rb.prefix_v.push_back(cache.ref(l, true));
         }
     }
     std::vector<Tensor> new_k(L), new_v(L);
@@ -1528,12 +1721,7 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
                 throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " + shape_str(want));
         }
         for (int64_t l = layer; l < L; ++l)
-            for (int pass = 0; pass < 2; ++pass) {
-                Tensor& dst = pass ? cache.v_[l] : cache.k_[l];
-                const Tensor& src = pass ? new_v[l] : new_k[l];
-                const int64_t H = src.shape[0], D = src.shape[2], c = dst.shape[1];
-                for (int64_t hh = 0; hh < H; ++hh) std::copy(src.ptr() + hh * D, src.ptr() + (hh + 1) * D, dst.ptr() + (hh * c + pos) * D);
-            }
+            for (int pass = 0; pass < 2; ++pass) cache.put(pass ? cache.v_[l] : cache.k_[l], (pass ? new_v[l] : new_k[l]).ptr(), 1, pos);
         cache.gpu_len_ = std::min(cache.gpu_len_, pos);  // the CPU's copy has the new values at pos
     }
     cache.check();
@@ -1558,7 +1746,7 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         if (c.len_) {
             bool ok = static_cast<int64_t>(c.k_.size()) == L;
             for (int64_t l = 0; ok && l < L; ++l)
-                ok = c.k_[l].dim() == 3 && c.k_[l].shape[0] == layer_cfgs_[l].kv_heads() && c.k_[l].shape[2] == layer_cfgs_[l].head_dim();
+                ok = c.k_[l].H == layer_cfgs_[l].kv_heads() && c.k_[l].D == layer_cfgs_[l].head_dim();
             if (!ok) throw std::invalid_argument("forward_cached: the batch holds another model's keys and values");
         }
         const int64_t T = static_cast<int64_t>(tokens[i].size());
@@ -1626,8 +1814,9 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
             const int64_t i = seq_of[sg], start = rb.start[sg];
             KVCache& c = kb.caches_[i];
             for (int64_t l = 0; l < L && c.gpu_len_ < start; ++l) {
-                upload_rows(kv, detail::GpuKV::keys(l), c.k_[l], Tp, i * kv.cap, c.gpu_len_, start);
-                upload_rows(kv, detail::GpuKV::values(l), c.v_[l], Tp, i * kv.cap, c.gpu_len_, start);
+                const KVCache::Store &ck = c.k_[l], &cv = c.v_[l];
+                upload_rows(kv, detail::GpuKV::keys(l), ck.f.data(), ck.h.data(), ck.H, ck.cap, ck.D, Tp, i * kv.cap, c.gpu_len_, start);
+                upload_rows(kv, detail::GpuKV::values(l), cv.f.data(), cv.h.data(), cv.H, cv.cap, cv.D, Tp, i * kv.cap, c.gpu_len_, start);
             }
             c.gpu_len_ = start;
             rb.kbase.push_back(i * kv.cap);
@@ -1642,10 +1831,10 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         for (int64_t sg = 0; sg < S; ++sg) {  // each sequence's CPU side, up to date, as its prefix
             const KVCache& c = kb.caches_[seq_of[sg]];
             c.sync_cpu();
-            std::vector<const Tensor*> pk, pv;
+            std::vector<detail::KVRef> pk, pv;
             for (int64_t l = 0; l < L && c.len_; ++l) {
-                pk.push_back(&c.k_[l]);
-                pv.push_back(&c.v_[l]);
+                pk.push_back(c.ref(l, false));
+                pv.push_back(c.ref(l, true));
             }
             rb.seg_prefix_k.push_back(std::move(pk));
             rb.seg_prefix_v.push_back(std::move(pv));
@@ -2352,13 +2541,14 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
             }
             gb.write_layer_inputs(l);
             if (!prefixed) return int64_t(0);
-            const Tensor* pk = batch.prefix_k.at(l);
-            const Tensor* pv = batch.prefix_v.at(l);
-            if (!pk || !pv || pk->dim() != 3 || pk->shape[0] != Hkv || pk->shape[2] != D || pv->shape != pk->shape)
-                throw std::invalid_argument("forward_rows: prefix keys / values must be (Hkv, T, D) for every layer");
-            std::copy(pk->ptr(), pk->ptr() + pk->numel(), s.reserve(kPK, pk->numel()));
-            std::copy(pv->ptr(), pv->ptr() + pv->numel(), s.reserve(kPV, pv->numel()));
-            return pk->shape[1];
+            const detail::KVRef& pk = batch.prefix_k.at(l);
+            const detail::KVRef& pv = batch.prefix_v.at(l);
+            if (!pk.f || !pv.f || pk.H != Hkv || pk.D != D || pv.H != pk.H || pv.T != pk.T || pv.D != pk.D)  // (a cached run's: float32)
+                throw std::invalid_argument("forward_rows: prefix keys / values must be float32 (Hkv, T, D) for every layer");
+            const int64_t n = pk.H * pk.T * pk.D;
+            std::copy(pk.f, pk.f + n, s.reserve(kPK, n));
+            std::copy(pv.f, pv.f + n, s.reserve(kPV, n));
+            return pk.T;
         };
         gb.hooks = hooks;
         gb.fp16 = batch.fp16;

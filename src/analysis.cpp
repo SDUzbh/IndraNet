@@ -653,8 +653,8 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
         const Batch& b = batches[j];
         const int64_t i = b.layer;
         detail::RowBatch rb;
-        rb.prefix_k = prefix_k;
-        rb.prefix_v = prefix_v;
+        rb.prefix_k.assign(prefix_k.begin(), prefix_k.end());
+        rb.prefix_v.assign(prefix_v.begin(), prefix_v.end());
         rb.gpu = gpu;
         rb.fp16 = fp16;
         for (int64_t t : b.items) rb.add(t, P - t);

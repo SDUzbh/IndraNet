@@ -2,6 +2,7 @@
 // Not part of the public API.
 #pragma once
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,9 @@ void set_patch_batch_rows(int64_t residual, int64_t heads);
 // For tests: check every KV cache after each forward_cached step (KVCache::check: the up-to-date prefixes
 // of its CPU and GPU copies, and their values where both hold them), as TFI_CHECK_KV=1 does.
 void set_check_kv(bool on);
+// For tests: cached keys (of one layer) from which an fp16 cache's key / value heads run side by side on the CPU;
+// 0 restores the default.
+void set_kv_side_by_side(int64_t values);
 // For tests (macOS): false runs a batched pass's GPU work one linear layer at a time, the residual
 // stream returning to the CPU after each, instead of keeping it on the GPU (Model::run_rows).
 void set_gpu_resident(bool on);
@@ -101,9 +105,28 @@ bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool st
 float exp_weight(float x);  // exp(x) for x <= 0, 0 below -87 and for NaN
 void exp_weights(const float* logits, int64_t n, float top, float scale, float* w);
 
+// One layer's earlier keys or values for attention, (H, T, D) row-major: float32 (a cached run's hook_k /
+// hook_v, a float32 KV cache) or fp16 bit patterns (a KV cache kept in fp16, read as it is). From a Tensor
+// pointer implicitly (null: none).
+struct KVRef {
+    const float* f = nullptr;
+    const uint16_t* h = nullptr;
+    int64_t H = 0, T = 0, D = 0;
+    KVRef() = default;
+    KVRef(const Tensor* t) {  // NOLINT(google-explicit-constructor): RowBatch's prefixes were Tensor pointers
+        if (!t) return;
+        if (t->dim() != 3) throw std::invalid_argument("prefix keys / values must be (Hkv, T, D), got " + shape_str(t->shape));
+        f = t->ptr();
+        H = t->shape[0];
+        T = t->shape[1];
+        D = t->shape[2];
+    }
+    bool empty() const { return !f && !h; }
+};
+
 struct RowBatch {
     std::vector<int64_t> start, len, offset;
-    std::vector<const Tensor*> prefix_k, prefix_v;  // per layer; unused when every start is 0
+    std::vector<KVRef> prefix_k, prefix_v;  // per layer; unused when every start is 0
     Gpu* gpu = nullptr;  // macOS: if set, the blocks run on the GPU (Model::run_rows)
     bool fp16 = false;   // ... with fp16 multiply inputs (Gpu::linear, Gpu::Seq)
     bool whole = false;  // one whole sequence (a single pass, Model::forward_from): hook_pattern runs as there
@@ -117,10 +140,10 @@ struct RowBatch {
     // Several sequences (Model::forward_cached on a KVBatch): segment s's earlier keys and values, per
     // layer, instead of the shared prefix_k / prefix_v; and (with kv) where its region starts in the
     // GPU's buffers, which hold every sequence's positions, a region each.
-    std::vector<std::vector<const Tensor*>> seg_prefix_k, seg_prefix_v;
+    std::vector<std::vector<KVRef>> seg_prefix_k, seg_prefix_v;
     std::vector<int64_t> kbase;
-    const Tensor* prefix_k_of(size_t s, int64_t layer) const { return seg_prefix_k.empty() ? prefix_k.at(layer) : seg_prefix_k.at(s).at(layer); }
-    const Tensor* prefix_v_of(size_t s, int64_t layer) const { return seg_prefix_v.empty() ? prefix_v.at(layer) : seg_prefix_v.at(s).at(layer); }
+    const KVRef& prefix_k_of(size_t s, int64_t layer) const { return seg_prefix_k.empty() ? prefix_k.at(layer) : seg_prefix_k.at(s).at(layer); }
+    const KVRef& prefix_v_of(size_t s, int64_t layer) const { return seg_prefix_v.empty() ? prefix_v.at(layer) : seg_prefix_v.at(s).at(layer); }
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());

@@ -3225,12 +3225,13 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
     // An fp16 step of difference in a key moves logits by ~1e-3; on the GPU the multiplies' fp16 inputs add ~1e-3 each.
     const bool gpu = device() != Device::Cpu && m16.gpu();
     const double rel = gpu ? 2e-2 : 2e-3, of_scale = gpu ? 2e-3 : 1e-4;
-    auto close = [rel, of_scale](const Tensor& got, const Tensor& w) {
+    auto close_to = [](const Tensor& got, const Tensor& w, double rel, double of_scale) {
         CHECK(got.shape == w.shape);
         const float sc = max_abs(w);
         for (int64_t i = 0; i < got.numel() && got.shape == w.shape; ++i)
             CHECK_NEAR(got.data[i], w.data[i], rel * std::max(1.f, std::fabs(w.data[i])) + of_scale * sc);
     };
+    auto close = [&](const Tensor& got, const Tensor& w) { close_to(got, w, rel, of_scale); };
     KVCache cache;
     std::vector<Tensor> parts{m16.forward_cached(Tokens(t.begin(), t.begin() + 6), cache)};
     for (int64_t i : {6, 7}) parts.push_back(m16.forward_cached({t[i]}, cache));
@@ -3242,6 +3243,34 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
         bool exact = true;  // every stored value an fp16 one
         for (float v : k.data) exact = exact && detail::half_to_float(detail::float_to_half(v)) == v;
         CHECK(exact);
+    }
+    // A chunk of 20 tokens continuing a cache: more query rows than the fp16 prefix is read a row at a time for (it
+    // is widened as a block and multiplied in the library).
+    {
+        const Tokens t2 = seq(24, 75);
+        const Tensor want2 = m16.forward(t2, &round);
+        KVCache c2;
+        std::vector<Tensor> p2{m16.forward_cached(Tokens(t2.begin(), t2.begin() + 4), c2)};
+        p2.push_back(m16.forward_cached(Tokens(t2.begin() + 4, t2.end()), c2));
+        // 24 positions through up to 12 layers: more keys near an fp16 rounding boundary, each a step (~3e-4 of the
+        // scale) where the two round differently.
+        close_to(stack_rows(p2), want2, rel, std::max(of_scale, 5e-4));
+    }
+    // Over a long prefix the key / value heads go side by side on the CPU: the same bits as one after another, for
+    // any thread count (forced here from one cached key).
+    if (device() == Device::Cpu) {
+        auto steps = [&](int64_t threshold, int64_t threads) {
+            detail::set_kv_side_by_side(threshold);
+            set_num_threads(threads);
+            KVCache c3;
+            std::vector<Tensor> p3{m16.forward_cached(Tokens(t.begin(), t.begin() + 6), c3)};
+            for (int64_t i = 6; i < 12; ++i) p3.push_back(m16.forward_cached({t[static_cast<size_t>(i)]}, c3));
+            detail::set_kv_side_by_side(0);
+            set_num_threads(0);
+            return stack_rows(p3);
+        };
+        const Tensor in_turn = steps(int64_t(1) << 40, 0);
+        CHECK(steps(1, 0).data == in_turn.data && steps(1, 1).data == in_turn.data && steps(1, 3).data == in_turn.data);
     }
     KVBatch batch(2);
     const std::vector<Tensor> two = m16.forward_cached({Tokens(t.begin(), t.begin() + 5), Tokens(t.begin(), t.begin() + 9)}, batch);
@@ -3258,7 +3287,10 @@ static void test_fp16_kv(const Model& m16, const ModelConfig& cfg) {
     KVCache big;
     std::vector<Tensor> big_parts{m16.forward_cached(Tokens(t.begin(), t.begin() + 4), big, &huge)};
     for (int64_t i : {4, 5, 6}) big_parts.push_back(m16.forward_cached({t[i]}, big, &huge));
-    close(stack_rows(big_parts), rows(want_big, 0, 7));
+    // Keys at 65504 give scores around 1e6, where adding a dot product in another order (an fp16 cache's keys are
+    // read a row at a time; the whole pass multiplies in the library) moves a score by ~0.1 and a peaked softmax
+    // with it: a looser tolerance for this ill-conditioned case (measured: 2.8e-3).
+    close_to(stack_rows(big_parts), rows(want_big, 0, 7), std::max(rel, 1e-2), std::max(of_scale, 1e-2));
     bool finite = true;
     for (float v : big.keys(0).data) finite = finite && std::isfinite(v) && std::fabs(v) <= 65504.f;
     CHECK(finite);

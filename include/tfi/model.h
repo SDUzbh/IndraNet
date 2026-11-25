@@ -19,6 +19,7 @@ namespace tfi {
 
 namespace detail {
 struct RowBatch;  // internal (src/model/ops.h)
+struct KVRef;     // internal (src/model/ops.h): earlier keys or values for attention
 struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model/model.cpp)
 class Gpu;        // internal (src/gpu/gpu.h, macOS)
 struct GpuKV;     // internal (src/gpu/gpu.h, macOS): a KVCache's copy on the GPU
@@ -77,9 +78,9 @@ class Model;
 // continues on its own: several continuations of one prompt can share its prefill.
 //
 // With a model whose weights are fp16 (WeightFormat::fp16, the indra CLI's --fp16), the keys and values are
-// rounded to fp16 where they are stored (after the hooks, clamped to fp16's finite range), and the GPU's
-// copy is held in fp16: half the memory, at an error about that of fp16 weights. Float32 models keep them
-// in float32, exactly.
+// rounded to fp16 where they are stored (after the hooks, clamped to fp16's finite range), and both copies
+// below hold them in fp16: half the memory, at an error about that of fp16 weights (keys() and values() give
+// them as float32). Float32 models keep them in float32, exactly.
 //
 // Two places may hold them: the CPU's tensors and (macOS, when steps run on the GPU) the GPU's buffers,
 // so that a sequence generated on the GPU isn't kept twice. Both are prefixes of the sequence, since a
@@ -108,19 +109,28 @@ class KVCache {
   private:
     friend class Model;
     friend class KVBatch;
-    // Per layer (Hkv, capacity, D): room to grow without copying each step. Mutable: reading the CPU side
-    // brings it up to date from the GPU first.
-    mutable std::vector<Tensor> k_, v_;
+    // One layer's keys or values on the CPU, (H, cap, D): room to grow without copying each step. float32 (f),
+    // or for an fp16 cache fp16 bit patterns (h): half the memory, as the GPU's copy.
+    struct Store {
+        int64_t H = 0, cap = 0, D = 0;
+        std::vector<float> f;
+        std::vector<uint16_t> h;
+    };
+    // Per layer. Mutable: reading the CPU side brings it up to date from the GPU first.
+    mutable std::vector<Store> k_, v_;
     int64_t len_ = 0;
     mutable int64_t cpu_len_ = 0;
     // macOS: the GPU's copy (its region `region_` of the buffers: a KVBatch keeps every sequence's in one).
     std::shared_ptr<detail::GpuKV> gpu_;
     int64_t region_ = 0;
     int64_t gpu_len_ = 0;
-    // fp16 values (a model with fp16 weights): keys and values rounded to fp16 where they are stored, and
-    // the GPU's copy held in fp16 (half the memory); the CPU copy holds the same values as float32. Set by
-    // the first step: a model of the other precision can't continue the cache.
+    // fp16 values (a model with fp16 weights): keys and values rounded to fp16 where they are stored, and both
+    // copies held in fp16 (half the memory). Set by the first step, before anything is stored: a model of the
+    // other precision can't continue the cache.
     bool half_ = false;
+    detail::KVRef ref(int64_t layer, bool values) const;  // layer's CPU copy, for attention on the CPU
+    // Rows n of the CPU copy from position `at` (every head), from float32 values (fp16 ones, for an fp16 cache).
+    void put(Store& s, const float* src, int64_t n, int64_t at) const;
     void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);  // on the CPU, which is up to date
     void sync_cpu() const;                // [cpu_len_, size()) from the GPU
     void reserve_cpu(int64_t n) const;    // CPU capacity for n positions, keeping [0, cpu_len_)
