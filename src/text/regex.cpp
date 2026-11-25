@@ -40,16 +40,17 @@ char32_t upper(char32_t c) { return c >= 'a' && c <= 'z' ? c - 32 : c; }
 
 bool item_matches(const Node::Item& it, char32_t c, bool icase) {
     bool m = false;
+    using enum Node::Item::Type;
     switch (it.type) {
-        case Node::Item::Range: {
+        case Range: {
             auto in = [&](char32_t x) { return x >= it.lo && x <= it.hi; };
             m = in(c) || (icase && (in(fold(c)) || in(upper(c))));  // (?i:...): ASCII letters in either case
             break;
         }
-        case Node::Item::Category: m = unicode_in_category(c, it.category); break;
-        case Node::Item::Space: m = unicode_white_space(c); break;
-        case Node::Item::Digit: m = unicode_in_category(c, "Nd"); break;
-        case Node::Item::Word:
+        case Category: m = unicode_in_category(c, it.category); break;
+        case Space: m = unicode_white_space(c); break;
+        case Digit: m = unicode_in_category(c, "Nd"); break;
+        case Word:
             m = unicode_letter(c) || unicode_in_category(c, "M") || unicode_in_category(c, "Nd") ||
                 unicode_in_category(c, "Pc");
             break;
@@ -59,10 +60,11 @@ bool item_matches(const Node::Item& it, char32_t c, bool icase) {
 
 // Whether node (a single-character matcher) matches c.
 bool single(const Node& n, char32_t c) {
+    using enum Node::Kind;
     switch (n.kind) {
-        case Node::Char: return n.icase ? fold(c) == fold(n.c) : c == n.c;
-        case Node::Any: return c != '\n';
-        case Node::Class: {
+        case Char: return n.icase ? fold(c) == fold(n.c) : c == n.c;
+        case Any: return c != '\n';
+        case Class: {
             bool m = false;
             for (const auto& it : n.items)
                 if (item_matches(it, c, n.icase)) {
@@ -242,7 +244,7 @@ class Parser {
                     look->children.push_back(alternation(icase));
                     inner = std::move(look);
                 } else {
-                    fail("unsupported group (?" + std::string(1, static_cast<char>(peek())) + "...)");
+                    fail(std::format("unsupported group (?{}...)", static_cast<char>(peek())));
                 }
             } else {
                 inner = alternation(icase);
@@ -314,20 +316,21 @@ class Matcher {
     explicit Matcher(const U32String& s) : s_(s) {}
 
     bool match(const Node& n, size_t i, const Cont& k) const {
+        using enum Node::Kind;
         switch (n.kind) {
-            case Node::Char:
-            case Node::Any:
-            case Node::Class: return i < s_.size() && single(n, s_[i]) && k(i + 1);
-            case Node::Seq: return seq(n, 0, i, k);
-            case Node::Alt:
+            case Char:
+            case Any:
+            case Class: return i < s_.size() && single(n, s_[i]) && k(i + 1);
+            case Seq: return seq(n, 0, i, k);
+            case Alt:
                 for (const auto& c : n.children)
                     if (match(*c, i, k)) return true;
                 return false;
-            case Node::Look: {
+            case Look: {
                 const bool found = match(*n.children[0], i, [](size_t) { return true; });
                 return found != n.look_negative && k(i);
             }
-            case Node::Repeat: {
+            case Repeat: {
                 const Node& child = *n.children[0];
                 if (is_single(child)) {  // a loop, not recursion: long runs can't overflow the stack
                     size_t run = 0;

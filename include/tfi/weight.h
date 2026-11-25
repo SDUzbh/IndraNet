@@ -48,7 +48,7 @@ class Weight {
     bool is_borrowed() const { return borrowed_; }  // values in memory owned elsewhere (see borrowed())
 
     int64_t numel() const;
-    int64_t dim() const { return static_cast<int64_t>(shape.size()); }
+    int64_t dim() const { return std::ssize(shape); }
     bool is_fp16() const { return half_; }
     int64_t bytes() const { return numel() * (is_fp16() ? 2 : 4); }  // memory the values take
 

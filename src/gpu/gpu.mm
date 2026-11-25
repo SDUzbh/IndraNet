@@ -902,7 +902,7 @@ struct Gpu::Impl {
     }
 
     id<MTLBuffer> shared_buffer(const Weight& W) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         auto it = shared.find(W.data());
         if (it != shared.end()) return it->second;
         // The buffer keeps the weight's memory alive (Weight allocates it page-aligned, in whole pages).
@@ -921,7 +921,7 @@ struct Gpu::Impl {
 
     // A GPU copy of n floats at p (fp16 when asked: nil if a value doesn't fit), cached by address.
     id<MTLBuffer> copy_buffer(const float* p, int64_t n, bool fp16) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         auto& cache = fp16 ? weights_fp16 : weights;
         auto it = cache.find(p);
         if (it != cache.end()) return it->second;
@@ -938,7 +938,7 @@ struct Gpu::Impl {
     id<MTLBuffer> acquire(size_t bytes) {
         {
             // The smallest free buffer that fits, so small requests don't take large buffers.
-            std::lock_guard<std::mutex> lock(mutex);
+            std::scoped_lock lock(mutex);
             size_t best = pool.size();
             for (size_t i = 0; i < pool.size(); ++i)
                 if (pool[i].length >= bytes && (best == pool.size() || pool[i].length < pool[best].length)) best = i;
@@ -954,7 +954,7 @@ struct Gpu::Impl {
     }
 
     void release(id<MTLBuffer> b) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         pool.push_back(b);
     }
 
@@ -1045,7 +1045,8 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const We
     for (const Weight* W : Ws) {
         if (W->dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
         if (W->shape[1] != k)
-            throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W->shape));
+            throw std::invalid_argument(
+                std::format("linear: input {} vs weight {}", shape_str(x.shape), shape_str(W->shape)));
         Shape shape(x.shape.begin(), x.shape.end() - 1);
         shape.push_back(W->shape[0]);
         ys.emplace_back(std::move(shape));
@@ -1345,10 +1346,11 @@ struct Gpu::Seq::Impl {
     }
 
     void encode(const Op& op, bool fp16) {
+        using enum Op::Kind;
         switch (op.kind) {
-            case Op::Linear: encode_linear(op, fp16); break;
-            case Op::LinearT: encode_linear_t(op); break;
-            case Op::NormBwd: {
+            case Linear: encode_linear(op, fp16); break;
+            case LinearT: encode_linear_t(op); break;
+            case NormBwd: {
                 const int64_t d = op.W->numel();
                 need(op.a, op.rows * d);
                 need(op.b, op.rows * d);
@@ -1368,8 +1370,8 @@ struct Gpu::Seq::Impl {
                     threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
-            case Op::ActBwd:
-            case Op::GluBwd: {
+            case ActBwd:
+            case GluBwd: {
                 const bool glu = op.kind == Op::GluBwd;
                 need(op.a, op.n);
                 need(op.b, op.n);
@@ -1393,7 +1395,7 @@ struct Gpu::Seq::Impl {
                 dispatch(glu ? g.glu_bwd_k : g.act_bwd_k, op.n);
                 break;
             }
-            case Op::Norm: {
+            case Norm: {
                 const int64_t d = op.W->numel();
                 need(op.a, op.rows * d);
                 need(op.c, op.rows * d);
@@ -1413,8 +1415,8 @@ struct Gpu::Seq::Impl {
                     threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
-            case Op::Act:
-            case Op::Glu: {
+            case Act:
+            case Glu: {
                 need(op.a, op.n);
                 if (op.kind == Op::Glu) need(op.b, op.n);
                 if (op.n == 0) break;
@@ -1427,7 +1429,7 @@ struct Gpu::Seq::Impl {
                 dispatch(op.kind == Op::Act ? g.act_k : g.glu_k, op.n);
                 break;
             }
-            case Op::RoundHalf: {
+            case RoundHalf: {
                 need(op.a, op.n);
                 if (op.n == 0) break;
                 const uint32_t cnt = u32(op.n);
@@ -1438,7 +1440,7 @@ struct Gpu::Seq::Impl {
                 dispatch(g.round_half_k, op.n);
                 break;
             }
-            case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, inverse = an fp16 cache
+            case KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, inverse = an fp16 cache
                 const int64_t n = op.rows * op.heads * op.D;
                 need(op.a, op.offset + n);
                 need(op.c,
@@ -1454,7 +1456,7 @@ struct Gpu::Seq::Impl {
                 dispatch(g.kv_append_k, n);
                 break;
             }
-            case Op::Rope: {
+            case Rope: {
                 const int64_t half = op.rot / 2, rows = op.rows * op.heads;
                 need(op.a, rows * op.D);
                 need(op.c, rows * op.D);
@@ -1484,7 +1486,7 @@ struct Gpu::Seq::Impl {
                 }
                 break;
             }
-            case Op::Attention: {
+            case Attention: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
                     throw std::invalid_argument(
@@ -1581,8 +1583,8 @@ struct Gpu::Seq::Impl {
                     threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
-            case Op::Pattern:
-            case Op::Apply: {
+            case Pattern:
+            case Apply: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.Hkv <= 0 || A.H % A.Hkv)
                     throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
@@ -1622,7 +1624,7 @@ struct Gpu::Seq::Impl {
                 }
                 break;
             }
-            case Op::AttentionBwd: {
+            case AttentionBwd: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
                     throw std::invalid_argument(
@@ -1687,8 +1689,8 @@ struct Gpu::Seq::Impl {
                 }
                 break;
             }
-            case Op::Add:
-            case Op::Copy: {
+            case Add:
+            case Copy: {
                 need(op.a, op.n + op.offset);
                 need(op.c, op.n + (op.kind == Op::Copy ? op.offset_y : 0));
                 if (op.kind == Op::Add) need(op.b, op.n);

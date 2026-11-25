@@ -305,8 +305,8 @@ Tensor Model::run_with_gradients(const Tokens& tokens, const std::function<Tenso
     Tensor logits = run_with_cache(tokens, cache, nullptr, hooks);
     Tensor dl = dlogits_fn(logits);
     if (dl.shape != logits.shape)
-        throw std::invalid_argument("dlogits must have the logits' shape " + shape_str(logits.shape) + ", got " +
-                                    shape_str(dl.shape));
+        throw std::invalid_argument(std::format("dlogits must have the logits' shape {}, got {}",
+                                                shape_str(logits.shape), shape_str(dl.shape)));
     if (cfg_.final_logit_softcap) {  // logits = cap * tanh(raw / cap): d/draw = 1 - (logits / cap)^2
         const float cap = static_cast<float>(*cfg_.final_logit_softcap);
         for (int64_t i = 0; i < dl.numel(); ++i) {

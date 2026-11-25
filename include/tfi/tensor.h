@@ -23,8 +23,8 @@ struct Tensor {
     explicit Tensor(Shape s, float fill = 0.f);
     Tensor(Shape s, std::vector<float> d);
 
-    int64_t numel() const { return static_cast<int64_t>(data.size()); }
-    int64_t dim() const { return static_cast<int64_t>(shape.size()); }
+    int64_t numel() const { return std::ssize(data); }
+    int64_t dim() const { return std::ssize(shape); }
     int64_t size(int64_t i) const;  // negative i counts from the end
     bool empty() const { return data.empty(); }
     float* ptr() { return data.data(); }

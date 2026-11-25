@@ -22,7 +22,7 @@ using detail::utf8_encode;
 namespace {
 
 [[noreturn]] void unsupported(const std::string& what) {
-    throw std::runtime_error("tokenizer.json: " + what + " is not supported");
+    throw std::runtime_error(std::format("tokenizer.json: {} is not supported", what));
 }
 
 const json::Value* field(const json::Value& v, const char* key) {
@@ -96,7 +96,7 @@ Behavior behavior_of(const std::string& b) {
     if (b == "MergedWithPrevious") return Behavior::MergedWithPrevious;
     if (b == "MergedWithNext") return Behavior::MergedWithNext;
     if (b == "Contiguous") return Behavior::Contiguous;
-    unsupported("split behavior '" + b + "'");
+    unsupported(std::format("split behavior '{}'", b));
 }
 
 // tokenizers' NormalizedString::split: the string cut at the pattern's matches, the pieces kept as
@@ -113,22 +113,23 @@ std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& 
     if (prev < s.size() || parts.empty()) parts.push_back({{prev, s.size()}, invert});
     std::vector<std::pair<size_t, size_t>> out;
     bool previous_match = false;
+    using enum Behavior;
     switch (behavior) {
-        case Behavior::Removed:
-            for (const auto& p : parts)
-                if (!p.second) out.push_back(p.first);
+        case Removed:
+            for (const auto& [range, matched] : parts)
+                if (!matched) out.push_back(range);
             break;
-        case Behavior::Isolated:
-            for (const auto& p : parts) out.push_back(p.first);
+        case Isolated:
+            for (const auto& [range, matched] : parts) out.push_back(range);
             break;
-        case Behavior::MergedWithPrevious:
-            for (const auto& p : parts) {
-                if (p.second && !previous_match && !out.empty()) out.back().second = p.first.second;
-                else out.push_back(p.first);
-                previous_match = p.second;
+        case MergedWithPrevious:
+            for (const auto& [range, matched] : parts) {
+                if (matched && !previous_match && !out.empty()) out.back().second = range.second;
+                else out.push_back(range);
+                previous_match = matched;
             }
             break;
-        case Behavior::MergedWithNext:
+        case MergedWithNext:
             for (size_t k = parts.size(); k-- > 0;) {
                 const auto& p = parts[k];
                 if (p.second && !previous_match && !out.empty()) out.back().first = p.first.first;
@@ -137,11 +138,11 @@ std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& 
             }
             std::ranges::reverse(out);
             break;
-        case Behavior::Contiguous:
-            for (const auto& p : parts) {
-                if (p.second == previous_match && !out.empty()) out.back().second = p.first.second;
-                else out.push_back(p.first);
-                previous_match = p.second;
+        case Contiguous:
+            for (const auto& [range, matched] : parts) {
+                if (matched == previous_match && !out.empty()) out.back().second = range.second;
+                else out.push_back(range);
+                previous_match = matched;
             }
             break;
     }
@@ -199,13 +200,13 @@ struct Tokenizer::Impl {
 
     void prepare_decoding() {
         int64_t n = 0;
-        for (const auto& kv : vocab) n = std::max(n, kv.second + 1);
+        for (const auto& [token, id] : vocab) n = std::max(n, id + 1);
         for (const Added& a : added) n = std::max(n, a.id + 1);
         id_text.assign(static_cast<size_t>(n), std::string());
         id_kind.assign(static_cast<size_t>(n), -1);
-        for (const auto& kv : vocab) {
-            id_text[kv.second] = kv.first;
-            id_kind[kv.second] = 0;
+        for (const auto& [token, id] : vocab) {
+            id_text[id] = token;
+            id_kind[id] = 0;
         }
         for (const Added& a : added) {
             id_text[a.id] = utf8_encode(a.content);
@@ -240,7 +241,7 @@ struct Tokenizer::Impl {
         } else if (type == "Prepend") {
             normalizers.push_back({.kind = Normalizer::Prepend, .content = utf8_decode(n.at("prepend").as_string())});
         } else {
-            unsupported("normalizer '" + type + "'");
+            unsupported(std::format("normalizer '{}'", type));
         }
     }
 
@@ -273,17 +274,17 @@ struct Tokenizer::Impl {
             if (field(p, "prepend_scheme")) t.prepend_scheme = text(p, "prepend_scheme");
             else t.prepend_scheme = flag(p, "add_prefix_space", true) ? "always" : "never";
             if (t.prepend_scheme != "always" && t.prepend_scheme != "first" && t.prepend_scheme != "never")
-                unsupported("Metaspace prepend_scheme '" + t.prepend_scheme + "'");
+                unsupported(std::format("Metaspace prepend_scheme '{}'", t.prepend_scheme));
             t.split = flag(p, "split", true);
         } else {
-            unsupported("pre_tokenizer '" + type + "'");
+            unsupported(std::format("pre_tokenizer '{}'", type));
         }
         pre_tokenizers.push_back(std::move(t));
     }
 
     void parse_model(const json::Value& m) {
         const std::string type = text(m, "type", "BPE");
-        if (type != "BPE") unsupported("model type '" + type + "' (only BPE is)");
+        if (type != "BPE") unsupported(std::format("model type '{}' (only BPE is)", type));
         if (!text(m, "continuing_subword_prefix").empty() || !text(m, "end_of_word_suffix").empty())
             unsupported("BPE with continuing_subword_prefix / end_of_word_suffix");
         if (const json::Value* d = field(m, "dropout"); d && d->as_number() > 0) unsupported("BPE dropout");
@@ -296,7 +297,8 @@ struct Tokenizer::Impl {
         if (const json::Value* u = field(m, "unk_token")) {
             auto it = vocab.find(u->as_string());
             if (it == vocab.end())
-                throw std::runtime_error("tokenizer.json: unk_token '" + u->as_string() + "' is not in the vocabulary");
+                throw std::runtime_error(
+                    std::format("tokenizer.json: unk_token '{}' is not in the vocabulary", u->as_string()));
             unk = it->second;
         }
         const json::Value& ms = m.at("merges");
@@ -310,14 +312,15 @@ struct Tokenizer::Impl {
             } else {  // "a b"
                 const std::string& s = e.as_string();
                 const size_t sp = s.find(' ');
-                if (sp == std::string::npos) throw std::runtime_error("tokenizer.json: merge '" + s + "' has no space");
+                if (sp == std::string::npos)
+                    throw std::runtime_error(std::format("tokenizer.json: merge '{}' has no space", s));
                 a = s.substr(0, sp);
                 b = s.substr(sp + 1);
             }
             auto ia = vocab.find(a), ib = vocab.find(b), im = vocab.find(a + b);
             if (ia == vocab.end() || ib == vocab.end() || im == vocab.end())
-                throw std::runtime_error("tokenizer.json: merge '" + a + " " + b +
-                                         "' uses tokens not in the vocabulary");
+                throw std::runtime_error(
+                    std::format("tokenizer.json: merge '{} {}' uses tokens not in the vocabulary", a, b));
             merges.emplace((uint64_t(uint32_t(ia->second)) << 32) | uint32_t(ib->second),
                            std::make_pair(int32_t(r), im->second));
         }
@@ -348,25 +351,26 @@ struct Tokenizer::Impl {
             prefix.push_back(p.at("cls").array.at(1).as_int());
             suffix.push_back(p.at("sep").array.at(1).as_int());
         } else {
-            unsupported("post_processor '" + type + "'");
+            unsupported(std::format("post_processor '{}'", type));
         }
     }
 
     U32String normalize(U32String s) const {
         for (const Normalizer& n : normalizers) {
+            using enum Normalizer::Kind;
             switch (n.kind) {
-                case Normalizer::NFC: s = detail::unicode_nfc(s); break;
-                case Normalizer::NFD: s = detail::unicode_nfd(s); break;
-                case Normalizer::Prepend:
+                case NFC: s = detail::unicode_nfc(s); break;
+                case NFD: s = detail::unicode_nfd(s); break;
+                case Prepend:
                     if (!s.empty()) s = n.content + s;
                     break;
-                case Normalizer::Replace: {
+                case Replace: {
                     U32String out;
                     size_t prev = 0;
-                    for (const auto& m : n.pattern.find_all(s)) {
-                        out.append(s, prev, m.first - prev);
+                    for (const auto& [begin, end] : n.pattern.find_all(s)) {
+                        out.append(s, prev, begin - prev);
                         out += n.content;
-                        prev = m.second;
+                        prev = end;
                     }
                     out.append(s, prev, std::string::npos);
                     s = std::move(out);
@@ -470,7 +474,7 @@ struct Tokenizer::Impl {
             pieces = std::move(next);
         }
         std::vector<U32String> out;
-        for (auto& p : pieces) out.push_back(std::move(p.first));
+        for (auto& [piece, offsets] : pieces) out.push_back(std::move(piece));
         return out;
     }
 
@@ -549,7 +553,7 @@ Tokenizer Tokenizer::from_json(const std::string& tokenizer_json) {
         // Ids as tokenizers assigns them when it loads the file (AddedVocabulary::add_tokens): an earlier
         // added token's, else the vocabulary's, else the next free one. The ids written in the file are
         // the same for any file tokenizers saved; this follows tokenizers where one isn't.
-        const int64_t vocab_size = static_cast<int64_t>(impl->vocab.size());
+        const int64_t vocab_size = std::ssize(impl->vocab);
         std::unordered_map<std::string, int64_t> seen;
         int64_t max_id = -1;
         for (const json::Value& e : a->array) {
@@ -588,7 +592,7 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special
     for (int64_t id : ids) {
         if (id < 0) throw std::out_of_range(std::format("token {} is negative", id));
         // Ids with no token (a model's padded vocabulary rows) give nothing, as in Hugging Face.
-        if (id >= static_cast<int64_t>(m.id_kind.size()) || m.id_kind[id] < 0) continue;
+        if (id >= std::ssize(m.id_kind) || m.id_kind[id] < 0) continue;
         const std::string& tok = m.id_text[id];
         if (m.id_kind[id] == 2 && skip_special_tokens) continue;
         if (m.id_kind[id] > 0) {  // added tokens are their text

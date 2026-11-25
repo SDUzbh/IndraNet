@@ -1,6 +1,7 @@
 #include "tfi/config.h"
 
 #include <concepts>
+#include <format>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -36,7 +37,7 @@ Biases& Biases::operator=(bool all) {
 }
 
 bool Biases::has(const std::string& part) const {
-    if (!all_parts().contains(part)) throw std::logic_error("Biases: unknown part '" + part + "'");
+    if (!all_parts().contains(part)) throw std::logic_error(std::format("Biases: unknown part '{}'", part));
     return parts.contains(part);
 }
 
@@ -56,8 +57,9 @@ Biases Biases::from_json(const json::Value& v) {
     for (const json::Value& p : v.array) {
         const std::string& name = p.as_string();
         if (!all_parts().contains(name))
-            throw std::runtime_error("config: bias part '" + name + "' is not one of qkv, o, mlp, norm");
-        if (!b.parts.insert(name).second) throw std::runtime_error("config: bias part '" + name + "' given twice");
+            throw std::runtime_error(std::format("config: bias part '{}' is not one of qkv, o, mlp, norm", name));
+        if (!b.parts.insert(name).second)
+            throw std::runtime_error(std::format("config: bias part '{}' given twice", name));
     }
     return b;
 }
@@ -78,15 +80,15 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
     };
     auto it = kKeys.find(r.type);
     if (it == kKeys.end())
-        throw std::runtime_error("config: rope_scaling type '" + r.type + "' is not supported by tfi");
+        throw std::runtime_error(std::format("config: rope_scaling type '{}' is not supported by tfi", r.type));
     for (const std::string& k : it->second.first)
-        if (!v.find(k)) throw std::runtime_error("config: rope_scaling '" + r.type + "' needs '" + k + "'");
+        if (!v.find(k)) throw std::runtime_error(std::format("config: rope_scaling '{}' needs '{}'", r.type, k));
     for (size_t i = 0; i < v.keys.size(); ++i) {
         const std::string& k = v.keys[i];
         const json::Value& x = v.values[i];
         if (k == "type") continue;
         if (!it->second.first.contains(k) && !it->second.second.contains(k))
-            throw std::runtime_error("config: rope_scaling '" + r.type + "' has unknown key '" + k + "'");
+            throw std::runtime_error(std::format("config: rope_scaling '{}' has unknown key '{}'", r.type, k));
         if (k == "factor") r.factor = opt_num(x);
         else if (k == "original_max_position_embeddings") r.original_max_position_embeddings = x.as_int();
         else if (k == "low_freq_factor") r.low_freq_factor = x.as_number();
@@ -158,7 +160,7 @@ void ModelConfig::apply(const json::Value& f) {
             layer_overrides.clear();
             for (size_t j = 0; j < v.keys.size(); ++j) layer_overrides[std::stoll(v.keys[j])] = v.values[j];
         } else if (!kTrainingOnly.contains(k)) {
-            throw std::runtime_error("config: unknown field '" + k + "' (exported by a newer indranet?)");
+            throw std::runtime_error(std::format("config: unknown field '{}' (exported by a newer indranet?)", k));
         }
     }
 }
@@ -174,7 +176,7 @@ ModelConfig ModelConfig::layer_config(int64_t layer) const {
 
 void ModelConfig::validate() const {
     auto one_of = [](const std::string& field, const std::string& v, const std::set<std::string>& ok) {
-        if (!ok.contains(v)) throw std::runtime_error("config: " + field + " '" + v + "' is not supported by tfi");
+        if (!ok.contains(v)) throw std::runtime_error(std::format("config: {} '{}' is not supported by tfi", field, v));
     };
     one_of("norm", norm, {"rmsnorm", "layernorm", "none"});
     one_of("norm_position", norm_position, {"pre", "post", "sandwich"});

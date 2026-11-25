@@ -28,7 +28,7 @@ constexpr int64_t kBlockFloats = int64_t(1) << 18;
 
 std::vector<float>& block_buffer(int64_t floats) {
     thread_local std::vector<float> buf;
-    if (static_cast<int64_t>(buf.size()) < floats) buf.resize(static_cast<size_t>(floats));
+    if (std::ssize(buf) < floats) buf.resize(static_cast<size_t>(floats));
     return buf;
 }
 
@@ -242,7 +242,7 @@ Weight Weight::fp16_bits(Shape shape, const uint16_t* bits) {
     const int64_t n = shape_numel(shape);
     if (shape.size() == 2 && !detail::all_finite_halves(bits, n))
         throw std::invalid_argument("fp16 weight has infinite or NaN values");
-    return filled(std::move(shape), true, [&](void* dst) { std::copy(bits, bits + n, static_cast<uint16_t*>(dst)); });
+    return filled(std::move(shape), true, [&](void* dst) { std::copy_n(bits, n, static_cast<uint16_t*>(dst)); });
 }
 
 Weight Weight::filled(Shape shape, bool fp16, const std::function<void(void* dst)>& fill) {
@@ -330,7 +330,8 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     const int64_t in = W.shape[1], out = W.shape[0];
     if (x.size(-1) != in)
-        throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
+        throw std::invalid_argument(
+            std::format("linear: input {} vs weight {}", shape_str(x.shape), shape_str(W.shape)));
     Shape s(x.shape.begin(), x.shape.end() - 1);
     s.push_back(out);
     Tensor y(std::move(s));
@@ -394,7 +395,8 @@ Tensor matmul(const Tensor& A, const Weight& W) {
     if (A.dim() != 2 || W.dim() != 2) throw std::invalid_argument("matmul expects 2-D tensors");
     const int64_t m = A.shape[0], n = A.shape[1], k = W.shape[1];
     if (n != W.shape[0])
-        throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(W.shape));
+        throw std::invalid_argument(
+            std::format("matmul shape mismatch {} @ {}", shape_str(A.shape), shape_str(W.shape)));
     Tensor C({m, k});
     if (!m || !k || !n) return C;
     if (!W.is_fp16()) {

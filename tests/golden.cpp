@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
             metric_gradients(model, tok.data, static_cast<int64_t>(m.array.at(0).as_number()),
                              static_cast<int64_t>(m.array.at(1).as_number()),
                              static_cast<int64_t>(m.array.at(2).as_number()), grads);
-            for (auto& kv : grads) cache["grad." + kv.first] = std::move(kv.second);
+            for (auto& [name, t] : grads) cache["grad." + name] = std::move(t);
         }
 
         int failures = 0, checked = 0;
@@ -68,12 +68,12 @@ int main(int argc, char** argv) {
         }
         // A partial reference (e.g. a Hugging Face model's logits and residual stream) checks only what it has.
         const bool partial = ref.metadata.contains("partial");
-        for (const auto& kv : cache) {
+        for (const auto& [name, t] : cache) {
             if (partial) break;
-            const bool bare = kv.first == "logits" || kv.first.starts_with("grad.");
-            const std::string key = bare ? kv.first : "cache." + kv.first;
+            const bool bare = name == "logits" || name.starts_with("grad.");
+            const std::string key = bare ? name : "cache." + name;
             if (!ref.tensors.contains(key)) {
-                std::printf("EXTRA    %s (produced by tfi, not in reference)\n", kv.first.c_str());
+                std::printf("EXTRA    %s (produced by tfi, not in reference)\n", name.c_str());
                 ++failures;
             }
         }

@@ -454,8 +454,8 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
         int64_t row = 0;
         for (size_t i = 0; i < n; ++i)
             if (!step[i].empty()) {
-                ph.segs.push_back({static_cast<int64_t>(i), {row, static_cast<int64_t>(step[i].size())}});
-                row += static_cast<int64_t>(step[i].size());
+                ph.segs.push_back({static_cast<int64_t>(i), {row, std::ssize(step[i])}});
+                row += std::ssize(step[i]);
             }
         if (ph.segs.empty()) {
             if (options.kv_clamped)
@@ -470,7 +470,7 @@ std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>
             const int64_t t = samplers[i](lg.data);
             if (traces) (*traces)[i].push_back(recs[i]->step(lg.data, t, batch[static_cast<int64_t>(i)].size() - 1));
             out[i].push_back(t);
-            const bool more = !stop.contains(t) && static_cast<int64_t>(out[i].size()) < options.max_new_tokens;
+            const bool more = !stop.contains(t) && std::ssize(out[i]) < options.max_new_tokens;
             step[i] = more ? Tokens{t} : Tokens{};
         }
     }

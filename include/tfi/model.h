@@ -159,7 +159,7 @@ class KVBatch {
     }
     KVBatch(KVBatch&&) = default;
     KVBatch& operator=(KVBatch&&) = default;
-    int64_t size() const { return static_cast<int64_t>(caches_.size()); }
+    int64_t size() const { return std::ssize(caches_); }
     const KVCache& operator[](int64_t i) const { return caches_.at(static_cast<size_t>(i)); }
 
   private:

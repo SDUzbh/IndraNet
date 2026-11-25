@@ -50,16 +50,16 @@ void parallel_for(int64_t n, F&& fn) {
             try {
                 fn(i);
             } catch (...) {
-                std::lock_guard<std::mutex> lock(error_mutex);
+                std::scoped_lock lock(error_mutex);
                 if (!error) error = std::current_exception();
                 next = n;  // stop handing out jobs
             }
         }
     };
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     for (int64_t w = 1; w < workers; ++w) threads.emplace_back(work);
     work();
-    for (auto& t : threads) t.join();
+    threads.clear();  // joins them
     if (error) std::rethrow_exception(error);
 }
 
@@ -84,7 +84,7 @@ NameFilter only(std::set<std::string> names) {
 }
 
 void check_pos(const Tokens& tokens, int64_t pos) {
-    if (pos < 0 || pos >= static_cast<int64_t>(tokens.size()))
+    if (pos < 0 || pos >= std::ssize(tokens))
         throw std::out_of_range(std::format("position {} is outside the sequence", pos));
 }
 
@@ -200,7 +200,7 @@ float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t ot
 }
 
 float next_token_loss(const Tensor& logits, const Tokens& tokens) {
-    const int64_t T = static_cast<int64_t>(tokens.size());
+    const int64_t T = std::ssize(tokens);
     if (T < 2) throw std::invalid_argument("loss needs at least two tokens");
     double s = 0;
     for (int64_t t = 0; t + 1 < T; ++t) s -= log_softmax_at(logits.row_view(t), tokens[t + 1]);
@@ -228,7 +228,7 @@ std::vector<std::pair<std::string, std::string>> lens_stages(const Model& m) {
 
 std::vector<std::string> lens_hook_points(const Model& m) {
     std::vector<std::string> out;
-    for (const auto& st : lens_stages(m)) out.push_back(st.second);
+    for (const auto& [label, hook] : lens_stages(m)) out.push_back(hook);
     return out;
 }
 
@@ -236,7 +236,7 @@ std::vector<LensEntry> logit_lens_from(const Model& m, const ActivationCache& ca
                                        int64_t k) {
     if (target >= 0) check_token(m, target, "target");
     const std::vector<std::pair<std::string, std::string>> stages = lens_stages(m);
-    const int64_t d = m.cfg().d_model, S = static_cast<int64_t>(stages.size());
+    const int64_t d = m.cfg().d_model, S = std::ssize(stages);
     // Every stage's row, decoded together: one pass over the unembedding instead of one per stage.
     Tensor stack({S, d});
     for (int64_t s = 0; s < S; ++s) {
@@ -448,7 +448,7 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
                 for (int64_t hb = 0; hb < heads(b); ++hb)
                     s.top_two_hop.push_back(
                         {head_label(a, ha), head_label(b, hb), two_hop[((a * H + ha) * L + b) * H + hb]});
-    std::ranges::sort(s.top_two_hop, [](const TwoHop& x, const TwoHop& y) { return x.score > y.score; });
+    std::ranges::sort(s.top_two_hop, std::ranges::greater{}, &TwoHop::score);
     if (s.top_two_hop.size() > 5) s.top_two_hop.resize(5);
     return s;
 }
@@ -550,7 +550,7 @@ struct Batch {
 // so the threads finish together.
 std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_layer,
                                 const std::function<int64_t(int64_t)>& rows, int64_t max_rows) {
-    const int64_t L = static_cast<int64_t>(items_per_layer.size());
+    const int64_t L = std::ssize(items_per_layer);
     std::vector<Batch> batches;
     for (int64_t i = 0; i < L; ++i) {
         std::ranges::sort(items_per_layer[i]);  // batches depend only on the set of sites
@@ -567,7 +567,7 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
         }
         if (!b.items.empty()) flush();
     }
-    std::ranges::stable_sort(batches, [](const Batch& a, const Batch& b) { return a.cost > b.cost; });
+    std::ranges::stable_sort(batches, std::ranges::greater{}, &Batch::cost);
     return batches;
 }
 
@@ -575,8 +575,8 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
 // Multiply-adds per row per block, about: the blocks' 2-D weights over the layers.
 double block_weights_per_layer(const Model& m) {
     double n = 0;
-    for (const auto& kv : m.weights())
-        if (kv.second.dim() == 2 && kv.first.starts_with("blocks.")) n += static_cast<double>(kv.second.numel());
+    for (const auto& [name, w] : m.weights())
+        if (w.dim() == 2 && name.starts_with("blocks.")) n += static_cast<double>(w.numel());
     return n / static_cast<double>(std::max<int64_t>(1, m.cfg().n_layers));
 }
 
@@ -614,10 +614,11 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
                                  int64_t pos, int64_t target, int64_t other, const std::vector<Site>* selected,
                                  const PatchRuns* runs = nullptr) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
-    if (std::ranges::find(sites, site) == sites.end()) throw std::invalid_argument("unknown patch site '" + site + "'");
+    if (std::ranges::find(sites, site) == sites.end())
+        throw std::invalid_argument(std::format("unknown patch site '{}'", site));
     check_patch_inputs(m, clean, corrupt, pos, target, other);
-    const int64_t L = m.cfg().n_layers, T = static_cast<int64_t>(clean.size()), d = m.cfg().d_model, P = pos + 1;
-    auto hook_name = [&](int64_t i) { return lp(i) + "hook_" + site; };
+    const int64_t L = m.cfg().n_layers, T = std::ssize(clean), d = m.cfg().d_model, P = pos + 1;
+    auto hook_name = [&](int64_t i) { return std::format("{}hook_{}", lp(i), site); };
 
     std::set<std::string> needed, corrupt_needed;
     for (int64_t i = 0; i < L; ++i) {
@@ -660,7 +661,7 @@ PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Toke
     const std::vector<Batch> batches = make_batches(todo, [P](int64_t t) { return P - t; }, batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
     const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
-    parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
+    parallel_for(std::ssize(batches), [&](int64_t j) {
         const Batch& b = batches[j];
         const int64_t i = b.layer;
         detail::RowBatch rb;
@@ -728,7 +729,7 @@ PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens&
     const std::vector<Batch> batches = make_batches(todo, [P](int64_t) { return P; }, head_batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
     const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
-    parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
+    parallel_for(std::ssize(batches), [&](int64_t j) {
         const Batch& b = batches[j];
         const int64_t i = b.layer, Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
         detail::RowBatch rb;
@@ -736,8 +737,7 @@ PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens&
         rb.fp16 = fp16;
         for (size_t s = 0; s < b.items.size(); ++s) rb.add(0, P);
         Tensor x({rb.rows(), d});
-        for (size_t s = 0; s < b.items.size(); ++s)
-            std::copy(start[i]->ptr(), start[i]->ptr() + P * d, x.ptr() + rb.offset[s] * d);
+        for (size_t s = 0; s < b.items.size(); ++s) std::copy_n(start[i]->ptr(), P * d, x.ptr() + rb.offset[s] * d);
         const Tensor* sp = src[i];
         Hooks hooks;
         hooks.add(lp(i) + "attn.hook_z", [&](const std::string&, Tensor& act) {  // each pass's head, every position
@@ -885,8 +885,8 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     std::vector<ActivationCache> step_grads(steps);
     // Jobs: the clean run, the corrupted run (with step 0's gradients when that is on the CPU), the
     // GPU batches, then the other CPU steps.
-    const int64_t n_cpu_jobs = static_cast<int64_t>(cpu_steps.size()) - (corrupt_on_cpu ? 1 : 0);
-    const int64_t n_gpu = static_cast<int64_t>(gpu_batches.size());
+    const int64_t n_cpu_jobs = std::ssize(cpu_steps) - (corrupt_on_cpu ? 1 : 0);
+    const int64_t n_gpu = std::ssize(gpu_batches);
     std::vector<int64_t> later_cpu;
     for (int64_t k : cpu_steps)
         if (k != 0) later_cpu.push_back(k);
@@ -913,7 +913,7 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
             for (int64_t k : b.items) {
                 const Hooks h = interpolate(k);
                 const Tensor e = m.embed(x, &h);
-                std::copy(e.ptr(), e.ptr() + e.numel(), x0.ptr() + rb.rows() * m.cfg().d_model);
+                std::copy_n(e.ptr(), e.numel(), x0.ptr() + rb.rows() * m.cfg().d_model);
                 rb.add(0, P);
             }
             std::vector<ActivationCache> g = m.gradients_rows(
@@ -930,18 +930,19 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     });
     a.grads = std::move(step_grads[0]);
     if (steps > 1)
-        for (auto& kv : a.grads) {  // average, summing in step order: deterministic
-            for (int64_t k = 1; k < steps; ++k) add_(kv.second, step_grads[k].at(kv.first));
-            kv.second = scale(kv.second, 1.f / static_cast<float>(steps));
+        for (auto& [name, t] : a.grads) {  // average, summing in step order: deterministic
+            for (int64_t k = 1; k < steps; ++k) add_(t, step_grads[k].at(name));
+            t = scale(t, 1.f / static_cast<float>(steps));
         }
     return a;
 }
 
 std::set<std::string> residual_names(const Model& m, const std::string& site) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
-    if (std::ranges::find(sites, site) == sites.end()) throw std::invalid_argument("unknown patch site '" + site + "'");
+    if (std::ranges::find(sites, site) == sites.end())
+        throw std::invalid_argument(std::format("unknown patch site '{}'", site));
     std::set<std::string> names;
-    for (int64_t i = 0; i < m.cfg().n_layers; ++i) names.insert(lp(i) + "hook_" + site);
+    for (int64_t i = 0; i < m.cfg().n_layers; ++i) names.insert(std::format("{}hook_{}", lp(i), site));
     return names;
 }
 
@@ -970,7 +971,7 @@ PatchResult attribution_residual_result(const Model& m, const AttributionRuns& a
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back(std::format("L{}", i));
     for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
     for (int64_t i = 0; i < L; ++i) {
-        const std::string n = lp(i) + "hook_" + site;
+        const std::string n = std::format("{}hook_{}", lp(i), site);
         if (!a.runs.clean_cache.contains(n)) continue;  // site doesn't exist in this layer: stays NaN
         const Tensor &cl = a.runs.clean_cache.at(n), &co = a.runs.corrupt_cache.at(n), &g = a.grads.at(n);
         for (int64_t t = 0; t < T; ++t) {
@@ -1016,7 +1017,7 @@ PatchResult attribution_patch_residual(const Model& m, const Tokens& clean, cons
                                        int64_t steps) {
     const std::set<std::string> names = residual_names(m, site);
     const AttributionRuns a = prepare_attribution(m, clean, corrupt, pos, target, other, names, steps);
-    return attribution_residual_result(m, a, site, pos, static_cast<int64_t>(clean.size()));
+    return attribution_residual_result(m, a, site, pos, std::ssize(clean));
 }
 
 PatchResult attribution_patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos,
@@ -1038,9 +1039,8 @@ std::vector<Site> top_sites(const Tensor& estimate, int64_t verify, Usable usabl
     std::vector<int64_t> idx;
     for (int64_t i = 0; i < estimate.numel(); ++i)
         if (!std::isnan(estimate.data[i]) && usable(i / cols, i % cols)) idx.push_back(i);
-    std::ranges::stable_sort(
-        idx, [&](int64_t a, int64_t b) { return std::fabs(estimate.data[a]) > std::fabs(estimate.data[b]); });
-    if (static_cast<int64_t>(idx.size()) > verify) idx.resize(static_cast<size_t>(verify));
+    std::ranges::stable_sort(idx, std::ranges::greater{}, [&](int64_t i) { return std::fabs(estimate.data[i]); });
+    if (std::ssize(idx) > verify) idx.resize(static_cast<size_t>(verify));
     std::vector<Site> sites;
     for (int64_t i : idx) sites.emplace_back(i / cols, i % cols);
     return sites;
@@ -1068,7 +1068,7 @@ PatchResult mixed_patch_residual(const Model& m, const Tokens& clean, const Toke
                                  int64_t pos, int64_t target, int64_t other, int64_t verify, int64_t steps) {
     const AttributionRuns a = prepare_attribution(m, clean, corrupt, pos, target, other, residual_names(m, site), steps,
                                                   {}, exact_corrupt_extra(m, true));
-    PatchResult atp = attribution_residual_result(m, a, site, pos, static_cast<int64_t>(clean.size()));
+    PatchResult atp = attribution_residual_result(m, a, site, pos, std::ssize(clean));
     const std::vector<Site> sites = top_sites(atp.effect, verify, [pos](int64_t, int64_t t) { return t <= pos; });
     const PatchResult exact = exact_patch_residual(m, clean, corrupt, site, pos, target, other, &sites, &a.runs);
     return merge_mixed(std::move(atp), exact, sites);
@@ -1092,21 +1092,20 @@ PatchResult mixed_patch_heads(const Model& m, const Tokens& clean, const Tokens&
 // the same for any thread count.
 HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64_t T) {
     if (reference.empty()) throw std::invalid_argument("mean ablation needs at least one reference sequence");
-    const int64_t L = m.cfg().n_layers, R = static_cast<int64_t>(reference.size());
-    const bool per_position =
-        std::ranges::all_of(reference, [T](const Tokens& r) { return static_cast<int64_t>(r.size()) == T; });
+    const int64_t L = m.cfg().n_layers, R = std::ssize(reference);
+    const bool per_position = std::ranges::all_of(reference, [T](const Tokens& r) { return std::ssize(r) == T; });
     HeadMeans means;
     std::vector<double> counts(L, 0.0);
     for (int64_t i = 0; i < L; ++i)
         means.layers.emplace_back(Shape{per_position ? T : 1, m.layer_cfg(i).n_heads, m.layer_cfg(i).head_dim()});
     std::vector<int64_t> all(R);
     for (int64_t n = 0; n < R; ++n) all[n] = n;
-    const std::vector<Batch> batches = make_batches(
-        {all}, [&](int64_t n) { return static_cast<int64_t>(reference[n].size()); }, ablation_batch_rows());
+    const std::vector<Batch> batches =
+        make_batches({all}, [&](int64_t n) { return std::ssize(reference[n]); }, ablation_batch_rows());
     detail::Gpu* const gpu = gpu_for(m, batches);
     const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     std::vector<std::vector<Tensor>> zs(R, std::vector<Tensor>(L));  // reference n, layer i: (len, H, D)
-    parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
+    parallel_for(std::ssize(batches), [&](int64_t j) {
         const Batch& b = batches[j];
         detail::RowBatch rb;
         rb.gpu = gpu;
@@ -1114,7 +1113,7 @@ HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64
         std::vector<Tensor> inputs;
         for (int64_t n : b.items) {
             inputs.push_back(m.embed(reference[n]));
-            rb.add(0, static_cast<int64_t>(reference[n].size()));
+            rb.add(0, std::ssize(reference[n]));
         }
         Tensor x({rb.rows(), m.cfg().d_model});
         for (size_t s = 0; s < inputs.size(); ++s)
@@ -1156,7 +1155,7 @@ Hooks ablate_head(const Model& m, int64_t layer, int64_t head, Ablation mode, co
     if (head < 0 || head >= Hl) throw std::out_of_range("head index out of range");
     const Tensor* mean = nullptr;
     if (mode == Ablation::Mean) {
-        if (!means || static_cast<int64_t>(means->layers.size()) != m.cfg().n_layers)
+        if (!means || std::ssize(means->layers) != m.cfg().n_layers)
             throw std::invalid_argument("mean ablation needs reference means (see head_means)");
         mean = &means->layers[layer];
     }
@@ -1168,10 +1167,10 @@ Hooks ablate_head(const Model& m, int64_t layer, int64_t head, Ablation mode, co
                 "per-position reference means were computed for length {}, input has length {}", mean->shape[0], T));
         for (int64_t t = 0; t < T; ++t) {
             float* dst = z.ptr() + (t * Hl + head) * D;
-            if (!mean) std::fill(dst, dst + D, 0.f);
+            if (!mean) std::fill_n(dst, D, 0.f);
             else {
                 const float* src = mean->ptr() + ((mean->shape[0] == 1 ? 0 : t) * Hl + head) * D;
-                std::copy(src, src + D, dst);
+                std::copy_n(src, D, dst);
             }
         }
     });
@@ -1183,7 +1182,7 @@ Hooks ablate_head(const Model& m, int64_t layer, int64_t head, Ablation mode, co
 // stacked into one batch, and the batches run in parallel. A head whose output already equals its
 // replacement at every position (zeros, or its mean) changes nothing: exactly 0, without a pass.
 Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const std::vector<Tokens>& reference) {
-    const int64_t L = m.cfg().n_layers, H = m.max_heads(), T = static_cast<int64_t>(tokens.size());
+    const int64_t L = m.cfg().n_layers, H = m.max_heads(), T = std::ssize(tokens);
     const int64_t d = m.cfg().d_model, V = m.cfg().vocab_size;
     if (T < 2) throw std::invalid_argument("loss needs at least two tokens");
 #ifdef TFI_USE_ACCELERATE
@@ -1198,9 +1197,8 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
         const double work =
             gpu_work(m, make_batches(
                             heads, [T](int64_t) { return T; }, ablation_batch_rows())) +
-            gpu_work(m, make_batches(
-                            {refs}, [&](int64_t n) { return static_cast<int64_t>(reference[n].size()); },
-                            ablation_batch_rows()));
+            gpu_work(m,
+                     make_batches({refs}, [&](int64_t n) { return std::ssize(reference[n]); }, ablation_batch_rows()));
         if (work >= detail::gpu_min_work()) m.gpu();
     }
 #endif
@@ -1244,23 +1242,23 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
     const bool fp16 = m.weight_format() == WeightFormat::fp16;  // fp16 weights: the GPU's multiplies take fp16 inputs
     // Logits are unembedded a few passes at a time: at most this many floats at once.
     constexpr int64_t kMaxLogits = int64_t(1) << 23;
-    parallel_for(static_cast<int64_t>(batches.size()), [&](int64_t j) {
+    parallel_for(std::ssize(batches), [&](int64_t j) {
         const Batch& b = batches[j];
         const int64_t i = b.layer, Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
-        const int64_t S = static_cast<int64_t>(b.items.size());
+        const int64_t S = std::ssize(b.items);
         detail::RowBatch rb;
         rb.gpu = gpu;
         rb.fp16 = fp16;
         for (int64_t s = 0; s < S; ++s) rb.add(0, T);
         Tensor x({rb.rows(), d});
-        for (int64_t s = 0; s < S; ++s) std::copy(start[i]->ptr(), start[i]->ptr() + T * d, x.ptr() + rb.offset[s] * d);
+        for (int64_t s = 0; s < S; ++s) std::copy_n(start[i]->ptr(), T * d, x.ptr() + rb.offset[s] * d);
         Hooks hooks;
         hooks.add(lp(i) + "attn.hook_z", [&](const std::string&, Tensor& z) {  // each pass's head, every position
             for (int64_t s = 0; s < S; ++s) {
                 const int64_t h = b.items[s];
                 for (int64_t t = 0; t < T; ++t) {
                     const float* src = replacement(i, h, t);
-                    std::copy(src, src + D, z.ptr() + ((rb.offset[s] + t) * Hl + h) * D);
+                    std::copy_n(src, D, z.ptr() + ((rb.offset[s] + t) * Hl + h) * D);
                 }
             }
         });
@@ -1339,7 +1337,7 @@ enum class GpuRun { NotWorth, Done, Overflow };
 // rounded, counting into `bad` the values that don't fit fp16.
 void put(detail::Gpu::Batch& batch, int buf, int64_t offset, const float* src, int64_t n, std::atomic<int64_t>& bad) {
     if (batch.is_fp16(buf)) bad += detail::floats_to_halves(src, batch.halves(buf) + offset, n);
-    else std::copy(src, src + n, batch.floats(buf) + offset);
+    else std::copy_n(src, n, batch.floats(buf) + offset);
 }
 
 // F with F F^T = G, for a symmetric positive semi-definite (r, r) G: its eigenvectors times the
@@ -1373,7 +1371,7 @@ Tensor gram_factor(const Tensor& G) {
 // staying float32.
 GpuRun composition_gpu(const Model& m, const std::vector<std::pair<int64_t, int64_t>>& ids,
                        const std::vector<HeadCache>& heads, Composition& c, bool fp16) {
-    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, N = static_cast<int64_t>(ids.size());
+    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, N = std::ssize(ids);
     auto H = [&](int64_t l) { return m.layer_cfg(l).n_heads; };
     auto D = [&](int64_t l) { return m.layer_cfg(l).head_dim(); };
     std::vector<int64_t> first(L + 1, 0);  // layer l's heads are ids[first[l] .. first[l + 1])
@@ -1467,7 +1465,7 @@ Composition composition_scores(const Model& m) {
             ids.emplace_back(i, h);
             c.labels.push_back(head_label(i, h));
         }
-    const int64_t N = static_cast<int64_t>(ids.size());
+    const int64_t N = std::ssize(ids);
     std::vector<HeadCache> heads(N);
     parallel_for(N, [&](int64_t a) { heads[a] = cache_head(head_weights(m, ids[a].first, ids[a].second)); });
     c.q = Tensor({N, N}, kNaN);
@@ -1486,7 +1484,7 @@ Composition composition_scores(const Model& m) {
         if (detail::gpu_only()) throw;     // ... except in GPU-only mode
     }
 #endif
-    parallel_for(static_cast<int64_t>(pairs.size()), [&](int64_t n) {
+    parallel_for(std::ssize(pairs), [&](int64_t n) {
         const auto [a, b] = pairs[n];
         const CompScores s = compose(heads[a], heads[b]);
         c.q.data[a * N + b] = s.q;
@@ -1700,8 +1698,7 @@ GpuRun ov_copying_gpu(const Model& m, int64_t max_tokens, Tensor& out, bool fp16
 // it needs, so groups share no scratch. fp16 as in ov_copying_gpu.
 GpuRun ov_pair_copying_gpu(const Model& m, int64_t max_tokens, const std::vector<std::pair<int64_t, int64_t>>& ids,
                            Tensor& out, bool fp16) {
-    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, V = m.cfg().vocab_size,
-                  N = static_cast<int64_t>(ids.size());
+    const int64_t L = m.cfg().n_layers, d = m.cfg().d_model, V = m.cfg().vocab_size, N = std::ssize(ids);
     const int64_t n = std::min(V, max_tokens);
     auto H = [&](int64_t l) { return m.layer_cfg(l).n_heads; };
     auto D = [&](int64_t l) { return m.layer_cfg(l).head_dim(); };
@@ -1807,7 +1804,7 @@ float ov_path_copying(const Model& m, const std::vector<std::pair<int64_t, int64
             throw std::invalid_argument("OV path heads must be in increasing layers");
     const OvPaths ov(m, max_tokens);
     std::vector<HeadWeights> w;
-    for (const auto& lh : path) w.push_back(head_weights(m, lh.first, lh.second));
+    for (const auto& [layer, head] : path) w.push_back(head_weights(m, layer, head));
     Tensor A = ov.start(w[0]);
     for (size_t i = 1; i < w.size(); ++i) A = OvPaths::step(A, w[i - 1], w[i]);
     return ov.hits(A, ov.finish(w.back()));
@@ -1830,7 +1827,7 @@ Tensor ov_copying_scores(const Model& m, int64_t max_tokens) {
     for (int64_t i = 0; i < L; ++i)
         for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) ids.emplace_back(i, h);
     Tensor out({L, H}, kNaN);
-    parallel_for(static_cast<int64_t>(ids.size()), [&](int64_t j) {
+    parallel_for(std::ssize(ids), [&](int64_t j) {
         const auto [i, h] = ids[j];
         const HeadWeights w = head_weights(m, i, h);
         out.data[i * H + h] = ov.hits(ov.start(w), ov.finish(w));
@@ -1842,7 +1839,7 @@ Tensor ov_pair_copying_scores(const Model& m, int64_t max_tokens) {
     std::vector<std::pair<int64_t, int64_t>> ids;
     for (int64_t i = 0; i < m.cfg().n_layers; ++i)
         for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) ids.emplace_back(i, h);
-    const int64_t N = static_cast<int64_t>(ids.size());
+    const int64_t N = std::ssize(ids);
 #ifdef TFI_USE_ACCELERATE
     try {
         Tensor out({N, N}, kNaN);

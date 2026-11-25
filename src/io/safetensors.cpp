@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <fcntl.h>
+#include <format>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -92,7 +93,7 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
         f.clear();
         f.seekg(data_start + static_cast<std::streamoff>(at));
         if (!f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n)))
-            throw std::runtime_error(path + ": cannot read " + name);
+            throw std::runtime_error(std::format("{}: cannot read {}", path, name));
     };
 
     SafeTensors out;
@@ -109,24 +110,24 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
         for (const auto& d : info.at("shape").array) shape.push_back(d.as_int());
         const uint64_t begin = static_cast<uint64_t>(info.at("data_offsets").array.at(0).as_int());
         const uint64_t end = static_cast<uint64_t>(info.at("data_offsets").array.at(1).as_int());
-        if (end < begin || end > data_size) throw std::runtime_error(path + ": bad offsets for " + name);
+        if (end < begin || end > data_size) throw std::runtime_error(std::format("{}: bad offsets for {}", path, name));
         const uint64_t width = dtype == "I64" ? 8 : dtype == "F32" ? 4 : (dtype == "F16" || dtype == "BF16") ? 2 : 0;
-        if (width == 0) throw std::runtime_error(path + ": unsupported dtype " + dtype + " for " + name);
+        if (width == 0) throw std::runtime_error(std::format("{}: unsupported dtype {} for {}", path, dtype, name));
         // The element count, multiplied in order with a check at each step, so that a header's shape can't
         // overflow it: no product of leading dimensions may exceed the elements the file has bytes for
         // (once one is 0 the rest can't matter, as for shape_numel).
         for (int64_t dim : shape)
-            if (dim < 0) throw std::runtime_error(path + ": negative dimension for " + name);
+            if (dim < 0) throw std::runtime_error(std::format("{}: negative dimension for {}", path, name));
         const uint64_t max_n = data_size / width;
         uint64_t count = 1;
         for (int64_t dim : shape) {
             if (count != 0 && static_cast<uint64_t>(dim) > max_n / count)
-                throw std::runtime_error(path + ": " + name + " has a shape larger than the file");
+                throw std::runtime_error(std::format("{}: {} has a shape larger than the file", path, name));
             count *= static_cast<uint64_t>(dim);
         }
         const int64_t n = static_cast<int64_t>(count);  // at most data_size / width
         if (end - begin != count * width)
-            throw std::runtime_error(path + ": " + name + " byte size does not match its shape");
+            throw std::runtime_error(std::format("{}: {} byte size does not match its shape", path, name));
         // Straight into the tensor's own storage: no intermediate byte buffer.
         auto read_into = [&](void* dst) { copy(begin, end - begin, dst, name); };
         if (dtype == "I64") {
@@ -142,7 +143,7 @@ SafeTensors load_safetensors(const std::string& path, const TensorSink& take, co
                           size,
                           [&](uint64_t offset, uint64_t count, void* dst) {
                               if (offset > size || count > size - offset)
-                                  throw std::out_of_range(path + ": read past the end of " + name);
+                                  throw std::out_of_range(std::format("{}: read past the end of {}", path, name));
                               copy(begin + offset, count, dst, name);
                           },
                           nullptr,

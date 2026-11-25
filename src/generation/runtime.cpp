@@ -36,13 +36,13 @@ int64_t position_limit(const Model& m) {
 // into the proposals themselves: a match d tokens back proposes the text repeating with period d (X Y X Y
 // ... from a match 2 back), not just the d tokens there are.
 Tokens lookup_draft(const Tokens& ctx, int64_t max_n, int64_t k) {
-    const int64_t len = static_cast<int64_t>(ctx.size());
+    const int64_t len = std::ssize(ctx);
     for (int64_t n = std::min(max_n, len - 1); n >= 1 && k > 0; --n) {
         const int64_t s = len - n;  // the suffix: ctx[s, len)
         for (int64_t i = s - 1; i >= 0; --i) {
             if (!std::equal(ctx.begin() + s, ctx.end(), ctx.begin() + i)) continue;
             Tokens out;
-            for (int64_t j = i + n; static_cast<int64_t>(out.size()) < k; ++j)
+            for (int64_t j = i + n; std::ssize(out) < k; ++j)
                 out.push_back(j < len ? ctx[static_cast<size_t>(j)] : out[static_cast<size_t>(j - len)]);
             return out;
         }
@@ -170,7 +170,7 @@ class EditPredictor {
     }
     // The period p that has repeated for the longest (at least one whole period, and 3 calls); 0: none.
     static int period(const std::vector<int>& h) {
-        const int64_t n = static_cast<int64_t>(h.size());
+        const int64_t n = std::ssize(h);
         int best = 0;
         int64_t best_run = 0;
         for (int p = 1; p <= kMaxPeriod && p < n; ++p) {
@@ -388,7 +388,7 @@ struct DecodeRuntime::Impl {
 
     void begin_pass() {
         pos = cache.size();
-        step_ctx = static_cast<int64_t>(ctx.size());
+        step_ctx = std::ssize(ctx);
         row = kept = proposed = 0;
         stale_from = n_layers;
         proposals.clear();
@@ -415,21 +415,21 @@ struct DecodeRuntime::Impl {
         kind = in.size() > 1 ? PassKind::Speculative : PassKind::Plain;
         L = model.forward_cached(in, cache, user ? &routed : plain_pass(), /*last_only=*/false);
         ++stats.steps;
-        proposed = static_cast<int64_t>(proposals.size());
+        proposed = std::ssize(proposals);
         stats.drafted += proposed;
     }
 
     // The hook points this pass's hooks are expected on, as the filters say now: for how much to propose, and which
     // blocks' inputs to record. (The pass asks the filters again as it reaches each point.)
     void expect() {
-        for (auto& kv : points) kv.second.expected = 0;
+        for (auto& [name, point] : points) point.expected = 0;
         for (size_t i = 0; i < names.size(); ++i)
             if (const char md = mode(names[i])) point(i).expected = md;
         record.clear();
         if (!resume) return;
-        for (const auto& kv : points) {
-            if (!kv.second.expected) continue;
-            for (int64_t b : {kv.second.block, kv.second.resume}) {
+        for (const auto& [name, point] : points) {
+            if (!point.expected) continue;
+            for (int64_t b : {point.block, point.resume}) {
                 if (b < 0) continue;
                 const std::string n = std::format("blocks.{}.hook_resid_pre", b);
                 const auto p = points.find(n);
@@ -448,12 +448,12 @@ struct DecodeRuntime::Impl {
             k = 0;
         }
         if (limit > 0) k = std::min(k, limit - 1 - pos);
-        if (draft && draft_limit > 0) k = std::min(k, draft_limit + 1 - static_cast<int64_t>(ctx.size()));
+        if (draft && draft_limit > 0) k = std::min(k, draft_limit + 1 - std::ssize(ctx));
         // An edit that can't be predicted yet still allows proposals if a token it gets wrong is computed again
         // from the upper half of the blocks only.
-        for (const auto& kv : points)
-            if (k > 0 && kv.second.expected == 2 && !(resume && 2 * kv.second.resume >= n_layers))
-                k = std::min(k, kv.second.predictor.confident(static_cast<size_t>(k) + 1) - 1);
+        for (const auto& [name, point] : points)
+            if (k > 0 && point.expected == 2 && !(resume && 2 * point.resume >= n_layers))
+                k = std::min(k, point.predictor.confident(static_cast<size_t>(k) + 1) - 1);
         if (k <= 0) return;
         if (draft) {
             if (!greedy && q.size() < static_cast<size_t>(k)) q.resize(static_cast<size_t>(k));
@@ -485,7 +485,7 @@ struct DecodeRuntime::Impl {
         const std::span<const float> lg = L.row_view(row);
         int64_t t;
         bool accepted = false;
-        if (row < static_cast<int64_t>(proposals.size())) {
+        if (row < std::ssize(proposals)) {
             const size_t r = static_cast<size_t>(row);
             t = proposals[r];
             if (greedy) {  // p and q are one-hot: the proposal is kept if it is the model's pick, which replaces it if
@@ -548,7 +548,7 @@ struct DecodeRuntime::Impl {
     // now put the hooks on other points than the pass did, it is computed again from the start.
     void settle_row() {
         if (user) cur = *user;  // this token's hooks
-        for (auto& kv : points) kv.second.done = false;
+        for (auto& [name, point] : points) point.done = false;
         if (!same_routing()) return recompute_row();
         const Point* wrong = confirm_row();
         if (!wrong && stale_from >= n_layers) return;
@@ -559,7 +559,7 @@ struct DecodeRuntime::Impl {
         if (wrong && wrong->name == "hook_final" && resume) {
             ++stats.reruns;
             const Tensor lg = model.rerun_final(pos + row, wrong->done_out, cache);
-            std::copy(lg.ptr(), lg.ptr() + lg.numel(), L.ptr() + row * L.shape[1]);
+            std::copy_n(lg.ptr(), lg.numel(), L.ptr() + row * L.shape[1]);
             return;
         }
         int64_t b = stale_from;
@@ -578,7 +578,7 @@ struct DecodeRuntime::Impl {
         ++stats.reruns;
         kind = PassKind::Rerun;
         const Tensor lg = model.rerun_cached(b, pos + row, std::move(x), cache, &routed);
-        std::copy(lg.ptr(), lg.ptr() + lg.numel(), L.ptr() + row * L.shape[1]);
+        std::copy_n(lg.ptr(), lg.numel(), L.ptr() + row * L.shape[1]);
         stale_from = std::min(stale_from, b);
     }
 
@@ -675,8 +675,7 @@ struct DecodeRuntime::Impl {
             if (s.pattern) shape[2] = width(r);
             Tensor t(shape);
             for (int64_t o2 = 0; o2 < outer; ++o2)
-                std::copy(act.ptr() + (o2 * n + r) * inner, act.ptr() + (o2 * n + r) * inner + width(r),
-                          t.ptr() + o2 * width(r));
+                std::copy_n(act.ptr() + (o2 * n + r) * inner, width(r), t.ptr() + o2 * width(r));
             return t;
         };
         auto put = [&](int64_t r, const Tensor& t) {

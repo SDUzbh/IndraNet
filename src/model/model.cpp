@@ -258,7 +258,7 @@ RopeTable rope_table(const ModelConfig& c) {
             inv[i] = (1.f / (factor * pos_freq)) * (1.f - extrapolation) + (1.f / pos_freq) * extrapolation;
         }
     } else if (s.type == "longrope") {
-        if (static_cast<int64_t>(s.short_factor.size()) != half)
+        if (std::ssize(s.short_factor) != half)
             throw std::runtime_error(
                 std::format("rope_scaling 'longrope' has {} short factors, but RoPE rotates {} pairs",
                             s.short_factor.size(), half));
@@ -412,17 +412,18 @@ void Model::check_shapes() {
     // indranet's modules create them); nothing is read unchecked later.
     auto expect = [&](const std::string& name, const Shape& s) {
         const Weight* w = weight_or_null(name);
-        if (!w) throw std::runtime_error("model file is missing tensor '" + name + "'");
+        if (!w) throw std::runtime_error(std::format("model file is missing tensor '{}'", name));
         if (w->shape != s)
-            throw std::runtime_error(name + " has shape " + shape_str(w->shape) + ", config says " + shape_str(s));
+            throw std::runtime_error(
+                std::format("{} has shape {}, config says {}", name, shape_str(w->shape), shape_str(s)));
     };
     // Exactly the biases the config names (bias: all, none or its parts): a bias it doesn't name would
     // otherwise be used unannounced, since the passes take every bias tensor present.
     auto expect_bias = [&](const std::string& name, int64_t n, bool declared, const ModelConfig& c, const char* part) {
         if (declared) expect(name, {n});
         else if (weight_or_null(name))
-            throw std::runtime_error("model file has " + name + ", but the config's bias (" + c.bias.str() +
-                                     ") doesn't include '" + part + "'");
+            throw std::runtime_error(std::format("model file has {}, but the config's bias ({}) doesn't include '{}'",
+                                                 name, c.bias.str(), part));
     };
     auto expect_norm = [&](const std::string& prefix, const ModelConfig& c, int64_t dim) {
         if (c.norm == "none") return;
@@ -513,7 +514,7 @@ Model Model::load(const std::string& path, WeightFormat format) {
         weights.emplace(name, Weight::filled(t.shape, false, [&](void* dst) {  // -> float32
                             if (t.dtype == "F32") return read_all(dst);
                             for_each_block(t, [&](int64_t first, const float* v, int64_t count) {
-                                std::copy(v, v + count, static_cast<float*>(dst) + first);
+                                std::copy_n(v, count, static_cast<float*>(dst) + first);
                             });
                         }));
         return true;
@@ -574,13 +575,13 @@ const Tokenizer& Model::tokenizer() const {
 }
 
 void Model::set_vocab(std::vector<std::string> vocab) {
-    if (!vocab.empty() && static_cast<int64_t>(vocab.size()) != cfg_.vocab_size)
+    if (!vocab.empty() && std::ssize(vocab) != cfg_.vocab_size)
         throw std::runtime_error(std::format("vocabulary has {} entries, model has {}", vocab.size(), cfg_.vocab_size));
     vocab_ = std::move(vocab);
 }
 
 std::string Model::token_str(int64_t id) const {
-    if (id >= 0 && id < static_cast<int64_t>(vocab_.size())) return vocab_[id];
+    if (id >= 0 && id < std::ssize(vocab_)) return vocab_[id];
     return std::to_string(id);
 }
 
@@ -590,7 +591,7 @@ std::string Model::decode(const Tokens& ids, bool skip_special_tokens) const {
         throw std::runtime_error("this model file has no vocabulary or tokenizer to decode tokens with");
     std::string out;
     for (int64_t id : ids) {
-        if (id < 0 || id >= static_cast<int64_t>(vocab_.size()))
+        if (id < 0 || id >= std::ssize(vocab_))
             throw std::out_of_range(std::format("token {} is outside the vocabulary", id));
         out += vocab_[id];
     }
@@ -639,7 +640,7 @@ const Weight* Model::weight_or_null(const std::string& name) const {
 
 const Weight& Model::weight(const std::string& name) const {
     const Weight* t = weight_or_null(name);
-    if (!t) throw std::runtime_error("model file is missing tensor '" + name + "'");
+    if (!t) throw std::runtime_error(std::format("model file is missing tensor '{}'", name));
     return *t;
 }
 
@@ -657,21 +658,21 @@ int64_t Model::max_heads() const {
 
 int64_t Model::num_parameters() const {
     int64_t n = 0;
-    for (const auto& kv : w_) n += kv.second.numel();
+    for (const auto& [name, w] : w_) n += w.numel();
     return n;
 }
 
 int64_t Model::weight_bytes() const {
     int64_t n = 0;
-    for (const auto& kv : w_) n += kv.second.bytes();
+    for (const auto& [name, w] : w_) n += w.bytes();
     return n;
 }
 
 std::vector<std::string> Model::fp32_weights() const {
     std::vector<std::string> out;
     if (format_ == WeightFormat::fp16)
-        for (const auto& kv : w_)
-            if (kv.second.dim() == 2 && !kv.second.is_fp16()) out.push_back(kv.first);
+        for (const auto& [name, w] : w_)
+            if (w.dim() == 2 && !w.is_fp16()) out.push_back(name);
     return out;
 }
 
@@ -738,7 +739,7 @@ Tensor Model::positional_embedding(int64_t start, int64_t T) const {
 }
 
 Tensor Model::positional_embedding_at(const std::vector<int64_t>& positions) const {
-    const int64_t d = cfg_.d_model, T = static_cast<int64_t>(positions.size());
+    const int64_t d = cfg_.d_model, T = std::ssize(positions);
     Tensor pe({T, d});
     if (cfg_.positional == "learned") {
         const Weight& P = weight("pos_embed.weight");
@@ -828,7 +829,7 @@ int64_t side_by_side_values() {
 
 float* prefix_buffer(int64_t floats) {
     thread_local std::vector<float> buf;
-    if (static_cast<int64_t>(buf.size()) < floats) buf.resize(static_cast<size_t>(floats));
+    if (std::ssize(buf) < floats) buf.resize(static_cast<size_t>(floats));
     return buf.data();
 }
 
@@ -866,7 +867,7 @@ void scores_half_rows(const float* q, int64_t first, int64_t D, const uint16_t* 
 template <int R>
 void apply_half_rows(const float* probs, int64_t first, int64_t ld, int64_t D, const uint16_t* v, float* out,
                      int64_t ldo) {
-    for (int r = 0; r < R; ++r) std::fill(out + r * ldo, out + r * ldo + D, 0.f);
+    for (int r = 0; r < R; ++r) std::fill_n(out + r * ldo, D, 0.f);
     for (int64_t j = 0; j < first; ++j) {
         float p[R];
         bool any = false;
@@ -1161,7 +1162,7 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
         hook(hooks, hook_name(layer, kHookZ), zt);
         if (zt.numel() != T * H * D)
             throw std::runtime_error(hook_name(layer, kHookZ) + " changed the activation's size");
-        std::copy(zt.ptr(), zt.ptr() + T * H * D, z_out);
+        std::copy_n(zt.ptr(), T * H * D, z_out);
     }
 }
 
@@ -1267,7 +1268,7 @@ Tensor Model::embed(const Tokens& tokens, const Hooks* hooks, int64_t start) con
 }
 
 Tensor Model::embed_at(const Tokens& tokens, const std::vector<int64_t>& positions, const Hooks* hooks) const {
-    const int64_t T = static_cast<int64_t>(tokens.size()), d = cfg_.d_model;
+    const int64_t T = std::ssize(tokens), d = cfg_.d_model;
     if (T == 0) throw std::invalid_argument("forward needs at least one token");
     const Weight& E = weight("embed.weight");
     Tensor x({T, d});
@@ -1376,8 +1377,8 @@ void upload_rows(detail::GpuKV& kv, int slot, const float* f, const uint16_t* bi
     const int64_t n = (to - from) * D;
     for (int64_t h = 0; h < H; ++h) {
         const int64_t src = (h * c + from) * D, at = (h * Tp + base + from) * D;
-        if (kv.half) std::copy(bits + src, bits + src + n, reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at);
-        else std::copy(f + src, f + src + n, kv.seq->data(slot) + at);
+        if (kv.half) std::copy_n(bits + src, n, reinterpret_cast<uint16_t*>(kv.seq->data(slot)) + at);
+        else std::copy_n(f + src, n, kv.seq->data(slot) + at);
     }
 }
 #endif
@@ -1449,7 +1450,7 @@ void KVCache::put(Store& s, const float* src, int64_t n, int64_t at) const {
         const float* from = src + h * n * s.D;
         const int64_t to = (h * s.cap + at) * s.D;
         if (half_) detail::floats_to_halves(from, s.h.data() + to, n * s.D);  // fp16 values already (add_kv_rounding)
-        else std::copy(from, from + n * s.D, s.f.data() + to);
+        else std::copy_n(from, n * s.D, s.f.data() + to);
     }
 }
 
@@ -1491,15 +1492,15 @@ void KVCache::sync_cpu() const {
             if (gpu_->half) {  // fp16 on both sides: copied as they are
                 const uint16_t* gk = gpu_halves(detail::GpuKV::keys(static_cast<int64_t>(l))) + from;
                 const uint16_t* gv = gpu_halves(detail::GpuKV::values(static_cast<int64_t>(l))) + from;
-                std::copy(gk, gk + n, k_[l].h.data() + to);
-                std::copy(gv, gv + n, v_[l].h.data() + to);
+                std::copy_n(gk, n, k_[l].h.data() + to);
+                std::copy_n(gv, n, v_[l].h.data() + to);
             } else {
                 float* dk = k_[l].f.data() + to;
                 float* dv = v_[l].f.data() + to;
                 const float* gk = gpu_->seq->data(detail::GpuKV::keys(static_cast<int64_t>(l)));
                 const float* gv = gpu_->seq->data(detail::GpuKV::values(static_cast<int64_t>(l)));
-                std::copy(gk + from, gk + from + n, dk);
-                std::copy(gv + from, gv + from + n, dv);
+                std::copy_n(gk + from, n, dk);
+                std::copy_n(gv + from, n, dv);
             }
         }
     }
@@ -1552,7 +1553,7 @@ void KVCache::check() const {
 
 Tensor KVCache::keys(int64_t layer) const {
     sync_cpu();
-    if (layer < 0 || layer >= static_cast<int64_t>(k_.size()))
+    if (layer < 0 || layer >= std::ssize(k_))
         throw std::out_of_range(
             std::format("KVCache: no layer {}{}", layer, (k_.empty() ? " (the cache is empty)" : "")));
     const detail::KVRef r = ref(layer, false);
@@ -1565,7 +1566,7 @@ Tensor KVCache::keys(int64_t layer) const {
 }
 Tensor KVCache::values(int64_t layer) const {
     sync_cpu();
-    if (layer < 0 || layer >= static_cast<int64_t>(v_.size()))
+    if (layer < 0 || layer >= std::ssize(v_))
         throw std::out_of_range(
             std::format("KVCache: no layer {}{}", layer, (v_.empty() ? " (the cache is empty)" : "")));
     const detail::KVRef r = ref(layer, true);
@@ -1596,7 +1597,7 @@ void KVCache::append(const std::vector<Tensor>& k, const std::vector<Tensor>& v,
 void Model::check_cache(const KVCache& cache) const {
     const int64_t L = cfg_.n_layers;
     if (cache.len_) {  // the cache must be this model's: a tensor per layer, each with the layer's heads
-        bool ok = static_cast<int64_t>(cache.k_.size()) == L;
+        bool ok = std::ssize(cache.k_) == L;
         for (int64_t l = 0; ok && l < L; ++l)
             ok = cache.k_[l].H == layer_cfgs_[l].kv_heads() && cache.k_[l].D == layer_cfgs_[l].head_dim();
         if (!ok) throw std::invalid_argument("forward_cached: the cache holds another model's keys and values");
@@ -1604,9 +1605,9 @@ void Model::check_cache(const KVCache& cache) const {
     // fp16 values for a model with fp16 weights; a cache keeps the precision of its first step.
     const bool half = format_ == WeightFormat::fp16;
     if ((cache.len_ || !cache.k_.empty()) && cache.half_ != half)
-        throw std::invalid_argument(std::string("forward_cached: the cache holds ") +
-                                    (cache.half_ ? "fp16" : "float32") + " keys and values; this model's are " +
-                                    (half ? "fp16" : "float32"));
+        throw std::invalid_argument(
+            std::format("forward_cached: the cache holds {} keys and values; this model's are {}",
+                        (cache.half_ ? "fp16" : "float32"), (half ? "fp16" : "float32")));
 }
 
 void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to,
@@ -1630,9 +1631,8 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
             g = single_pass_gpu(*this, 0, T);
         } else {
             double block_weights = 0;
-            for (const auto& kv : w_)
-                if (kv.second.dim() == 2 && kv.first.starts_with("blocks."))
-                    block_weights += static_cast<double>(kv.second.numel());
+            for (const auto& [name, w] : w_)
+                if (w.dim() == 2 && name.starts_with("blocks.")) block_weights += static_cast<double>(w.numel());
             if (detail::gpu_only() || T >= detail::gpu_min_rows() || block_weights >= kDecodeWeights) g = gpu();
         }
     }
@@ -1675,7 +1675,7 @@ void Model::use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64
 }
 
 Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks, bool last_only) const {
-    const int64_t L = cfg_.n_layers, T = static_cast<int64_t>(tokens.size()), start = cache.len_;
+    const int64_t L = cfg_.n_layers, T = std::ssize(tokens), start = cache.len_;
     if (T == 0) throw std::invalid_argument("forward_cached needs at least one token");
     check_cache(cache);
     const bool half = format_ == WeightFormat::fp16;
@@ -1734,8 +1734,8 @@ Tensor Model::forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* 
         for (int64_t l = 0; l < L; ++l) {
             const Shape want{layer_cfgs_[l].kv_heads(), T, layer_cfgs_[l].head_dim()};
             if (new_k[l].shape != want || new_v[l].shape != want)
-                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " +
-                                         shape_str(want));
+                throw std::runtime_error(std::format("forward_cached: {}attn's keys or values are not {}",
+                                                     layer_prefix(l), shape_str(want)));
         }
         cache.append(new_k, new_v, T);
     }
@@ -1808,8 +1808,8 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
         for (int64_t l = layer; l < L; ++l) {
             const Shape want{layer_cfgs_[l].kv_heads(), 1, layer_cfgs_[l].head_dim()};
             if (new_k[l].shape != want || new_v[l].shape != want)
-                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " +
-                                         shape_str(want));
+                throw std::runtime_error(std::format("forward_cached: {}attn's keys or values are not {}",
+                                                     layer_prefix(l), shape_str(want)));
         }
         for (int64_t l = layer; l < L; ++l)
             for (int pass = 0; pass < 2; ++pass)
@@ -1823,7 +1823,7 @@ Tensor Model::rerun_cached(int64_t layer, int64_t pos, Tensor resid, KVCache& ca
 std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVBatch& kb, const Hooks* hooks,
                                           bool last_only) const {
     const int64_t L = cfg_.n_layers, n_seq = kb.size();
-    if (static_cast<int64_t>(tokens.size()) != n_seq)
+    if (std::ssize(tokens) != n_seq)
         throw std::invalid_argument(
             std::format("forward_cached: {} token lists for a batch of {}", tokens.size(), n_seq));
     for (int64_t l = 0; l < L && hooks; ++l)
@@ -1839,12 +1839,12 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         if (tokens[i].empty()) continue;
         const KVCache& c = kb.caches_[i];
         if (c.len_) {
-            bool ok = static_cast<int64_t>(c.k_.size()) == L;
+            bool ok = std::ssize(c.k_) == L;
             for (int64_t l = 0; ok && l < L; ++l)
                 ok = c.k_[l].H == layer_cfgs_[l].kv_heads() && c.k_[l].D == layer_cfgs_[l].head_dim();
             if (!ok) throw std::invalid_argument("forward_cached: the batch holds another model's keys and values");
         }
-        const int64_t T = static_cast<int64_t>(tokens[i].size());
+        const int64_t T = std::ssize(tokens[i]);
         seq_of.push_back(i);
         rb.add(c.len_, T);
         all.insert(all.end(), tokens[i].begin(), tokens[i].end());
@@ -1852,14 +1852,14 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     }
     std::vector<Tensor> out(static_cast<size_t>(n_seq));
     if (seq_of.empty()) return out;
-    const int64_t S = static_cast<int64_t>(seq_of.size()), R = rb.rows();
+    const int64_t S = std::ssize(seq_of), R = rb.rows();
     const bool half = format_ == WeightFormat::fp16;  // as for one cache
     for (int64_t i : seq_of) {
         KVCache& c = kb.caches_[i];
         if ((c.len_ || !c.k_.empty()) && c.half_ != half)
-            throw std::invalid_argument(std::string("forward_cached: the batch holds ") +
-                                        (c.half_ ? "fp16" : "float32") + " keys and values; this model's are " +
-                                        (half ? "fp16" : "float32"));
+            throw std::invalid_argument(
+                std::format("forward_cached: the batch holds {} keys and values; this model's are {}",
+                            (c.half_ ? "fp16" : "float32"), (half ? "fp16" : "float32")));
         c.half_ = half;
     }
 
@@ -1869,9 +1869,8 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
     detail::Gpu* g = nullptr;
     if (use_gpu() && gpu_attention_fits(layer_cfgs_, 0)) {
         double block_weights = 0;
-        for (const auto& w : w_)
-            if (w.second.dim() == 2 && w.first.starts_with("blocks."))
-                block_weights += static_cast<double>(w.second.numel());
+        for (const auto& [name, weight] : w_)
+            if (weight.dim() == 2 && name.starts_with("blocks.")) block_weights += static_cast<double>(weight.numel());
         if (detail::gpu_only() || R >= detail::gpu_min_rows() || block_weights >= kDecodeWeights) g = gpu();
     }
     if (g) {
@@ -1989,8 +1988,8 @@ std::vector<Tensor> Model::forward_cached(const std::vector<Tokens>& tokens, KVB
         for (int64_t l = 0; l < L; ++l) {
             const Shape want{layer_cfgs_[l].kv_heads(), R, layer_cfgs_[l].head_dim()};
             if (new_k[l].shape != want || new_v[l].shape != want)
-                throw std::runtime_error("forward_cached: " + layer_prefix(l) + "attn's keys or values are not " +
-                                         shape_str(want));
+                throw std::runtime_error(std::format("forward_cached: {}attn's keys or values are not {}",
+                                                     layer_prefix(l), shape_str(want)));
         }
         for (int64_t sg = 0; sg < S; ++sg) {
             const int64_t i = seq_of[sg], n = rb.len[sg], off = rb.offset[sg];
@@ -2023,8 +2022,8 @@ detail::Gpu* single_pass_gpu(const Model& m, int64_t layer, int64_t T) {
     if (!use_gpu()) return nullptr;
     const int64_t L = m.cfg().n_layers;
     double weights = 0;
-    for (const auto& kv : m.weights())
-        if (kv.second.dim() == 2 && kv.first.starts_with("blocks.")) weights += static_cast<double>(kv.second.numel());
+    for (const auto& [name, w] : m.weights())
+        if (w.dim() == 2 && name.starts_with("blocks.")) weights += static_cast<double>(w.numel());
     const bool on = detail::single_pass_on_gpu(T, L - layer, weights / static_cast<double>(std::max<int64_t>(1, L)),
                                                m.has_gpu(), detail::gpu_min_rows(), detail::gpu_min_work());
     return on ? m.gpu() : nullptr;
@@ -2047,7 +2046,7 @@ bool detail::single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights,
 
 detail::Gpu* Model::gpu() const {
 #ifdef TFI_USE_ACCELERATE
-    std::lock_guard<std::mutex> lock(g_gpu_mutex);
+    std::scoped_lock lock(g_gpu_mutex);
     if (!gpu_.checked) {
         gpu_.gpu = detail::Gpu::create();
         gpu_.checked = true;
@@ -2059,7 +2058,7 @@ detail::Gpu* Model::gpu() const {
 }
 
 bool Model::has_gpu() const {
-    std::lock_guard<std::mutex> lock(g_gpu_mutex);
+    std::scoped_lock lock(g_gpu_mutex);
     return gpu_.gpu != nullptr;
 }
 
@@ -2266,7 +2265,7 @@ struct GpuBlocks {
         if (t.numel() != n) throw std::runtime_error(name + ": a hook changed the activation's size");
         const Tensor back = view == View::Heads ? detail::merge_heads(t) : std::move(t);
         const int dst = kHand0 + next_hand++ % kHandSlots;
-        std::copy(back.ptr(), back.ptr() + n, s.reserve(dst, n));
+        std::copy_n(back.ptr(), n, s.reserve(dst, n));
         return dst;
     }
     // Captures waiting for the end of the run: the slot the GPU copied the activation into, and how
@@ -2311,7 +2310,7 @@ struct GpuBlocks {
     // For attention on the GPU: each row's position, segment start, segment's first row and
     // segment's rows (kMeta), and blocks of rows for the tiled kernel (kBlocks, unless `tiled` is false).
     void write_rows(const detail::RowBatch& batch, bool tiled) {
-        const int64_t S = static_cast<int64_t>(batch.start.size());
+        const int64_t S = std::ssize(batch.start);
         uint32_t* meta = reinterpret_cast<uint32_t*>(s.reserve(kMeta, 4 * R));
         std::vector<uint32_t> blk;
         n_positions = 0;
@@ -2659,7 +2658,7 @@ bool gpu_attention_fits(const std::vector<ModelConfig>& cfgs, int64_t layer) {
 // false) Model::block, its linear layers still on the GPU if batch.gpu is set.
 Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows,
                        Tensor* logits, bool logits_last_only) const {
-    const int64_t L = cfg_.n_layers, d = cfg_.d_model, S = static_cast<int64_t>(batch.start.size());
+    const int64_t L = cfg_.n_layers, d = cfg_.d_model, S = std::ssize(batch.start);
     (void)logits;  // only with a KV cache on the GPU (macOS)
     (void)logits_last_only;
     // Each segment's last row of a (rows, d) residual stream at `src`.
@@ -2721,8 +2720,8 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                 throw std::invalid_argument(
                     "forward_rows: prefix keys / values must be float32 (Hkv, T, D) for every layer");
             const int64_t n = pk.H * pk.T * pk.D;
-            std::copy(pk.f, pk.f + n, s.reserve(kPK, n));
-            std::copy(pv.f, pv.f + n, s.reserve(kPV, n));
+            std::copy_n(pk.f, n, s.reserve(kPK, n));
+            std::copy_n(pv.f, n, s.reserve(kPV, n));
             return pk.T;
         };
         gb.hooks = hooks;
@@ -2755,7 +2754,7 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         s.reserve(kResid1, R * d);
         if (batch.kv)
             for (int64_t l = layer; l < L; ++l) s.reserve(detail::GpuKV::resid(l), R * d);
-        std::copy(x.ptr(), x.ptr() + R * d, s.reserve(kResid0, R * d));
+        std::copy_n(x.ptr(), R * d, s.reserve(kResid0, R * d));
         int cur = kResid0;
         LayerSlots ls = inference_slots(layer_cfgs_[layer], layer, cur, out_slot(layer, cur));
         use_qkv(layer);
@@ -2805,7 +2804,7 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
                     hook(hooks, hook_name(l, kHookPattern), P);
                     if (P.numel() != H * R * R)
                         throw std::runtime_error(p + "hook_pattern: a hook changed the activation's size");
-                    std::copy(P.ptr(), P.ptr() + P.numel(), s.data(kPattern));
+                    std::copy_n(P.ptr(), P.numel(), s.data(kPattern));
                     s.attention_apply(kPattern, v, kZ, shape);
                 }
                 z = gb.at(p + "hook_z", kZ, H * D, GpuBlocks::View::RowsHeads, D);
@@ -2844,7 +2843,7 @@ Tensor Model::run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, c
         }
         if (last_rows) return lasts(s.data(cur));  // only what the caller reads comes back
         x = Tensor({R, d});
-        std::copy(s.data(cur), s.data(cur) + R * d, x.ptr());
+        std::copy_n(s.data(cur), R * d, x.ptr());
         return last_rows ? lasts(x.ptr()) : x;
     }
 #endif
@@ -2862,7 +2861,7 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
                                                    const std::function<Tensor(int64_t, const Tensor&)>& dmetric,
                                                    const NameFilter& filter) const {
 #ifdef TFI_USE_ACCELERATE
-    const int64_t L = cfg_.n_layers, d = cfg_.d_model, R = batch.rows(), S = static_cast<int64_t>(batch.start.size());
+    const int64_t L = cfg_.n_layers, d = cfg_.d_model, R = batch.rows(), S = std::ssize(batch.start);
     if (!batch.gpu) throw std::logic_error("gradients_rows needs a GPU");
     if (x0.dim() != 2 || x0.shape[0] != R || x0.shape[1] != d)
         throw std::invalid_argument("gradients_rows: input must be (rows, d_model), got " + shape_str(x0.shape));
@@ -2895,11 +2894,11 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
     auto rows = [&](int slot, int64_t seg, int64_t width) {
         Tensor t({batch.len[seg], width});
         const float* src = s.data(slot) + batch.offset[seg] * width;
-        std::copy(src, src + t.numel(), t.ptr());
+        std::copy_n(src, t.numel(), t.ptr());
         return t;
     };
 
-    std::copy(x0.ptr(), x0.ptr() + R * d, s.reserve(saved_slots(0).x, R * d));
+    std::copy_n(x0.ptr(), R * d, s.reserve(saved_slots(0).x, R * d));
     if (gpu_attention) use_attn_slots(0);
     gb.before_attention(0, saved_slots(0));
     if (!gpu_attention) s.run(false);
@@ -2948,7 +2947,7 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
     // dF/d(hook_resid_post) of the last block: only each segment's last row, as in run_with_gradients.
     const int final_resid = saved_slots(L - 1).out;
     float* top = s.reserve(kTop, R * d);
-    std::fill(top, top + R * d, 0.f);
+    std::fill_n(top, R * d, 0.f);
     for (int64_t g = 0; g < S; ++g) {
         const int64_t r = batch.offset[g] + batch.len[g] - 1;
         Tensor x({1, d});
@@ -2956,8 +2955,8 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
         const Tensor logits = logits_from_final(final_norm(x));
         Tensor dl = dmetric(g, logits);
         if (dl.shape != logits.shape)
-            throw std::invalid_argument("dlogits must have the logits' shape " + shape_str(logits.shape) + ", got " +
-                                        shape_str(dl.shape));
+            throw std::invalid_argument(std::format("dlogits must have the logits' shape {}, got {}",
+                                                    shape_str(logits.shape), shape_str(dl.shape)));
         if (cfg_.final_logit_softcap) {
             const float cap = static_cast<float>(*cfg_.final_logit_softcap);
             for (int64_t i = 0; i < dl.numel(); ++i) {
@@ -2967,7 +2966,7 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
         }
         Tensor gr = matmul(dl, unembed());
         if (cfg_.norm_position != "post") gr = detail::norm_backward(*this, "ln_final", cfg_, x, gr);
-        std::copy(gr.ptr(), gr.ptr() + d, top + r * d);
+        std::copy_n(gr.ptr(), d, top + r * d);
     }
 
     auto g_post = [&](int64_t l) { return l == L - 1 ? static_cast<int>(kTop) : grad_slots(l + 1).resid_pre; };
@@ -3021,9 +3020,9 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
             const detail::AttentionGrads ag = detail::attention_backward(
                 *this, l, dzg, a.q, a.k, a.v, a.pattern, c.qk_norm ? &a.q0 : nullptr, c.qk_norm ? &a.k0 : nullptr);
             if (want_z) out[g][layer_prefix(l) + "attn.hook_z"] = std::move(dzg).reshape({n, H, D});
-            std::copy(ag.q_proj.ptr(), ag.q_proj.ptr() + n * H * D, dq + off * H * D);
-            std::copy(ag.k_proj.ptr(), ag.k_proj.ptr() + n * Hkv * D, dk + off * Hkv * D);
-            std::copy(ag.v_proj.ptr(), ag.v_proj.ptr() + n * Hkv * D, dv + off * Hkv * D);
+            std::copy_n(ag.q_proj.ptr(), n * H * D, dq + off * H * D);
+            std::copy_n(ag.k_proj.ptr(), n * Hkv * D, dk + off * Hkv * D);
+            std::copy_n(ag.v_proj.ptr(), n * Hkv * D, dv + off * Hkv * D);
         }
         gb.backward_after(l, saved_slots(l), grad_slots(l), base[l]);
         if (l > 0)

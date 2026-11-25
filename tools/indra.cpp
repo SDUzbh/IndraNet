@@ -8,6 +8,7 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -121,7 +122,7 @@ Args parse_args(int argc, char** argv) {
     a.model = argv[2];
     for (int i = 3; i < argc; ++i) {
         std::string k = argv[i];
-        if (!k.starts_with("--")) throw std::invalid_argument("unexpected argument '" + k + "'");
+        if (!k.starts_with("--")) throw std::invalid_argument(std::format("unexpected argument '{}'", k));
         k = k.substr(2);
         // A flag with no value (e.g. --raw) is followed by another --option or nothing.
         if (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--")) a.opts[k] = "1";
@@ -154,7 +155,8 @@ Tokens input_tokens(const Args& a, const Model& m, const std::string& key = "tok
     if (a.has(key)) return parse_tokens(a.get(key));
     if (key == "tokens" && a.has("repeat-random"))
         return repeat_random(m, a.get_int("repeat-random", 8), a.get_int("seed", 0));
-    throw std::invalid_argument("give --" + key + " or --" + text_key + (key == "tokens" ? " or --repeat-random" : ""));
+    throw std::invalid_argument(
+        std::format("give --{} or --{}{}", key, text_key, (key == "tokens" ? " or --repeat-random" : "")));
 }
 
 // A token named on the command line: its text when the model has a vocabulary, otherwise an id.
@@ -171,12 +173,12 @@ int64_t token_opt(const Args& a, const Model& m, const std::string& key, int64_t
 
 // For display: 'text' when the model has a vocabulary, the id otherwise.
 std::string tok(const Model& m, int64_t id) {
-    return m.vocab().empty() ? std::to_string(id) : "'" + m.token_str(id) + "'";
+    return m.vocab().empty() ? std::to_string(id) : std::format("'{}'", m.token_str(id));
 }
 
 int64_t resolve_pos(const Args& a, const Tokens& t) {
     int64_t p = a.get_int("pos", -1);
-    if (p < 0) p += static_cast<int64_t>(t.size());
+    if (p < 0) p += std::ssize(t);
     return p;
 }
 
@@ -251,8 +253,9 @@ int cmd_tokenize(const Args& a) {
     std::printf("%zu tokens (%s)\n", t.size(), tokenizer ? "the model's tokenizer" : "longest vocabulary match");
     for (size_t i = 0; i < t.size(); ++i) {
         const int64_t id = t[i];
-        const bool shown = id >= 0 && id < static_cast<int64_t>(vocab.size());
-        std::printf("%5zu %8lld   %s\n", i, static_cast<long long>(id), shown ? ("'" + vocab[id] + "'").c_str() : "");
+        const bool shown = id >= 0 && id < std::ssize(vocab);
+        std::printf("%5zu %8lld   %s\n", i, static_cast<long long>(id),
+                    shown ? (std::format("'{}'", vocab[id])).c_str() : "");
     }
     std::printf("--tokens ");
     for (size_t i = 0; i < t.size(); ++i) std::printf("%s%lld", i ? "," : "", static_cast<long long>(t[i]));
@@ -307,12 +310,12 @@ int cmd_run(const Args& a, const Model& m) {
     const Tensor logits = m.forward(t);
     const int64_t k = a.get_int("top", 3);
     std::printf("%5s %7s   top-%lld next tokens (prob)\n", "pos", "token", static_cast<long long>(k));
-    for (int64_t p = 0; p < static_cast<int64_t>(t.size()); ++p) {
+    for (int64_t p = 0; p < std::ssize(t); ++p) {
         Tensor probs = rows(logits, p, p + 1);
         softmax_(probs.data);
         std::printf("%5lld %7s  ", (long long)p, tok(m, t[p]).c_str());
         for (int64_t id : topk(probs.data, k)) std::printf("  %6s (%.3f)", tok(m, id).c_str(), probs.data[id]);
-        if (p + 1 < static_cast<int64_t>(t.size()))
+        if (p + 1 < std::ssize(t))
             std::printf("   | actual next %s: p=%.3f", tok(m, t[p + 1]).c_str(), probs.data[t[p + 1]]);
         std::printf("\n");
     }
@@ -346,11 +349,11 @@ int cmd_dla(const Args& a, const Model& m) {
     const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
     const DLAResult r = direct_logit_attribution(m, t, pos, target, other);
     std::vector<size_t> order(r.values.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::ranges::sort(order, [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::ranges::sort(order, std::ranges::greater{}, [&](size_t i) { return std::fabs(r.values[i]); });
     const size_t top = std::min<size_t>(order.size(), static_cast<size_t>(a.get_int("top", 15)));
     std::printf("direct logit attribution at position %lld: logit[%s]%s\n", (long long)pos, tok(m, target).c_str(),
-                other >= 0 ? (" - logit[" + tok(m, other) + "]").c_str() : "");
+                other >= 0 ? (std::format(" - logit[{}]", tok(m, other))).c_str() : "");
     std::printf("actual %.4f   sum of parts %.4f   (final norm scale frozen)\n\n", r.actual, r.sum);
     for (size_t i = 0; i < top; ++i) {
         const float v = r.values[order[i]];
@@ -392,7 +395,7 @@ int cmd_patch(const Args& a, const Model& m) {
     const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
     const std::string site = a.get("site", "resid_pre"), method = a.get("method", "exact");
     if (method != "exact" && method != "attribution" && method != "mixed")
-        throw std::invalid_argument("--method must be exact, attribution or mixed, not '" + method + "'");
+        throw std::invalid_argument(std::format("--method must be exact, attribution or mixed, not '{}'", method));
     const int64_t steps = a.get_int("steps", 1), verify = a.get_int("verify", 10);
     const bool heads = site == "heads";
     auto run = [&](const std::string& how) {
@@ -408,8 +411,8 @@ int cmd_patch(const Args& a, const Model& m) {
     const PatchResult r = run(method);
     std::printf("%s patching (%s), metric at position %lld: %s\n", method == "exact" ? "activation" : method.c_str(),
                 site.c_str(), (long long)pos,
-                other >= 0 ? ("logit[" + tok(m, target) + "] - logit[" + tok(m, other) + "]").c_str()
-                           : ("log p(" + tok(m, target) + ")").c_str());
+                other >= 0 ? (std::format("logit[{}] - logit[{}]", tok(m, target), tok(m, other))).c_str()
+                           : (std::format("log p({})", tok(m, target))).c_str());
     std::printf("clean %.4f   corrupted %.4f   gap %.4f\n", r.clean_metric, r.corrupt_metric, r.gap());
     const Tensor* shown = &r.values;
     if (!r.normalized()) {
@@ -454,7 +457,7 @@ int cmd_patch(const Args& a, const Model& m) {
         // How far off were the estimates where we checked, and how large is the biggest one left unchecked?
         // In the shown table's units: normalized values divide by the signed gap, so sizes divide by |gap|.
         const float unit = shown == &r.values ? r.gap() : 1.f, size_unit = std::fabs(unit);
-        const int64_t cols = static_cast<int64_t>(r.col_labels.size());
+        const int64_t cols = std::ssize(r.col_labels);
         float worst = 0, unverified = 0;
         int64_t worst_i = -1, unverified_i = -1;
         for (int64_t i = 0; i < r.effect.numel(); ++i) {
@@ -466,7 +469,7 @@ int cmd_patch(const Args& a, const Model& m) {
                 unverified = std::fabs(r.estimate.data[i]) / size_unit, unverified_i = i;
             }
         }
-        auto where = [&](int64_t i) { return r.row_labels[i / cols] + " " + r.col_labels[i % cols]; };
+        auto where = [&](int64_t i) { return std::format("{} {}", r.row_labels[i / cols], r.col_labels[i % cols]); };
         std::printf("\nthe exactly measured sites' estimates were off by up to %.3f", worst);
         if (worst_i >= 0)
             std::printf(" (%s: estimate %.3f, exact %.3f)", where(worst_i).c_str(), r.estimate.data[worst_i] / unit,
@@ -494,7 +497,7 @@ int cmd_patch(const Args& a, const Model& m) {
         std::printf("\nagreement over %.0f sites: correlation %s, largest error %.3f", n,
                     vx > 0 && vy > 0 ? std::format("{:.3f}", cov / std::sqrt(vx * vy)).c_str() : "n/a", worst);
         if (worst_i >= 0) {
-            const int64_t cols = static_cast<int64_t>(r.col_labels.size());
+            const int64_t cols = std::ssize(r.col_labels);
             std::printf(" at %s %s (estimate %.3f, exact %.3f)", r.row_labels[worst_i / cols].c_str(),
                         r.col_labels[worst_i % cols].c_str(), shown->data[worst_i], want.data[worst_i]);
         }
@@ -505,7 +508,7 @@ int cmd_patch(const Args& a, const Model& m) {
 
 int cmd_attn(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
-    const int64_t T = static_cast<int64_t>(t.size()), layer = a.get_int("layer", 0);
+    const int64_t T = std::ssize(t), layer = a.get_int("layer", 0);
     if (layer < 0 || layer >= m.cfg().n_layers) throw std::invalid_argument("--layer is out of range");
     const int64_t H = m.layer_cfg(layer).n_heads, head = a.get_int("head", -1);
     if (head >= H) throw std::invalid_argument("--head is out of range");
@@ -574,7 +577,7 @@ int cmd_ablate(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
     const std::string mode = a.get("mode", "mean");
     if (mode != "mean" && mode != "zero") throw std::invalid_argument("--mode must be mean or zero");
-    const int64_t T = static_cast<int64_t>(t.size());
+    const int64_t T = std::ssize(t);
     const std::vector<Tokens> refs = mode == "mean" ? reference_tokens(a, m, T) : std::vector<Tokens>();
     if (mode == "mean" && refs.empty())
         throw std::invalid_argument(
@@ -615,7 +618,7 @@ int cmd_circuits(const Args& a, const Model& m) {
             all.push_back({c.k.data[i * N + j], "K", i, j});
             all.push_back({c.v.data[i * N + j], "V", i, j});
         }
-    std::ranges::sort(all, [](const Entry& x, const Entry& y) { return x.score > y.score; });
+    std::ranges::sort(all, std::ranges::greater{}, &Entry::score);
     std::printf("composition scores (weights only; random-head baseline %.3f)\n", base);
     if (m.cfg().positional == "rope")
         std::printf("note: RoPE rotates q/k by position, so Q/K scores ignore the rotation\n");
@@ -642,8 +645,8 @@ int cmd_circuits(const Args& a, const Model& m) {
             for (int64_t lb = la + 1; lb < L; ++lb)
                 for (int64_t i = first[la]; i < first[la + 1]; ++i)
                     for (int64_t j = first[lb]; j < first[lb + 1]; ++j)
-                        paths.push_back({pair.data[i * N + j], c.labels[i] + " -> " + c.labels[j]});
-        std::ranges::sort(paths, [](const auto& x, const auto& y) { return x.first > y.first; });
+                        paths.push_back({pair.data[i * N + j], std::format("{} -> {}", c.labels[i], c.labels[j])});
+        std::ranges::sort(paths, std::ranges::greater{}, [](const auto& x) { return x.first; });
         std::printf("\ntwo-head OV path copying (writer OV, then reader OV), top %lld:\n", (long long)top);
         for (size_t n = 0; n < std::min<size_t>(paths.size(), static_cast<size_t>(top)); ++n)
             std::printf("  %s   %.3f\n", paths[n].second.c_str(), paths[n].first);
@@ -765,8 +768,8 @@ int cmd_generate(const Args& a, const Model& m) {
             std::string parts;
             if (additive) {
                 std::vector<size_t> order(st.dla.values.size());
-                for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-                std::ranges::sort(order, [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
+                std::iota(order.begin(), order.end(), size_t{0});
+                std::ranges::sort(order, std::ranges::greater{}, [&](size_t i) { return st.dla.values[i]; });
                 for (size_t i = 0; i < std::min<size_t>(3, order.size()); ++i) {
                     parts += std::format("{}{} {:+.1f}", parts.empty() ? "" : "  ", st.dla.labels[order[i]],
                                          st.dla.values[order[i]]);
@@ -808,7 +811,7 @@ int main(int argc, char** argv) {
             if (dev == "cpu") set_device(Device::Cpu);
             else if (dev == "both") set_device(Device::Both);
             else if (dev == "gpu") set_device(Device::Gpu);
-            else throw std::invalid_argument("--device must be cpu, both or gpu, got '" + dev + "'");
+            else throw std::invalid_argument(std::format("--device must be cpu, both or gpu, got '{}'", dev));
         }
         if (a.has("fp16") && a.has("fp32")) throw std::invalid_argument("give --fp16 or --fp32, not both");
         const bool fp16 = a.has("fp16");
@@ -832,7 +835,7 @@ int main(int argc, char** argv) {
             {"attn", cmd_attn},   {"generate", cmd_generate},
         };
         auto it = commands.find(a.command);
-        if (it == commands.end()) throw std::invalid_argument("unknown command '" + a.command + "'");
+        if (it == commands.end()) throw std::invalid_argument(std::format("unknown command '{}'", a.command));
         return it->second(a, m);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "indra: %s\n\n%s", e.what(), kUsage);

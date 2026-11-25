@@ -29,7 +29,7 @@ int64_t shape_numel(const Shape& s) {
     int64_t n = 1;
     for (int64_t d : s)
         if (__builtin_mul_overflow(n, d, &n))
-            throw std::overflow_error("shape " + shape_str(s) + " has too many elements");
+            throw std::overflow_error(std::format("shape {} has too many elements", shape_str(s)));
     return n;
 }
 
@@ -48,7 +48,7 @@ int64_t Tensor::size(int64_t i) const {
 }
 
 static int64_t flat_index(const Shape& shape, std::initializer_list<int64_t> idx) {
-    if (static_cast<int64_t>(idx.size()) != static_cast<int64_t>(shape.size()))
+    if (std::ssize(idx) != std::ssize(shape))
         throw std::out_of_range("index rank does not match shape " + shape_str(shape));
     int64_t flat = 0, d = 0;
     for (int64_t i : idx) {
@@ -71,7 +71,8 @@ static Shape reshape_target(const Shape& from, Shape to) {
         else known *= to[i];
     }
     if (infer >= 0) to[infer] = known ? n / known : 0;
-    if (shape_numel(to) != n) throw std::invalid_argument("cannot reshape " + shape_str(from) + " to " + shape_str(to));
+    if (shape_numel(to) != n)
+        throw std::invalid_argument(std::format("cannot reshape {} to {}", shape_str(from), shape_str(to)));
     return to;
 }
 
@@ -98,7 +99,7 @@ void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t
     } else {
         for (int64_t i = 0; i < m; ++i) {
             float* c = C + i * ldc;
-            if (!accumulate) std::fill(c, c + n, 0.f);
+            if (!accumulate) std::fill_n(c, n, 0.f);
             for (int64_t p = 0; p < k; ++p) {
                 const float a = A[i * lda + p];
                 const float* b = B + p * ldb;
@@ -122,8 +123,8 @@ Tensor matmul(const Tensor& A, const Tensor& B, bool transpose_b) {
     const int64_t kb = transpose_b ? B.shape[1] : B.shape[0];
     const int64_t n = transpose_b ? B.shape[0] : B.shape[1];
     if (k != kb)
-        throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(B.shape) +
-                                    (transpose_b ? "^T" : ""));
+        throw std::invalid_argument(std::format("matmul shape mismatch {} @ {}{}", shape_str(A.shape),
+                                                shape_str(B.shape), (transpose_b ? "^T" : "")));
     Tensor C({m, n});
     if (m && n) gemm(transpose_b, m, n, k, A.ptr(), B.ptr(), C.ptr());
     return C;
@@ -133,7 +134,8 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     const int64_t in = W.shape[1], out = W.shape[0];
     if (x.size(-1) != in)
-        throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
+        throw std::invalid_argument(
+            std::format("linear: input {} vs weight {}", shape_str(x.shape), shape_str(W.shape)));
     // Treat x as (rows, in) and write straight into a tensor of the final shape: no copies.
     Shape s(x.shape.begin(), x.shape.end() - 1);  // x has at least one dim: x.size(-1) checked it
     s.push_back(out);
@@ -158,7 +160,7 @@ Tensor transpose2d(const Tensor& A) {
 
 static void check_same(const Tensor& a, const Tensor& b, const char* op) {
     if (a.shape != b.shape)
-        throw std::invalid_argument(std::string(op) + ": shape " + shape_str(a.shape) + " vs " + shape_str(b.shape));
+        throw std::invalid_argument(std::format("{}: shape {} vs {}", op, shape_str(a.shape), shape_str(b.shape)));
 }
 
 Tensor add(const Tensor& a, const Tensor& b) {
@@ -258,7 +260,7 @@ std::vector<int64_t> topk(std::span<const float> v, int64_t k) {
     k = std::min(k, n);
     std::vector<int64_t> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int64_t a, int64_t b) { return v[a] > v[b]; });
+    std::ranges::partial_sort(idx, idx.begin() + k, std::ranges::greater{}, [&](int64_t i) { return v[i]; });
     idx.resize(k);
     return idx;
 }

@@ -16,7 +16,7 @@ const Value* Value::find(const std::string& key) const {
 
 const Value& Value::at(const std::string& key) const {
     const Value* v = find(key);
-    if (!v) throw std::runtime_error("JSON: missing key '" + key + "'");
+    if (!v) throw std::runtime_error(std::format("JSON: missing key '{}'", key));
     return *v;
 }
 

@@ -69,7 +69,7 @@ Tensor from_numpy(const FloatIn& a) {
 
 nb::dict cache_to_dict(ActivationCache&& cache) {
     nb::dict d;
-    for (auto& kv : cache) d[nb::str(kv.first.c_str())] = to_numpy(std::move(kv.second));
+    for (auto& [name, t] : cache) d[nb::str(name.c_str())] = to_numpy(std::move(t));
     return d;
 }
 
@@ -80,7 +80,7 @@ NameFilter names_filter(const Model& m, const std::optional<std::vector<std::str
     const std::set<std::string> known(all.begin(), all.end());
     for (const auto& n : *names)
         if (!known.contains(n))
-            throw std::invalid_argument("no hook point named '" + n + "' (Model.hook_names() lists them)");
+            throw std::invalid_argument(std::format("no hook point named '{}' (Model.hook_names() lists them)", n));
     auto wanted = std::make_shared<std::set<std::string>>(names->begin(), names->end());
     return [wanted](const std::string& n) { return wanted->count(n) > 0; };
 }
@@ -112,9 +112,10 @@ std::optional<Hooks> python_hooks(const Model& m, const std::optional<nb::dict>&
         for (auto [key, value] : fns) {
             const std::string name = nb::cast<std::string>(key);
             if (!known.contains(name))
-                throw std::invalid_argument("no hook point named '" + name + "' (Model.hook_names() lists them)");
+                throw std::invalid_argument(
+                    std::format("no hook point named '{}' (Model.hook_names() lists them)", name));
             if (!PyCallable_Check(value.ptr()))
-                throw std::invalid_argument(std::string("the ") + what + " for '" + name + "' is not callable");
+                throw std::invalid_argument(std::format("the {} for '{}' is not callable", what, name));
             add(name, nb::handle(value));
         }
     };
@@ -128,8 +129,8 @@ std::optional<Hooks> python_hooks(const Model& m, const std::optional<nb::dict>&
                 FloatIn result = nb::cast<FloatIn>(out.is_none() ? arr : out);
                 Tensor t = from_numpy(result);
                 if (t.shape != shape)
-                    throw std::invalid_argument("the hook for '" + n + "' returned shape " + shape_str(t.shape) +
-                                                ", expected " + shape_str(shape));
+                    throw std::invalid_argument(std::format("the hook for '{}' returned shape {}, expected {}", n,
+                                                            shape_str(t.shape), shape_str(shape)));
                 act = std::move(t);
             });
         });
@@ -152,7 +153,7 @@ nb::str utf8_str(const std::string& bytes) {
 }
 
 int64_t resolve_pos(const Tokens& t, int64_t pos) {
-    const int64_t T = static_cast<int64_t>(t.size());
+    const int64_t T = std::ssize(t);
     if (pos < 0) pos += T;
     if (pos < 0 || pos >= T) throw std::out_of_range(std::format("pos is out of range for {} tokens", T));
     return pos;
@@ -162,7 +163,7 @@ Device parse_device(const std::string& s) {
     if (s == "cpu") return Device::Cpu;
     if (s == "both") return Device::Both;
     if (s == "gpu") return Device::Gpu;
-    throw std::invalid_argument("device must be 'cpu', 'both' or 'gpu', not '" + s + "'");
+    throw std::invalid_argument(std::format("device must be 'cpu', 'both' or 'gpu', not '{}'", s));
 }
 
 const char* device_name(Device d) { return d == Device::Cpu ? "cpu" : d == Device::Gpu ? "gpu" : "both"; }
@@ -347,7 +348,7 @@ NB_MODULE(_tfi, mod) {
         .def("weight_names",
              [](const Model& m) {
                  std::vector<std::string> n;
-                 for (const auto& kv : m.weights()) n.push_back(kv.first);
+                 for (const auto& [name, w] : m.weights()) n.push_back(name);
                  return n;
              })
         .def(
@@ -648,8 +649,7 @@ NB_MODULE(_tfi, mod) {
         "lens_grid",
         [](const Model& m, const Tokens& tokens, int64_t k) {
             const auto stages = lens_stages(m);
-            const int64_t T = static_cast<int64_t>(tokens.size()), V = m.cfg().vocab_size,
-                          S = static_cast<int64_t>(stages.size());
+            const int64_t T = std::ssize(tokens), V = m.cfg().vocab_size, S = std::ssize(stages);
             if (T == 0) throw std::invalid_argument("no tokens");
             k = std::max<int64_t>(1, std::min(k, V));
             std::vector<int64_t> top(S * T * k), rank(S * T, -1);
@@ -657,7 +657,7 @@ NB_MODULE(_tfi, mod) {
             {
                 nb::gil_scoped_release release;
                 std::set<std::string> needed;
-                for (const auto& st : stages) needed.insert(st.second);
+                for (const auto& [label, hook] : stages) needed.insert(hook);
                 ActivationCache cache;
                 m.run_with_cache(tokens, cache, [&needed](const std::string& n) { return needed.contains(n); });
                 const int64_t block = 64;  // rows unembedded at once: (block, V) logits at a time
@@ -684,7 +684,7 @@ NB_MODULE(_tfi, mod) {
             }
             nb::dict d;
             std::vector<std::string> labels;
-            for (const auto& st : stages) labels.push_back(st.first);
+            for (const auto& [label, hook] : stages) labels.push_back(label);
             const size_t s = static_cast<size_t>(S), t = static_cast<size_t>(T), kk = static_cast<size_t>(k);
             d["stages"] = labels;
             d["top_tokens"] = to_numpy(std::move(top), {s, t, kk});
@@ -744,7 +744,8 @@ NB_MODULE(_tfi, mod) {
         [](const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site, int64_t pos,
            int64_t target, int64_t other, const std::string& method, int64_t steps, int64_t verify) {
             if (method != "exact" && method != "attribution" && method != "mixed")
-                throw std::invalid_argument("method must be 'exact', 'attribution' or 'mixed', not '" + method + "'");
+                throw std::invalid_argument(
+                    std::format("method must be 'exact', 'attribution' or 'mixed', not '{}'", method));
             PatchResult r;
             {
                 nb::gil_scoped_release release;
