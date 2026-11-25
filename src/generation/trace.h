@@ -25,7 +25,8 @@ struct TraceRecorder {
     bool all_rows = false;
 
     TraceRecorder(const Model& model, const TraceOptions& o) : m(model), opt(o) {
-        if (o.top_k < 0 || o.attention_top < 0) throw std::invalid_argument("trace: top_k and attention_top must be 0 or more");
+        if (o.top_k < 0 || o.attention_top < 0)
+            throw std::invalid_argument("trace: top_k and attention_top must be 0 or more");
         if (o.lens)
             for (const std::string& n : lens_hook_points(m)) points.insert(n);
         if (o.dla) {
@@ -33,23 +34,27 @@ struct TraceRecorder {
             for (const std::string& n : dla_hook_points(m)) points.insert(n);
         }
         if (o.attention_top > 0)
-            for (int64_t l = 0; l < m.cfg().n_layers; ++l) points.insert("blocks." + std::to_string(l) + ".attn.hook_pattern");
+            for (int64_t l = 0; l < m.cfg().n_layers; ++l)
+                points.insert("blocks." + std::to_string(l) + ".attn.hook_pattern");
     }
     void direct_logit_attribution_from_check() const {
         for (int64_t i = 0; i < m.cfg().n_layers; ++i)
             if (m.cfg().norm_position == "post" || m.layer_cfg(i).norm_position == "post")
-                throw std::invalid_argument("trace: direct logit attribution needs an additive residual stream; post-norm "
-                                            "models have none (set trace.dla = false)");
+                throw std::invalid_argument(
+                    "trace: direct logit attribution needs an additive residual stream; post-norm "
+                    "models have none (set trace.dla = false)");
     }
     void capture(const std::string& name, const Tensor& a) {
         if (all_rows) {
             last[name] = a;
             return;
         }
-        if (name.size() > 12 && name.compare(name.size() - 12, 12, "hook_pattern") == 0) {  // (H, T, keys): each head's last query
+        if (name.size() > 12 &&
+            name.compare(name.size() - 12, 12, "hook_pattern") == 0) {  // (H, T, keys): each head's last query
             const int64_t H = a.shape[0], T = a.shape[1], K = a.shape[2];
             Tensor t({H, 1, K});
-            for (int64_t h = 0; h < H; ++h) std::copy(a.ptr() + (h * T + T - 1) * K, a.ptr() + (h * T + T) * K, t.ptr() + h * K);
+            for (int64_t h = 0; h < H; ++h)
+                std::copy(a.ptr() + (h * T + T - 1) * K, a.ptr() + (h * T + T) * K, t.ptr() + h * K);
             last[name] = std::move(t);
             return;
         }

@@ -151,7 +151,8 @@ Tokens input_tokens(const Args& a, const Model& m, const std::string& key = "tok
     const std::string text_key = key == "tokens" ? "text" : key + "-text";
     if (a.has(text_key)) return m.tokenize(a.get(text_key), !a.has("no-special-tokens"));
     if (a.has(key)) return parse_tokens(a.get(key));
-    if (key == "tokens" && a.has("repeat-random")) return repeat_random(m, a.get_int("repeat-random", 8), a.get_int("seed", 0));
+    if (key == "tokens" && a.has("repeat-random"))
+        return repeat_random(m, a.get_int("repeat-random", 8), a.get_int("seed", 0));
     throw std::invalid_argument("give --" + key + " or --" + text_key + (key == "tokens" ? " or --repeat-random" : ""));
 }
 
@@ -168,7 +169,9 @@ int64_t token_opt(const Args& a, const Model& m, const std::string& key, int64_t
 }
 
 // For display: 'text' when the model has a vocabulary, the id otherwise.
-std::string tok(const Model& m, int64_t id) { return m.vocab().empty() ? std::to_string(id) : "'" + m.token_str(id) + "'"; }
+std::string tok(const Model& m, int64_t id) {
+    return m.vocab().empty() ? std::to_string(id) : "'" + m.token_str(id) + "'";
+}
 
 int64_t resolve_pos(const Args& a, const Tokens& t) {
     int64_t p = a.get_int("pos", -1);
@@ -273,7 +276,8 @@ int cmd_info(const Args&, const Model& m) {
             std::printf(", %s scaling", r.type.c_str());
             if (r.factor) std::printf(" factor %g", *r.factor);
             if (r.type == "dynamic" || r.type == "longrope")
-                std::printf(", sequences up to %lld tokens", static_cast<long long>(r.original_max_position_embeddings));
+                std::printf(", sequences up to %lld tokens",
+                            static_cast<long long>(r.original_max_position_embeddings));
         }
         std::printf(")");
     }
@@ -322,7 +326,8 @@ int cmd_lens(const Args& a, const Model& m) {
     const auto lens = logit_lens(m, t, pos, target, a.get_int("top", 5));
     std::printf("logit lens at position %lld (token %s)", (long long)pos, tok(m, t[pos]).c_str());
     if (target >= 0) std::printf(", tracking token %s", tok(m, target).c_str());
-    std::printf("\n\n%-9s %-10s %-8s  top predictions (prob)\n", "stage", target >= 0 ? "p(target)" : "", target >= 0 ? "rank" : "");
+    std::printf("\n\n%-9s %-10s %-8s  top predictions (prob)\n", "stage", target >= 0 ? "p(target)" : "",
+                target >= 0 ? "rank" : "");
     for (const auto& e : lens) {
         std::printf("%-9s ", e.stage.c_str());
         if (target >= 0) std::printf("%-10.4f %-8lld ", e.target_prob, (long long)e.target_rank);
@@ -341,15 +346,18 @@ int cmd_dla(const Args& a, const Model& m) {
     const DLAResult r = direct_logit_attribution(m, t, pos, target, other);
     std::vector<size_t> order(r.values.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
+    std::sort(order.begin(), order.end(),
+              [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
     const size_t top = std::min<size_t>(order.size(), static_cast<size_t>(a.get_int("top", 15)));
     std::printf("direct logit attribution at position %lld: logit[%s]%s\n", (long long)pos, tok(m, target).c_str(),
                 other >= 0 ? (" - logit[" + tok(m, other) + "]").c_str() : "");
     std::printf("actual %.4f   sum of parts %.4f   (final norm scale frozen)\n\n", r.actual, r.sum);
     for (size_t i = 0; i < top; ++i) {
         const float v = r.values[order[i]];
-        const int bar = static_cast<int>(std::min(40.f, std::fabs(v) / std::max(1e-6f, std::fabs(r.values[order[0]])) * 40.f));
-        std::printf("%-16s %9.4f  %s%s\n", r.labels[order[i]].c_str(), v, v < 0 ? "-" : "+", std::string(bar, '#').c_str());
+        const int bar =
+            static_cast<int>(std::min(40.f, std::fabs(v) / std::max(1e-6f, std::fabs(r.values[order[0]])) * 40.f));
+        std::printf("%-16s %9.4f  %s%s\n", r.labels[order[i]].c_str(), v, v < 0 ? "-" : "+",
+                    std::string(bar, '#').c_str());
     }
     if (top < order.size()) std::printf("... %zu smaller components (--top)\n", order.size() - top);
     return 0;
@@ -413,25 +421,31 @@ int cmd_patch(const Args& a, const Model& m) {
         shown = &r.effect;
     } else {
         if (std::fabs(r.gap()) < 1.0f)
-            std::printf("warning: the gap is only %.3g in size, so normalized values amplify small effects and may be noise.\n"
-                        "         Choose a corruption that moves the metric more, or pass --raw.\n", std::fabs(r.gap()));
+            std::printf(
+                "warning: the gap is only %.3g in size, so normalized values amplify small effects and may be noise.\n"
+                "         Choose a corruption that moves the metric more, or pass --raw.\n",
+                std::fabs(r.gap()));
         std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
     }
     if (a.has("fp16")) {
         const double err = 1e-3 / std::max(1e-12, double(std::fabs(r.gap())));
         std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of up to about\n"
                     "      1e-3 to the metric: up to about %.2g in normalized values for this gap\n",
-                    use_gpu() && m.gpu() && (method != "attribution" || a.has("compare")) ? " and the GPU's multiplies take fp16 inputs" : "",
+                    use_gpu() && m.gpu() && (method != "attribution" || a.has("compare"))
+                        ? " and the GPU's multiplies take fp16 inputs"
+                        : "",
                     err);
         if (err > 0.01) std::printf("warning: that is large for this gap; run with --fp32 for exact values\n");
     }
     if (method == "attribution")
-        std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
-                    "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
+        std::printf(
+            "linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
+            "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
     const int64_t n_exact = std::count(r.exact.begin(), r.exact.end(), uint8_t(1));
     if (method == "mixed")
-        std::printf("* = measured by exact patching (the %lld largest estimates); other entries are attribution estimates\n",
-                    (long long)n_exact);
+        std::printf(
+            "* = measured by exact patching (the %lld largest estimates); other entries are attribution estimates\n",
+            (long long)n_exact);
     std::printf("\n");
     print_matrix(*shown, r.row_labels, r.col_labels, "%7.3f", method == "mixed" ? &r.exact : nullptr);
     if (std::any_of(shown->data.begin(), shown->data.end(), [](float v) { return std::isnan(v); }))
@@ -459,7 +473,8 @@ int cmd_patch(const Args& a, const Model& m) {
                         r.effect.data[worst_i] / unit);
         std::printf("\nlargest estimate left unverified: %.3f", unverified);
         if (unverified_i >= 0) std::printf(" (%s)", where(unverified_i).c_str());
-        std::printf("\nif estimates were far off, unverified sites may be too; exact patching (the default) measures every site\n");
+        std::printf("\nif estimates were far off, unverified sites may be too; exact patching (the default) measures "
+                    "every site\n");
     }
     if (method != "exact" && a.has("compare")) {
         const PatchResult exact = run("exact");
@@ -508,8 +523,8 @@ int cmd_attn(const Args& a, const Model& m) {
         for (int64_t h = head >= 0 ? head : 0; h < (head >= 0 ? head + 1 : H); ++h) {
             if (head < 0) std::printf(" H%lld", (long long)h);
             for (int64_t key : topk(P.ptr() + (h * T + q) * T, T, k))
-                std::printf(" %lld:%s %.2f", (long long)key, m.vocab().empty() ? std::to_string(t[key]).c_str()
-                                                                                : m.token_str(t[key]).c_str(),
+                std::printf(" %lld:%s %.2f", (long long)key,
+                            m.vocab().empty() ? std::to_string(t[key]).c_str() : m.token_str(t[key]).c_str(),
                             P.data[(h * T + q) * T + key]);
             std::printf(" |");
         }
@@ -573,7 +588,8 @@ int cmd_ablate(const Args& a, const Model& m) {
         std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of around 1e-4 to each value\n",
                     use_gpu() && m.gpu() ? " and the GPU's multiplies take fp16 inputs" : "");
     if (mode == "mean") {
-        const bool per_pos = std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
+        const bool per_pos =
+            std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
         std::printf("means over %zu reference sequences, %s\n", refs.size(),
                     per_pos ? "one per position" : "one over all positions (reference lengths differ from the input)");
     }
@@ -586,7 +602,11 @@ int cmd_circuits(const Args& a, const Model& m) {
     const int64_t top = a.get_int("top", 10);
     const Composition c = composition_scores(m);
     const float base = composition_random_baseline(m);
-    struct Entry { float score; std::string kind; size_t i, j; };
+    struct Entry {
+        float score;
+        std::string kind;
+        size_t i, j;
+    };
     std::vector<Entry> all;
     const size_t N = c.labels.size();
     for (size_t i = 0; i < N; ++i)
@@ -608,7 +628,8 @@ int cmd_circuits(const Args& a, const Model& m) {
     const int64_t sampled = a.get_int("tokens-sampled", 1024);
     const Tensor copy = ov_copying_scores(m, sampled);
     std::printf("\nOV copying: fraction of tokens a head's direct path maps back to themselves "
-                "(chance %.4f)\n", 1.0 / m.cfg().vocab_size);
+                "(chance %.4f)\n",
+                1.0 / m.cfg().vocab_size);
     print_matrix(copy, layer_labels(m), head_labels(m));
 
     // Two-head OV paths (V-composition): writer OV then reader OV, for every earlier/later pair.
@@ -680,12 +701,16 @@ int cmd_generate(const Args& a, const Model& m) {
             draft.emplace(Model::load(a.get("draft"), m.weight_format()));
             o.speculative.draft = &*draft;
             if (const int64_t diff = vocabulary_differences(m, *draft))
-                std::fprintf(stderr, "note: the draft's tokenizer differs from the model's at %lld token ids: its proposals will be "
-                             "rejected more often (the output is unaffected)\n", static_cast<long long>(diff));
+                std::fprintf(
+                    stderr,
+                    "note: the draft's tokenizer differs from the model's at %lld token ids: its proposals will be "
+                    "rejected more often (the output is unaffected)\n",
+                    static_cast<long long>(diff));
         }
     }
     for (int64_t id : o.stop_tokens)
-        if (id < 0 || id >= m.cfg().vocab_size) throw std::invalid_argument("--stop token " + std::to_string(id) + " is outside the vocabulary");
+        if (id < 0 || id >= m.cfg().vocab_size)
+            throw std::invalid_argument("--stop token " + std::to_string(id) + " is outside the vocabulary");
     const bool text = m.has_tokenizer() || !m.vocab().empty();
     Tokens all = prompt;
     size_t printed = 0;
@@ -694,7 +719,8 @@ int cmd_generate(const Args& a, const Model& m) {
         std::fwrite(shown.data(), 1, shown.size(), stdout);
         printed = shown.size();
     } else {
-        for (size_t i = 0; i < prompt.size(); ++i) std::printf("%s%lld", i ? "," : "", static_cast<long long>(prompt[i]));
+        for (size_t i = 0; i < prompt.size(); ++i)
+            std::printf("%s%lld", i ? "," : "", static_cast<long long>(prompt[i]));
         std::printf(" |");
     }
     std::fflush(stdout);
@@ -741,18 +767,20 @@ int cmd_generate(const Args& a, const Model& m) {
             if (additive) {
                 std::vector<size_t> order(st.dla.values.size());
                 for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-                std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
+                std::sort(order.begin(), order.end(),
+                          [&](size_t x, size_t y) { return st.dla.values[x] > st.dla.values[y]; });
                 for (size_t i = 0; i < std::min<size_t>(3, order.size()); ++i) {
                     char buf[64];
-                    std::snprintf(buf, sizeof buf, "%s %+.1f", st.dla.labels[order[i]].c_str(), st.dla.values[order[i]]);
+                    std::snprintf(buf, sizeof buf, "%s %+.1f", st.dla.labels[order[i]].c_str(),
+                                  st.dla.values[order[i]]);
                     parts += (parts.empty() ? "" : "  ") + std::string(buf);
                 }
                 char buf[48];
                 std::snprintf(buf, sizeof buf, "  (of %.1f)", st.dla.actual);
                 parts += buf;
             }
-            std::printf("%5lld  %s %6.3f  %-12s %s %s\n", static_cast<long long>(st.position + 1), pad(tok(m, st.token), 14).c_str(),
-                        st.prob, from.c_str(), pad(alts, 40).c_str(), parts.c_str());
+            std::printf("%5lld  %s %6.3f  %-12s %s %s\n", static_cast<long long>(st.position + 1),
+                        pad(tok(m, st.token), 14).c_str(), st.prob, from.c_str(), pad(alts, 40).c_str(), parts.c_str());
         }
     }
     std::fflush(stdout);
@@ -776,7 +804,8 @@ int main(int argc, char** argv) {
         if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
         if (a.has("device") || a.has("no-gpu")) {
             const std::string dev = a.has("device") ? a.get("device") : "cpu";
-            if (a.has("device") && a.has("no-gpu") && dev != "cpu") throw std::invalid_argument("--no-gpu contradicts --device " + dev);
+            if (a.has("device") && a.has("no-gpu") && dev != "cpu")
+                throw std::invalid_argument("--no-gpu contradicts --device " + dev);
             if (dev == "cpu") set_device(Device::Cpu);
             else if (dev == "both") set_device(Device::Both);
             else if (dev == "gpu") set_device(Device::Gpu);
@@ -789,17 +818,19 @@ int main(int argc, char** argv) {
         if (fp16) {
             const std::vector<std::string> kept = m.fp32_weights();
             if (!kept.empty()) {
-                std::printf("note: %zu weight%s kept in float32 (values outside fp16's range):", kept.size(), kept.size() == 1 ? "" : "s");
+                std::printf("note: %zu weight%s kept in float32 (values outside fp16's range):", kept.size(),
+                            kept.size() == 1 ? "" : "s");
                 for (size_t i = 0; i < std::min<size_t>(kept.size(), 4); ++i) std::printf(" %s", kept[i].c_str());
                 std::printf("%s\n", kept.size() > 4 ? " ..." : "");
             }
             if (a.command != "patch" && a.command != "ablate" && a.command != "info")
-                std::printf("note: --fp16: weights are stored in fp16, so values can differ from float32 weights by about 1e-3 relative\n");
+                std::printf("note: --fp16: weights are stored in fp16, so values can differ from float32 weights by "
+                            "about 1e-3 relative\n");
         }
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
-            {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},
-            {"patch", cmd_patch}, {"ablate", cmd_ablate}, {"circuits", cmd_circuits}, {"attn", cmd_attn},
-            {"generate", cmd_generate},
+            {"info", cmd_info},   {"run", cmd_run},           {"lens", cmd_lens},     {"dla", cmd_dla},
+            {"heads", cmd_heads}, {"patch", cmd_patch},       {"ablate", cmd_ablate}, {"circuits", cmd_circuits},
+            {"attn", cmd_attn},   {"generate", cmd_generate},
         };
         auto it = commands.find(a.command);
         if (it == commands.end()) throw std::invalid_argument("unknown command '" + a.command + "'");

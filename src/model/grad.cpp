@@ -8,8 +8,8 @@
 #include <stdexcept>
 
 #include "ops.h"
-#include "vmath.h"
 #include "tfi/model.h"
+#include "vmath.h"
 
 namespace tfi {
 
@@ -33,7 +33,8 @@ Tensor linear_backward(const Tensor& dy, const Weight& W) {
 
 namespace detail {
 
-Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x, const Tensor& dy) {
+Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
+                     const Tensor& dy) {
     if (c.norm == "none") return dy;
     const Tensor& w = m.weight(prefix + ".weight").f32();
     const int64_t d = x.size(-1), n = x.numel() / d;
@@ -181,8 +182,10 @@ struct Backward {
         Tensor q0, k0;  // the projections before qk_norm
         const Tensor& x = act(lp(layer) + "hook_attn_in");
         if (c.qk_norm) {
-            q0 = detail::split_heads(linear(x, m.weight(p + "q_proj.weight"), m.weight_or_null(p + "q_proj.bias")), H, D);
-            k0 = detail::split_heads(linear(x, m.weight(p + "k_proj.weight"), m.weight_or_null(p + "k_proj.bias")), Hkv, D);
+            q0 = detail::split_heads(linear(x, m.weight(p + "q_proj.weight"), m.weight_or_null(p + "q_proj.bias")), H,
+                                     D);
+            k0 = detail::split_heads(linear(x, m.weight(p + "k_proj.weight"), m.weight_or_null(p + "k_proj.bias")), Hkv,
+                                     D);
         }
         const detail::AttentionGrads g = detail::attention_backward(
             m, layer, dz, q, act(p + "hook_k"), act(p + "hook_v"), act(p + "hook_pattern"), &q0, &k0);
@@ -230,7 +233,8 @@ struct Backward {
         const std::string p = lp(layer) + "attn.";
         const Tensor& z = act(p + "hook_z");
         const int64_t T = z.shape[0];
-        const Tensor raw = linear(z.reshape({T, -1}), m.weight(p + "o_proj.weight"), m.weight_or_null(p + "o_proj.bias"));
+        const Tensor raw =
+            linear(z.reshape({T, -1}), m.weight(p + "o_proj.weight"), m.weight_or_null(p + "o_proj.bias"));
         return norm_backward(m, lp(layer) + "ln1_post", c, raw, g);
     }
     Tensor sandwich_mlp(int64_t layer, const Tensor& g) const {
@@ -263,7 +267,7 @@ struct Backward {
         };
 
         if (c.parallel_residual) {  // mid = x + attn(ln1 x); out = mid + mlp(ln2 x)
-            Tensor g_x = g_post;  // copy: g_mid is g_post, and g_x accumulates every path
+            Tensor g_x = g_post;    // copy: g_mid is g_post, and g_x accumulates every path
             if (c.has_mlp()) add_(g_x, norm_backward(m, p + "ln2", c, x, mlp_branch(g_post)));
             report(p + "hook_resid_mid", g_post);
             const Tensor d_attn_in = attn_branch(g_post);
@@ -314,7 +318,8 @@ Tensor Model::run_with_gradients(const Tokens& tokens, const std::function<Tenso
     Tensor g = matmul(dl, unembed());  // d hook_final
     bw.report("hook_final", g);
     const int64_t L = cfg_.n_layers;
-    if (cfg_.norm_position != "post") g = norm_backward(*this, "ln_final", cfg_, cache.at(lp(L - 1) + "hook_resid_post"), g);
+    if (cfg_.norm_position != "post")
+        g = norm_backward(*this, "ln_final", cfg_, cache.at(lp(L - 1) + "hook_resid_post"), g);
     for (int64_t i = L - 1; i >= 0; --i) g = bw.block(i, g);
     bw.report("hook_embed", g);  // resid_pre of block 0 = embed (+ pos_embed)
     if (cfg_.embedding_positional()) bw.report("hook_pos_embed", g);

@@ -54,7 +54,8 @@ Biases Biases::from_json(const json::Value& v) {
     if (!v.is_array()) throw std::runtime_error("config: bias must be true, false or a list of parts");
     for (const json::Value& p : v.array) {
         const std::string& name = p.as_string();
-        if (!all_parts().count(name)) throw std::runtime_error("config: bias part '" + name + "' is not one of qkv, o, mlp, norm");
+        if (!all_parts().count(name))
+            throw std::runtime_error("config: bias part '" + name + "' is not one of qkv, o, mlp, norm");
         if (!b.parts.insert(name).second) throw std::runtime_error("config: bias part '" + name + "' given twice");
     }
     return b;
@@ -69,12 +70,14 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
         {"linear", {{"factor"}, {}}},
         {"dynamic", {{"factor", "original_max_position_embeddings"}, {}}},
         {"llama3", {{"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}, {}}},
-        {"yarn", {{"factor", "original_max_position_embeddings"},
-                  {"beta_fast", "beta_slow", "mscale", "mscale_all_dim", "attention_factor", "truncate"}}},
+        {"yarn",
+         {{"factor", "original_max_position_embeddings"},
+          {"beta_fast", "beta_slow", "mscale", "mscale_all_dim", "attention_factor", "truncate"}}},
         {"longrope", {{"short_factor", "original_max_position_embeddings"}, {"factor", "attention_factor"}}},
     };
     auto it = kKeys.find(r.type);
-    if (it == kKeys.end()) throw std::runtime_error("config: rope_scaling type '" + r.type + "' is not supported by tfi");
+    if (it == kKeys.end())
+        throw std::runtime_error("config: rope_scaling type '" + r.type + "' is not supported by tfi");
     for (const std::string& k : it->second.first)
         if (!v.find(k)) throw std::runtime_error("config: rope_scaling '" + r.type + "' needs '" + k + "'");
     for (size_t i = 0; i < v.keys.size(); ++i) {
@@ -87,19 +90,23 @@ RopeScaling RopeScaling::from_json(const json::Value& v) {
         else if (k == "original_max_position_embeddings") r.original_max_position_embeddings = x.as_int();
         else if (k == "low_freq_factor") r.low_freq_factor = x.as_number();
         else if (k == "high_freq_factor") r.high_freq_factor = x.as_number();
-        else if (k == "beta_fast") { if (!x.is_null()) r.beta_fast = x.as_number(); }
-        else if (k == "beta_slow") { if (!x.is_null()) r.beta_slow = x.as_number(); }
-        else if (k == "mscale") r.mscale = opt_num(x);
+        else if (k == "beta_fast") {
+            if (!x.is_null()) r.beta_fast = x.as_number();
+        } else if (k == "beta_slow") {
+            if (!x.is_null()) r.beta_slow = x.as_number();
+        } else if (k == "mscale") r.mscale = opt_num(x);
         else if (k == "mscale_all_dim") r.mscale_all_dim = opt_num(x);
         else if (k == "attention_factor") r.attention_factor = opt_num(x);
         else if (k == "truncate") r.truncate = x.as_bool();
-        else if (k == "short_factor") for (const auto& e : x.array) r.short_factor.push_back(e.as_number());
+        else if (k == "short_factor")
+            for (const auto& e : x.array) r.short_factor.push_back(e.as_number());
     }
     if (it->second.first.count("factor") && !(r.factor && *r.factor > 0))
         throw std::runtime_error("config: rope_scaling factor must be positive");
     if (r.type == "llama3" && !(r.low_freq_factor < r.high_freq_factor))
         throw std::runtime_error("config: rope_scaling 'llama3' needs low_freq_factor < high_freq_factor");
-    if (r.original_max_position_embeddings < 0) throw std::runtime_error("config: original_max_position_embeddings < 0");
+    if (r.original_max_position_embeddings < 0)
+        throw std::runtime_error("config: original_max_position_embeddings < 0");
     return r;
 }
 
@@ -124,8 +131,7 @@ void ModelConfig::apply(const json::Value& f) {
             // 0 asks for the default width, as in indranet (`cfg.d_mlp or default`), whose exports store it so.
             d_mlp = opt_int<int64_t>(v);
             if (d_mlp && *d_mlp == 0) d_mlp.reset();
-        }
-        else if (k == "mlp_multiple_of") mlp_multiple_of = v.as_int();
+        } else if (k == "mlp_multiple_of") mlp_multiple_of = v.as_int();
         else if (k == "max_seq_len") max_seq_len = v.as_int();
         else if (k == "norm") norm = v.as_string();
         else if (k == "norm_eps") norm_eps = v.as_number();
@@ -133,7 +139,8 @@ void ModelConfig::apply(const json::Value& f) {
         else if (k == "positional") positional = v.as_string();
         else if (k == "rope_theta") rope_theta = v.as_number();
         else if (k == "rope_fraction") rope_fraction = v.as_number();
-        else if (k == "rope_scaling") rope_scaling = v.is_null() ? std::nullopt : std::optional<RopeScaling>(RopeScaling::from_json(v));
+        else if (k == "rope_scaling")
+            rope_scaling = v.is_null() ? std::nullopt : std::optional<RopeScaling>(RopeScaling::from_json(v));
         else if (k == "attention") attention = v.as_string();
         else if (k == "mlp") mlp = v.as_string();
         else if (k == "activation") activation = v.as_string();

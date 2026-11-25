@@ -38,8 +38,8 @@ inline uint16_t float_to_half(float f) {
     const uint32_t sign = (x >> 16) & 0x8000, ax = x & 0x7FFFFFFF;
     if (ax >= 0x7F800000) return static_cast<uint16_t>(sign | 0x7C00 | (ax > 0x7F800000 ? 0x200 : 0));  // inf, NaN
     if (ax >= 0x477FF000) return static_cast<uint16_t>(sign | 0x7C00);  // >= 65520 rounds to infinity
-    if (ax < 0x38800000) {                                               // below 2^-14: subnormal or zero
-        if (ax < 0x33000000) return static_cast<uint16_t>(sign);         // below 2^-25 rounds to zero
+    if (ax < 0x38800000) {                                              // below 2^-14: subnormal or zero
+        if (ax < 0x33000000) return static_cast<uint16_t>(sign);        // below 2^-25 rounds to zero
         const uint32_t e = ax >> 23, m = (ax & 0x7FFFFF) | 0x800000, shift = 126 - e;
         uint32_t r = m >> shift;
         const uint32_t rem = m & ((1u << shift) - 1), halfway = 1u << (shift - 1);

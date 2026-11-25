@@ -10,9 +10,9 @@
 #include <stdexcept>
 #include <vector>
 
+#include "gpu_chunks.h"
 #include "tfi/tensor.h"
 #include "tfi/weight.h"
-#include "gpu_chunks.h"
 
 namespace tfi {
 namespace detail {
@@ -76,15 +76,16 @@ class Gpu::Seq {
     // Over rows of w.numel() values: (x - mean) / sqrt(var + eps) * w (+ b), as Model::norm.
     // Without `layernorm` (rmsnorm), mean is 0 and b must be null.
     void norm(int x, int y, int64_t rows, const Tensor& w, const Tensor* b, bool layernorm, float eps);
-    void activate(int x, int64_t n, GpuAct act);         // in place
-    void glu(int gate, int up, int64_t n, GpuAct act);   // gate = act(gate) * up
-    void add(int a, int b, int out, int64_t n);          // out = a + b; out may be a or b
-    void copy(int x, int y, int64_t n, int64_t x_offset = 0, int64_t y_offset = 0);  // y[y_offset..][0, n) = x[x_offset..][0, n)
+    void activate(int x, int64_t n, GpuAct act);        // in place
+    void glu(int gate, int up, int64_t n, GpuAct act);  // gate = act(gate) * up
+    void add(int a, int b, int out, int64_t n);         // out = a + b; out may be a or b
+    void copy(int x, int y, int64_t n, int64_t x_offset = 0,
+              int64_t y_offset = 0);  // y[y_offset..][0, n) = x[x_offset..][0, n)
     // A KV cache's new positions: rows src_row.. of `src` (rows, heads * D) into `dst` (heads, cap, D), as
     // positions start .. start + rows - 1 (start + rows <= cap).
     // With half, dst holds fp16 values (2 per float of the slot), each rounded as it is written.
-    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row = 0,
-                   bool half = false);
+    void kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start,
+                   int64_t src_row = 0, bool half = false);
     // x[0, n) rounded to fp16 values (clamped to fp16's finite range), in place.
     void round_half(int x, int64_t n);
     // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
@@ -98,12 +99,12 @@ class Gpu::Seq {
     // row r is at position meta[4 r] (uint32), and inv_freq holds the rot / 2 frequencies. cos and sin
     // are multiplied by `scale` (RoPE scaling's attention factor). inverse: the transpose (RoPE's backward
     // pass), which with scale 1 rotates back.
-    void rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse = false,
-              float scale = 1.f);
+    void rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta,
+              bool inverse = false, float scale = 1.f);
     // Causal attention of every row's query, as Model::attend: z (rows, H D) from q (rows, H D) and
     // k, v (rows, Hkv D). meta has 4 uint32 per row: its position, its segment's start position, its
-    // segment's first row and its segment's number of rows. Keys and values before the segment's start come from pk, pv (Hkv, Tp, D),
-    // the rest from the segment's own rows. Scores are scaled, then softcapped (cap > 0), then ALiBi'd
+    // segment's first row and its segment's number of rows. Keys and values before the segment's start come from pk, pv
+    // (Hkv, Tp, D), the rest from the segment's own rows. Scores are scaled, then softcapped (cap > 0), then ALiBi'd
     // (slopes: one per head, if has_slopes), within `window` keys if window > 0. Float32.
     // With `blocks` > 0 and D a multiple of 8 up to 128, slot `blk` divides the rows into that many
     // blocks of up to kAttnBlockRows consecutive rows of one segment (4 uint32 each: first row, rows,
@@ -120,8 +121,8 @@ class Gpu::Seq {
     // attention_backward.
     // kbase >= 0: a slot of one uint per row, where its sequence's positions start in pk / pv (several
     // sequences' caches in one buffer, each in a region of its own: positions j at kbase + j).
-    void attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk = 0,
-                   int lse = -1, int kbase = -1);
+    void attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape,
+                   int blk = 0, int lse = -1, int kbase = -1);
     // attention()'s backward pass with no earlier positions (shape.Tp = 0): from dz (rows, H D) and
     // the forward pass's q, k, v, z and lse, dq into `dq` (rows, H D), dk and dv into `dk`, `dv`
     // (rows, Hkv D); `delta` is scratch (rows, H).
@@ -158,11 +159,11 @@ class Gpu::Seq {
 struct GpuKV {
     static constexpr int kSlot0 = 256;  // above every slot run_rows uses
     static constexpr int kKBase = kSlot0 - 4, kFinal = kSlot0 - 3, kFinalLast = kSlot0 - 2, kLogits = kSlot0 - 1;
-    std::shared_ptr<Gpu> gpu;           // kept alive with the cache
+    std::shared_ptr<Gpu> gpu;  // kept alive with the cache
     std::unique_ptr<Gpu::Seq> seq;
-    int64_t cap = 0;                    // positions each sequence's region of a layer's slots holds
-    int64_t regions = 1;                // sequences (a KVBatch's), region r at positions r * cap ..
-    bool half = false;                  // keys and values held as fp16 (a model with fp16 weights), 2 per float of a slot
+    int64_t cap = 0;      // positions each sequence's region of a layer's slots holds
+    int64_t regions = 1;  // sequences (a KVBatch's), region r at positions r * cap ..
+    bool half = false;    // keys and values held as fp16 (a model with fp16 weights), 2 per float of a slot
     static int keys(int64_t layer) { return kSlot0 + 5 * static_cast<int>(layer); }
     static int values(int64_t layer) { return keys(layer) + 1; }
     static int inv_freq(int64_t layer) { return keys(layer) + 2; }
@@ -215,7 +216,7 @@ class Gpu::Batch {
     // sets overflowed() (the caller then does the work again in float32).
     void to_half(int src, int dst, int64_t n);
     bool overflowed();  // since the last run() began
-    void end_group();  // the operations since the previous end_group() form one group
+    void end_group();   // the operations since the previous end_group() form one group
     // Run every group recorded since the last run() and wait for all of them.
     void run();
 

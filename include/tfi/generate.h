@@ -24,15 +24,15 @@ struct TraceOptions {
 };
 
 struct TraceStep {
-    int64_t token = -1;     // the chosen token
-    int64_t position = -1;  // the position whose logits chose it (the token goes at position + 1)
+    int64_t token = -1;           // the chosen token
+    int64_t position = -1;        // the position whose logits chose it (the token goes at position + 1)
     float prob = 0, logprob = 0;  // its probability under the model's distribution (before temperature, top_k, top_p)
     std::vector<int64_t> top_tokens;
     std::vector<float> top_probs;
     std::vector<LensEntry> lens;  // target_prob / target_rank: the chosen token's, at each stage
     DLAResult dla;                // parts of the chosen token's logit
     struct Attention {
-        std::string head;              // "L3H5"
+        std::string head;                // "L3H5"
         std::vector<int64_t> positions;  // most attended first
         std::vector<float> weights;
     };
@@ -79,7 +79,7 @@ struct GenerateOptions {
     bool stop_at_eos = true;           // ... or one of the model's eos_tokens()
     // Called with each new token as it is chosen; returning false stops after it.
     std::function<bool(int64_t token)> on_token;
-    TraceOptions trace;  // what generate() records when given a trace to fill
+    TraceOptions trace;              // what generate() records when given a trace to fill
     SpeculativeOptions speculative;  // generate() only
 };
 
@@ -135,8 +135,8 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
 // sequence, each may be null) apply to their sequence only: each sees its own rows of every activation
 // (hook_pattern is not available). traces: one per sequence, as generate()'s trace (attention_top must
 // be 0). options.on_token and options.speculative are not used: give generate() one sequence for them.
-std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts, const GenerateOptions& options = {},
-                                   const std::vector<const Hooks*>& hooks = {},
+std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts,
+                                   const GenerateOptions& options = {}, const std::vector<const Hooks*>& hooks = {},
                                    std::vector<std::vector<TraceStep>>* traces = nullptr);
 
 }  // namespace tfi

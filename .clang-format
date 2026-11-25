@@ -1,0 +1,13 @@
+# The LLVM style, with the settings this code already follows.
+BasedOnStyle: LLVM
+IndentWidth: 4
+AccessModifierOffset: -2              # "  public:" inside a class
+ColumnLimit: 120
+PointerAlignment: Left                # const float* x
+SpacesBeforeTrailingComments: 2       # code;  // comment
+IndentCaseLabels: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+BreakTemplateDeclarations: Yes        # template <...> on its own line

@@ -96,12 +96,31 @@ class Parser {
             v.string = parse_string();
             return v;
         }
-        if (consume_literal("true")) { v.type = Value::Type::Bool; v.boolean = true; return v; }
-        if (consume_literal("false")) { v.type = Value::Type::Bool; return v; }
+        if (consume_literal("true")) {
+            v.type = Value::Type::Bool;
+            v.boolean = true;
+            return v;
+        }
+        if (consume_literal("false")) {
+            v.type = Value::Type::Bool;
+            return v;
+        }
         if (consume_literal("null")) return v;
-        if (consume_literal("NaN")) { v.type = Value::Type::Number; v.number = NAN; return v; }
-        if (consume_literal("Infinity")) { v.type = Value::Type::Number; v.number = INFINITY; return v; }
-        if (consume_literal("-Infinity")) { v.type = Value::Type::Number; v.number = -INFINITY; return v; }
+        if (consume_literal("NaN")) {
+            v.type = Value::Type::Number;
+            v.number = NAN;
+            return v;
+        }
+        if (consume_literal("Infinity")) {
+            v.type = Value::Type::Number;
+            v.number = INFINITY;
+            return v;
+        }
+        if (consume_literal("-Infinity")) {
+            v.type = Value::Type::Number;
+            v.number = -INFINITY;
+            return v;
+        }
         return parse_number();
     }
 
@@ -119,8 +138,10 @@ class Parser {
 
     static void append_utf8(std::string& out, uint32_t cp) {
         if (cp < 0x80) out += static_cast<char>(cp);
-        else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
-        else if (cp < 0x10000) {
+        else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
             out += static_cast<char>(0xE0 | (cp >> 12));
             out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
             out += static_cast<char>(0x80 | (cp & 0x3F));
@@ -153,7 +174,10 @@ class Parser {
             if (i_ >= s_.size()) fail("unterminated string");
             const char c = s_[i_++];
             if (c == '"') break;
-            if (c != '\\') { out += c; continue; }
+            if (c != '\\') {
+                out += c;
+                continue;
+            }
             if (i_ >= s_.size()) fail("unterminated escape");
             const char e = s_[i_++];
             switch (e) {
@@ -185,7 +209,10 @@ class Parser {
         expect('[');
         Value v;
         v.type = Value::Type::Array;
-        if (peek() == ']') { ++i_; return v; }
+        if (peek() == ']') {
+            ++i_;
+            return v;
+        }
         while (true) {
             v.array.push_back(parse_value());
             const char c = peek();
@@ -200,7 +227,10 @@ class Parser {
         expect('{');
         Value v;
         v.type = Value::Type::Object;
-        if (peek() == '}') { ++i_; return v; }
+        if (peek() == '}') {
+            ++i_;
+            return v;
+        }
         while (true) {
             if (peek() != '"') fail("expected object key");
             v.keys.push_back(parse_string());

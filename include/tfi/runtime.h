@@ -22,12 +22,13 @@ namespace tfi {
 // numbers or use another token's activation, unchanged. Hooks whose edits can't be predicted run with little or
 // no speculation. As each pass of Model::forward_cached runs a copy of its hooks, each token's hooks run on a copy
 // made just before they run, their filters asked then: a mutable lambda's state lasts one token, the caller's
-// Hooks is never changed, and a filter can turn on or off between tokens. The model, options' draft, hooks and trace must outlive the runtime; options.on_token is
-// generate()'s, not used here. After an exception from a hook or the model, next() returns nothing.
+// Hooks is never changed, and a filter can turn on or off between tokens. The model, options' draft, hooks and trace
+// must outlive the runtime; options.on_token is generate()'s, not used here. After an exception from a hook or the
+// model, next() returns nothing.
 class DecodeRuntime {
   public:
-    DecodeRuntime(const Model& model, const Tokens& prompt, const GenerateOptions& options = {}, const Hooks* hooks = nullptr,
-                  std::vector<TraceStep>* trace = nullptr);
+    DecodeRuntime(const Model& model, const Tokens& prompt, const GenerateOptions& options = {},
+                  const Hooks* hooks = nullptr, std::vector<TraceStep>* trace = nullptr);
     ~DecodeRuntime();
     DecodeRuntime(const DecodeRuntime&) = delete;
     DecodeRuntime& operator=(const DecodeRuntime&) = delete;

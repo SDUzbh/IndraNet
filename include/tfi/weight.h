@@ -22,9 +22,9 @@ enum class WeightFormat { fp32, fp16 };
 
 // One weight. A 2-D weight (a matrix: embeddings, projections, unembedding) keeps its values, float32
 // or half precision, in page-aligned memory that the GPU can use in place, without a copy of its own:
-// an allocation of its own, or a memory-mapped model file (borrowed()); copies of a Weight share it. Read matrices through rows(), cols(), to_tensor() and the
-// linear() / matmul() overloads below, which give float32 either way. Other weights (norm scales,
-// biases) are float32 Tensors, read with f32().
+// an allocation of its own, or a memory-mapped model file (borrowed()); copies of a Weight share it. Read matrices
+// through rows(), cols(), to_tensor() and the linear() / matmul() overloads below, which give float32 either way. Other
+// weights (norm scales, biases) are float32 Tensors, read with f32().
 class Weight {
   public:
     Shape shape;
@@ -43,7 +43,8 @@ class Weight {
     // A 2-D weight whose values stay in memory owned elsewhere (a memory-mapped model file): nothing is
     // copied. data must start on a page boundary and capacity bytes from it (whole pages, at least the
     // values' size) must be readable, so that the GPU can use it in place too; owner keeps it alive.
-    static Weight borrowed(Shape shape, bool fp16, const void* data, size_t capacity, std::shared_ptr<const void> owner);
+    static Weight borrowed(Shape shape, bool fp16, const void* data, size_t capacity,
+                           std::shared_ptr<const void> owner);
     bool is_borrowed() const { return borrowed_; }  // values in memory owned elsewhere (see borrowed())
 
     int64_t numel() const;
@@ -88,7 +89,8 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b = nullptr);
 // linear(x, Ws[i], bs[i]) for every i (bs may be empty, or hold nulls), the same values as separate
 // calls. With 1-16 rows of x the weights' rows are split across the threads together, so that one wake
 // of the threads covers them all (e.g. q, k and v).
-std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws, const std::vector<const Weight*>& bs = {});
+std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws,
+                                const std::vector<const Weight*>& bs = {});
 // A(m, n) @ W(n, k) for a 2-D weight W: e.g. linear()'s input gradient dy @ W.
 Tensor matmul(const Tensor& A, const Weight& W);
 

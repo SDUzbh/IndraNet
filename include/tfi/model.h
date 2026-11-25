@@ -11,18 +11,18 @@
 #include <vector>
 
 #include "tfi/config.h"
-#include "tfi/tokenizer.h"
 #include "tfi/tensor.h"
+#include "tfi/tokenizer.h"
 #include "tfi/weight.h"
 
 namespace tfi {
 
 namespace detail {
-struct RowBatch;  // internal (src/model/ops.h)
-struct KVRef;     // internal (src/model/ops.h): earlier keys or values for attention
+struct RowBatch;       // internal (src/model/ops.h)
+struct KVRef;          // internal (src/model/ops.h): earlier keys or values for attention
 struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model/model.cpp)
-class Gpu;        // internal (src/gpu/gpu.h, macOS)
-struct GpuKV;     // internal (src/gpu/gpu.h, macOS): a KVCache's copy on the GPU
+class Gpu;             // internal (src/gpu/gpu.h, macOS)
+struct GpuKV;          // internal (src/gpu/gpu.h, macOS): a KVCache's copy on the GPU
 
 // A model's GPU context, created on first use. Copies start empty: each model has its own context
 // (a copy shares the weights' memory, which each context uses in place).
@@ -47,16 +47,16 @@ using NameFilter = std::function<bool(const std::string& name)>;
 
 class Hooks {
   public:
-    Hooks& add(const std::string& name, HookFn fn);       // exact hook name
-    Hooks& add_filter(NameFilter filter, HookFn fn);      // every hook the filter accepts
+    Hooks& add(const std::string& name, HookFn fn);   // exact hook name
+    Hooks& add_filter(NameFilter filter, HookFn fn);  // every hook the filter accepts
     // A hook that only reads (e.g. caches) the activations the filter accepts: on the GPU it may be
     // called after the pass has moved on, and out of order with other hooks, with a copy of the
     // activation as it was at the hook point, so the pass need not stop for it.
     Hooks& add_capture(NameFilter filter, HookFn fn);
     Hooks& extend(const Hooks& other);
     void run(const std::string& name, Tensor& act) const;  // in registration order
-    bool matches(const std::string& name) const;            // whether run(name) would call anything
-    bool changes(const std::string& name) const;            // ... anything but captures
+    bool matches(const std::string& name) const;           // whether run(name) would call anything
+    bool changes(const std::string& name) const;           // ... anything but captures
     bool empty() const { return entries_.empty(); }
 
   private:
@@ -131,11 +131,12 @@ class KVCache {
     detail::KVRef ref(int64_t layer, bool values) const;  // layer's CPU copy, for attention on the CPU
     // Rows n of the CPU copy from position `at` (every head), from float32 values (fp16 ones, for an fp16 cache).
     void put(Store& s, const float* src, int64_t n, int64_t at) const;
-    void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v, int64_t n);  // on the CPU, which is up to date
-    void sync_cpu() const;                // [cpu_len_, size()) from the GPU
-    void reserve_cpu(int64_t n) const;    // CPU capacity for n positions, keeping [0, cpu_len_)
+    void append(const std::vector<Tensor>& k, const std::vector<Tensor>& v,
+                int64_t n);             // on the CPU, which is up to date
+    void sync_cpu() const;              // [cpu_len_, size()) from the GPU
+    void reserve_cpu(int64_t n) const;  // CPU capacity for n positions, keeping [0, cpu_len_)
     void shapes(const std::vector<int64_t>& heads, const std::vector<int64_t>& dims);  // per-layer shapes, if none yet
-    void check() const;                   // with TFI_CHECK_KV set: the invariant, and both sides equal where both hold
+    void check() const;  // with TFI_CHECK_KV set: the invariant, and both sides equal where both hold
 };
 
 // Several sequences' KV caches, continued together by Model::forward_cached's batched form: each call
@@ -188,7 +189,8 @@ class Model {
     // to there (a prompt's go straight in), and the pass, final norm and unembedding included, is one GPU
     // submission (with fp16 weights, fp16 multiplies: see WeightFormat). Not when a hook reads hook_pattern, or a
     // layer's heads are too wide for the GPU's attention: the CPU then (a prompt: forward()'s whole pass).
-    Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr, bool last_only = false) const;
+    Tensor forward_cached(const Tokens& tokens, KVCache& cache, const Hooks* hooks = nullptr,
+                          bool last_only = false) const;
     // Several sequences in one pass: tokens[i] continues sequence i of `batch` (empty: it sits this call
     // out). Returns each sequence's logits as forward_cached would give them (an empty tensor for one that
     // sat out). The sequences' rows are stacked in order, so hooks see (rows of every sequence given
@@ -249,8 +251,8 @@ class Model {
     // each edited value as the activation itself (e.g. replacing hook_embed runs the model on other
     // embeddings). If `acts` is given it receives every activation. Returns the logits.
     Tensor run_with_gradients(const Tokens& tokens, const std::function<Tensor(const Tensor& logits)>& dlogits,
-                              ActivationCache& grads, NameFilter filter = nullptr,
-                              ActivationCache* acts = nullptr, const Hooks* hooks = nullptr) const;
+                              ActivationCache& grads, NameFilter filter = nullptr, ActivationCache* acts = nullptr,
+                              const Hooks* hooks = nullptr) const;
 
     const Weight& weight(const std::string& name) const;  // throws, naming the missing tensor
     const Weight* weight_or_null(const std::string& name) const;
@@ -267,7 +269,7 @@ class Model {
     // was given one. Without it, tokens are plain ids.
     const std::vector<std::string>& vocab() const { return vocab_; }
     void set_vocab(std::vector<std::string> vocab);
-    std::string token_str(int64_t id) const;     // the token's text, or its id
+    std::string token_str(int64_t id) const;  // the token's text, or its id
     // Optional tokenizer: a Hugging Face tokenizer.json (stored by indranet_hf), parsed on first use.
     bool has_tokenizer() const;
     const Tokenizer& tokenizer() const;  // throws std::runtime_error without one, or if it can't be read
@@ -286,7 +288,7 @@ class Model {
 
     // Building blocks reused by the analysis tools.
     Tensor norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const;  // over the last dim
-    Tensor final_norm(const Tensor& resid) const;    // ln_final (identity for post-norm models)
+    Tensor final_norm(const Tensor& resid) const;          // ln_final (identity for post-norm models)
     Tensor logits_from_final(const Tensor& normed) const;  // unembed + final softcap
     // The same, with the unembedding on the GPU when `batch` allows it (as in forward_rows).
     Tensor logits_from_final(const Tensor& normed, const detail::RowBatch* batch) const;
@@ -310,7 +312,8 @@ class Model {
     std::vector<std::string> param_names_;
     const std::string& param_name(int64_t layer, int param, bool bias = false) const;
     // norm() with its weight and bias tensors' names.
-    Tensor norm_named(const std::string& weight_name, const std::string& bias_name, const ModelConfig& c, const Tensor& x) const;
+    Tensor norm_named(const std::string& weight_name, const std::string& bias_name, const ModelConfig& c,
+                      const Tensor& x) const;
     WeightFormat format_ = WeightFormat::fp32;
     std::map<std::string, Weight> w_;  // declared before gpu_, which may use their memory in place
     std::vector<std::string> vocab_;
@@ -331,11 +334,11 @@ class Model {
     // the GPU (batch.kv) and `logits`, the final norm (hook_final, every row) and the unembedding (of the
     // last row only with logits_last_only) run in the same GPU submission, into *logits, before any final
     // softcap.
-    Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks,
-                    bool last_rows = false, Tensor* logits = nullptr, bool logits_last_only = false) const;
+    Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks, bool last_rows = false,
+                    Tensor* logits = nullptr, bool logits_last_only = false) const;
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
     Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
-    Tensor positional_embedding(int64_t start, int64_t T) const;  // positions start..start+T-1
+    Tensor positional_embedding(int64_t start, int64_t T) const;                  // positions start..start+T-1
     Tensor positional_embedding_at(const std::vector<int64_t>& positions) const;  // one row per position
     // embed() with each token's own position (several sequences stacked, each at its own place).
     Tensor embed_at(const Tokens& tokens, const std::vector<int64_t>& positions, const Hooks* hooks) const;
@@ -344,7 +347,8 @@ class Model {
     // macOS: whether a cached pass of T new rows goes to the GPU (forward_cached's rules); if so, sets up
     // the cache's GPU copy with room for `need` positions, uploads what only the CPU holds below
     // `upload_to`, and points rb at it.
-    void use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to, const Hooks* hooks) const;
+    void use_gpu_cache(KVCache& cache, detail::RowBatch& rb, int64_t T, int64_t need, int64_t upload_to,
+                       const Hooks* hooks) const;
     void check_cache(const KVCache& cache) const;  // the cache, if not empty, is this model's
 };
 

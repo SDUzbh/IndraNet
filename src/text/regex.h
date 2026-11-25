@@ -16,7 +16,7 @@
 namespace tfi::detail {
 
 class Regex {
-public:
+  public:
     explicit Regex(const std::string& pattern);  // throws std::runtime_error on syntax it doesn't take
     ~Regex();
     Regex(Regex&&) noexcept;
@@ -26,7 +26,7 @@ public:
     std::vector<std::pair<size_t, size_t>> find_all(const U32String& s) const;
     struct Node;
 
-private:
+  private:
     std::unique_ptr<Node> root_;
 };
 

@@ -106,7 +106,8 @@ void direct_rows(const float* x, const WT* W, int64_t in, int64_t j0, int64_t j1
                 acc[r][1] = vfmaq_f32(acc[r][1], vld1q_f32(x + r * in + k + 4), w1);
             }
         }
-        for (int r = 0; r < R; ++r) sum[r] = vaddvq_f32(vaddq_f32(vaddq_f32(acc[r][0], acc[r][1]), vaddq_f32(acc[r][2], acc[r][3])));
+        for (int r = 0; r < R; ++r)
+            sum[r] = vaddvq_f32(vaddq_f32(vaddq_f32(acc[r][0], acc[r][1]), vaddq_f32(acc[r][2], acc[r][3])));
 #else
         for (int r = 0; r < R; ++r) sum[r] = 0.f;
 #endif
@@ -160,7 +161,7 @@ void run_row_chunks(int64_t total, int64_t in, F&& rows) {
                          [](void* p, size_t c) {
                              const Job& jb = *static_cast<const Job*>(p);
                              const int64_t i = static_cast<int64_t>(c);
-                             (*jb.fn)(jb.total * i / jb.chunks, jb.total * (i + 1) / jb.chunks);
+                             (*jb.fn)(jb.total* i / jb.chunks, jb.total * (i + 1) / jb.chunks);
                          });
         return;
     }
@@ -172,7 +173,8 @@ void run_row_chunks(int64_t total, int64_t in, F&& rows) {
 
 // Several weights reading the same x rows (1..kDirectMaxRows): their rows taken as one range, so that a
 // single run_row_chunks (one wake of the threads) covers them all. y[i] receives W[i]'s output.
-void linear_direct_many(const float* x, int64_t n_rows, const std::vector<const Weight*>& Ws, const std::vector<float*>& y) {
+void linear_direct_many(const float* x, int64_t n_rows, const std::vector<const Weight*>& Ws,
+                        const std::vector<float*>& y) {
     std::vector<int64_t> first(Ws.size() + 1, 0);
     for (size_t i = 0; i < Ws.size(); ++i) first[i + 1] = first[i] + Ws[i]->shape[0];
     const int64_t in = Ws.empty() ? 1 : Ws[0]->shape[1];
@@ -180,7 +182,8 @@ void linear_direct_many(const float* x, int64_t n_rows, const std::vector<const 
         for (size_t i = 0; i < Ws.size(); ++i) {
             const int64_t lo = std::max(a, first[i]), hi = std::min(b, first[i + 1]), out = Ws[i]->shape[0];
             for (int64_t r = 0; lo < hi && r < n_rows; r += kDirectRows)
-                direct_range(x + r * in, std::min(kDirectRows, n_rows - r), *Ws[i], lo - first[i], hi - first[i], y[i] + r * out, out);
+                direct_range(x + r * in, std::min(kDirectRows, n_rows - r), *Ws[i], lo - first[i], hi - first[i],
+                             y[i] + r * out, out);
         }
     });
 }
@@ -281,7 +284,8 @@ const Tensor& Weight::f32() const {
 void Weight::read_rows(int64_t begin, int64_t end, float* dst) const {
     if (dim() != 2) throw std::invalid_argument("read_rows needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[0])
-        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " + shape_str(shape));
+        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
+                                shape_str(shape));
     const int64_t c = shape[1];
     if (is_fp16()) detail::halves_to_floats(f16() + begin * c, dst, (end - begin) * c);
     else std::copy(f32_data() + begin * c, f32_data() + end * c, dst);
@@ -290,7 +294,8 @@ void Weight::read_rows(int64_t begin, int64_t end, float* dst) const {
 Tensor Weight::rows(int64_t begin, int64_t end) const {
     if (dim() != 2) throw std::invalid_argument("rows needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[0])
-        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " + shape_str(shape));
+        throw std::out_of_range("rows [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
+                                shape_str(shape));
     Tensor out({end - begin, shape[1]});
     read_rows(begin, end, out.ptr());
     return out;
@@ -304,7 +309,8 @@ Tensor Weight::row(int64_t i) const {
 Tensor Weight::cols(int64_t begin, int64_t end) const {
     if (dim() != 2) throw std::invalid_argument("cols needs a 2-D weight, got " + shape_str(shape));
     if (begin < 0 || end < begin || end > shape[1])
-        throw std::out_of_range("cols [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " + shape_str(shape));
+        throw std::out_of_range("cols [" + std::to_string(begin) + ", " + std::to_string(end) + ") of " +
+                                shape_str(shape));
     const int64_t R = shape[0], C = shape[1], n = end - begin;
     Tensor out({R, n});
     for (int64_t r = 0; r < R; ++r) {
@@ -324,7 +330,8 @@ Tensor Weight::to_tensor() const {
 Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     const int64_t in = W.shape[1], out = W.shape[0];
-    if (x.size(-1) != in) throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
+    if (x.size(-1) != in)
+        throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
     Shape s(x.shape.begin(), x.shape.end() - 1);
     s.push_back(out);
     Tensor y(std::move(s));
@@ -353,8 +360,10 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
     return y;
 }
 
-std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws, const std::vector<const Weight*>& bs) {
-    if (!bs.empty() && bs.size() != Ws.size()) throw std::invalid_argument("linear_many: one bias (or null) per weight");
+std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws,
+                                const std::vector<const Weight*>& bs) {
+    if (!bs.empty() && bs.size() != Ws.size())
+        throw std::invalid_argument("linear_many: one bias (or null) per weight");
     const int64_t in = x.size(-1), n_rows = in ? x.numel() / in : 0;
     bool direct = n_rows >= 1 && n_rows <= kDirectMaxRows && Ws.size() > 1;
     for (const Weight* W : Ws) direct = direct && W->dim() == 2 && W->shape[1] == in && W->shape[0] > 0;
@@ -385,7 +394,8 @@ std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*
 Tensor matmul(const Tensor& A, const Weight& W) {
     if (A.dim() != 2 || W.dim() != 2) throw std::invalid_argument("matmul expects 2-D tensors");
     const int64_t m = A.shape[0], n = A.shape[1], k = W.shape[1];
-    if (n != W.shape[0]) throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(W.shape));
+    if (n != W.shape[0])
+        throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(W.shape));
     Tensor C({m, k});
     if (!m || !k || !n) return C;
     if (!W.is_fp16()) {

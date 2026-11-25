@@ -15,15 +15,15 @@ class Model;
 
 namespace detail {
 
-class Gpu;    // gpu.h (macOS)
+class Gpu;     // gpu.h (macOS)
 struct GpuKV;  // gpu.h (macOS): a KVCache's copy on the GPU
 
 void activate_(Tensor& t, const std::string& act);
 // d act(x) / dx, elementwise, for the pre-activation x.
 void activation_grad_(Tensor& x, const std::string& act);
-Tensor split_heads(const Tensor& x, int64_t H, int64_t D);  // (T, H*D) -> (H, T, D)
+Tensor split_heads(const Tensor& x, int64_t H, int64_t D);            // (T, H*D) -> (H, T, D)
 Tensor split_heads(const float* x, int64_t T, int64_t H, int64_t D);  // the same from a row-major (T, H*D) array
-Tensor merge_heads(const Tensor& x);                        // (H, T, D) -> (T, H*D)
+Tensor merge_heads(const Tensor& x);                                  // (H, T, D) -> (T, H*D)
 // A layer's RoPE: the first `rot` values of each head rotate at frequencies inv_freq (rot / 2), and
 // with rope_scaling cos and sin are multiplied by `factor`. Sequences longer than max_len (0: no
 // limit) are refused: there "dynamic" and "longrope" scaling change their frequencies.
@@ -38,7 +38,8 @@ void check_rope_length(const ModelConfig& c, const RopeTable& t, int64_t n_posit
 // Rotate (H, T, D) in place at positions 0..T-1 (indranet's "rotate half" RoPE), or at positions[t]
 // for row t when given. `inverse` applies the transpose (the backward pass): with no cos/sin factor
 // that is also the inverse rotation.
-void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse = false, const std::vector<int64_t>* positions = nullptr);
+void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse = false,
+                 const std::vector<int64_t>* positions = nullptr);
 std::vector<float> alibi_slopes(int64_t n);
 // C(m,n) = A(m,k) @ op(B) with row strides lda/ldb/ldc; op(B) = B (k,n) or, with trans_b, B(n,k)^T.
 // With accumulate, C += A @ op(B).
@@ -47,7 +48,8 @@ void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t
 
 // Backward pass of Model::norm (prefix's weight, config c) over the last dimension: dL/dx given its
 // input x and dL/dy (grad.cpp).
-Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x, const Tensor& dy);
+Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
+                     const Tensor& dy);
 
 // The part of attention's backward pass between o_proj and the q/k/v projections, for one sequence
 // at positions 0..T-1 (grad.cpp). From dz (T, H*D) and the forward pass's hook_q, hook_k, hook_v
@@ -97,7 +99,8 @@ void set_circuits_run_bytes(int64_t bytes);
 // the GPU is running, from 2 rows when a layer holds kSinglePassLayerWeights weights or the rows x
 // a layer's weights reach kSinglePassRowWork (tuned on an M5 Pro, models of 4x256 to 24x1024).
 constexpr double kSinglePassLayerWeights = 3e6, kSinglePassRowWork = 5e7;
-bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows, double min_work);
+bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows,
+                        double min_work);
 
 // The sampler's weights (Sampler, generate.cpp): w[i] = exp((logits[i] - top) * scale) in float, for logits
 // at most `top`; 0 where that exponent is below -87 (exp under fp32's smallest normal), and for NaN and
@@ -115,7 +118,8 @@ struct KVRef {
     KVRef() = default;
     KVRef(const Tensor* t) {  // NOLINT(google-explicit-constructor): RowBatch's prefixes were Tensor pointers
         if (!t) return;
-        if (t->dim() != 3) throw std::invalid_argument("prefix keys / values must be (Hkv, T, D), got " + shape_str(t->shape));
+        if (t->dim() != 3)
+            throw std::invalid_argument("prefix keys / values must be (Hkv, T, D), got " + shape_str(t->shape));
         f = t->ptr();
         H = t->shape[0];
         T = t->shape[1];
@@ -127,8 +131,8 @@ struct KVRef {
 struct RowBatch {
     std::vector<int64_t> start, len, offset;
     std::vector<KVRef> prefix_k, prefix_v;  // per layer; unused when every start is 0
-    Gpu* gpu = nullptr;  // macOS: if set, the blocks run on the GPU (Model::run_rows)
-    bool fp16 = false;   // ... with fp16 multiply inputs (Gpu::linear, Gpu::Seq)
+    Gpu* gpu = nullptr;                     // macOS: if set, the blocks run on the GPU (Model::run_rows)
+    bool fp16 = false;                      // ... with fp16 multiply inputs (Gpu::linear, Gpu::Seq)
     bool whole = false;  // one whole sequence (a single pass, Model::forward_from): hook_pattern runs as there
     // One segment continuing a cached sequence (Model::forward_cached): hook_pattern runs on its
     // (H, len, start + len) pattern, on the CPU.
@@ -142,8 +146,12 @@ struct RowBatch {
     // GPU's buffers, which hold every sequence's positions, a region each.
     std::vector<std::vector<KVRef>> seg_prefix_k, seg_prefix_v;
     std::vector<int64_t> kbase;
-    const KVRef& prefix_k_of(size_t s, int64_t layer) const { return seg_prefix_k.empty() ? prefix_k.at(layer) : seg_prefix_k.at(s).at(layer); }
-    const KVRef& prefix_v_of(size_t s, int64_t layer) const { return seg_prefix_v.empty() ? prefix_v.at(layer) : seg_prefix_v.at(s).at(layer); }
+    const KVRef& prefix_k_of(size_t s, int64_t layer) const {
+        return seg_prefix_k.empty() ? prefix_k.at(layer) : seg_prefix_k.at(s).at(layer);
+    }
+    const KVRef& prefix_v_of(size_t s, int64_t layer) const {
+        return seg_prefix_v.empty() ? prefix_v.at(layer) : seg_prefix_v.at(s).at(layer);
+    }
     int64_t rows() const { return offset.empty() ? 0 : offset.back() + len.back(); }
     void add(int64_t start_pos, int64_t n) {
         offset.push_back(rows());

@@ -76,7 +76,9 @@ class EditPredictor {
         const unsigned k = edits_[static_cast<size_t>(id)].kinds;
         return k & (~k + 1);
     }
-    Tensor predict(int id, unsigned kind, const Tensor& x) const { return id < 0 ? x : apply(edits_[static_cast<size_t>(id)], kind, x); }
+    Tensor predict(int id, unsigned kind, const Tensor& x) const {
+        return id < 0 ? x : apply(edits_[static_cast<size_t>(id)], kind, x);
+    }
     // Whether the hooks' output y is `predicted`, what predict(id, kind, x) gave.
     bool agrees(int id, unsigned kind, const Tensor& x, const Tensor& predicted, const Tensor& y) const {
         return close(id < 0 ? nullptr : &edits_[static_cast<size_t>(id)], kind, x, predicted, y);
@@ -103,7 +105,8 @@ class EditPredictor {
         }
         if (followers_.size() > kFollowers) followers_.clear();
         history_.push_back(id);
-        if (history_.size() > 2 * kHistory) history_.erase(history_.begin(), history_.end() - static_cast<std::ptrdiff_t>(kHistory));
+        if (history_.size() > 2 * kHistory)
+            history_.erase(history_.begin(), history_.end() - static_cast<std::ptrdiff_t>(kHistory));
     }
 
   private:
@@ -161,7 +164,8 @@ class EditPredictor {
             }
         }
         if (edits_.size() == kEdits) return -1;
-        edits_.push_back({x, y, close(nullptr, kSame, x, x, y) ? unsigned(kSame) : unsigned(kOverwrite | kScale | kOffset)});
+        edits_.push_back(
+            {x, y, close(nullptr, kSame, x, x, y) ? unsigned(kSame) : unsigned(kOverwrite | kScale | kOffset)});
         return static_cast<int>(edits_.size()) - 1;
     }
     // The period p that has repeated for the longest (at least one whole period, and 3 calls); 0: none.
@@ -211,12 +215,12 @@ struct DecodeRuntime::Impl {
         bool edits = false;  // else only captures
         int row_dim = 0;     // 1 for hook_q / hook_k / hook_v / hook_pattern
         bool pattern = false;
-        int64_t block = -1;   // its block (-1: before the first, hook_embed and hook_pos_embed; the last for hook_final)
+        int64_t block = -1;  // its block (-1: before the first, hook_embed and hook_pos_embed; the last for hook_final)
         int64_t resume = -1;  // the block to compute a token again from when this point's output was mispredicted
         EditPredictor predictor;
-        std::vector<Tensor> in, predicted;  // this pass's guesses (rows 1, 2, ...)
+        std::vector<Tensor> in, predicted;          // this pass's guesses (rows 1, 2, ...)
         std::vector<std::pair<int, unsigned>> how;  // ... the edit and kind each prediction used
-        bool done = false;                  // called for the token being confirmed
+        bool done = false;                          // called for the token being confirmed
         Tensor done_out;
         size_t index = 0;   // in names
         char expected = 0;  // what the filters said before this pass: 0 not on it, 1 captures only, 2 edits
@@ -243,7 +247,7 @@ struct DecodeRuntime::Impl {
     PassKind kind = PassKind::Plain;
     // Recomputing a token from a block needs its input to the block (hook_resid_pre): from the point there if
     // the caller's hooks are on it, else recorded from each speculative pass.
-    bool resume = false;                   // tokens are computed again from a block rather than from the start
+    bool resume = false;                    // tokens are computed again from a block rather than from the start
     std::map<std::string, int64_t> record;  // hook_resid_pre name -> block
     std::map<int64_t, Tensor> recorded;     // block -> this pass's hook_resid_pre
     int64_t n_layers = 0;
@@ -271,9 +275,10 @@ struct DecodeRuntime::Impl {
     // neither a clock nor the device may decide it).
     int64_t want = 0, misses = 0, pause = 0, cooldown = 1;
 
-    Impl(const Model& m, const Tokens& t, const GenerateOptions& options, const Hooks* hooks, std::vector<TraceStep>* tr)
-        : model(m), prompt(t), o(options), user(hooks), trace(tr), sample(o), greedy(sample.greedy()), K(o.speculative.draft_tokens), speculate(K > 0),
-          draft(o.speculative.draft), ctx(t), want(K) {
+    Impl(const Model& m, const Tokens& t, const GenerateOptions& options, const Hooks* hooks,
+         std::vector<TraceStep>* tr)
+        : model(m), prompt(t), o(options), user(hooks), trace(tr), sample(o), greedy(sample.greedy()),
+          K(o.speculative.draft_tokens), speculate(K > 0), draft(o.speculative.draft), ctx(t), want(K) {
         if (prompt.empty()) throw std::invalid_argument("generate needs a prompt of at least one token");
         stop.insert(o.stop_tokens.begin(), o.stop_tokens.end());
         if (o.stop_at_eos) stop.insert(model.eos_tokens().begin(), model.eos_tokens().end());
@@ -299,8 +304,9 @@ struct DecodeRuntime::Impl {
         resume = !trace;
         routed.add_filter([this](const std::string& n) { return index_of.count(n) && cur.changes(n); },
                           [this](const std::string& n, Tensor& a) { at_point(n, a); });
-        routed.add_capture([this](const std::string& n) { return index_of.count(n) && !cur.changes(n) && cur.matches(n); },
-                           [this](const std::string& n, Tensor& a) { at_point(n, a); });
+        routed.add_capture(
+            [this](const std::string& n) { return index_of.count(n) && !cur.changes(n) && cur.matches(n); },
+            [this](const std::string& n, Tensor& a) { at_point(n, a); });
         routed.add_capture([this](const std::string& n) { return record.count(n) > 0; },
                            [this](const std::string& n, Tensor& a) {
                                if (kind == PassKind::Speculative) recorded[record.at(n)] = a;
@@ -347,7 +353,10 @@ struct DecodeRuntime::Impl {
         Point s;
         s.name = n;
         s.index = i;
-        auto ends = [&](const char* e) { const size_t l = std::strlen(e); return n.size() >= l && n.compare(n.size() - l, l, e) == 0; };
+        auto ends = [&](const char* e) {
+            const size_t l = std::strlen(e);
+            return n.size() >= l && n.compare(n.size() - l, l, e) == 0;
+        };
         s.pattern = ends("attn.hook_pattern");
         s.row_dim = s.pattern || ends("attn.hook_q") || ends("attn.hook_k") || ends("attn.hook_v") ? 1 : 0;
         if (n.compare(0, 7, "blocks.") == 0) s.block = std::stoll(n.substr(7));
@@ -453,7 +462,8 @@ struct DecodeRuntime::Impl {
         if (draft) {
             if (!greedy && q.size() < static_cast<size_t>(k)) q.resize(static_cast<size_t>(k));
             const int64_t dv = draft->cfg().vocab_size;
-            Tensor dl = draft->forward_cached(Tokens(ctx.begin() + draft_cache.size(), ctx.end()), draft_cache, nullptr, true);
+            Tensor dl =
+                draft->forward_cached(Tokens(ctx.begin() + draft_cache.size(), ctx.end()), draft_cache, nullptr, true);
             for (int64_t i = 0; i < k; ++i) {
                 if (greedy) {  // its distribution would be one-hot at this token
                     proposals.push_back((*draft_sample)(dl.ptr(), dv));
@@ -468,7 +478,8 @@ struct DecodeRuntime::Impl {
             }
         } else if (!o.speculative.draft) {
             proposals = lookup_draft(ctx, o.speculative.ngram, k);
-            const auto s = std::find_if(proposals.begin(), proposals.end(), [&](int64_t t) { return stop.count(t) > 0; });
+            const auto s =
+                std::find_if(proposals.begin(), proposals.end(), [&](int64_t t) { return stop.count(t) > 0; });
             if (s != proposals.end()) proposals.erase(s + 1, proposals.end());
         }
     }
@@ -483,7 +494,8 @@ struct DecodeRuntime::Impl {
         if (row < static_cast<int64_t>(proposals.size())) {
             const size_t r = static_cast<size_t>(row);
             t = proposals[r];
-            if (greedy) {  // p and q are one-hot: the proposal is kept if it is the model's pick, which replaces it if not
+            if (greedy) {  // p and q are one-hot: the proposal is kept if it is the model's pick, which replaces it if
+                           // not
                 const int64_t best = sample(lg, V);
                 accepted = best == t;
                 t = best;
@@ -496,8 +508,7 @@ struct DecodeRuntime::Impl {
                     w = p;
                     if (qi)
                         for (size_t j = 0; j < w.size() && j < qi->size(); ++j) w[j] = std::max(0.0, w[j] - (*qi)[j]);
-                    else if (t < V)
-                        w[static_cast<size_t>(t)] = 0;
+                    else if (t < V) w[static_cast<size_t>(t)] = 0;
                     double total = 0;
                     for (double x : w) total += x;
                     t = sample.draw(total > 0 ? w : p);
@@ -561,7 +572,8 @@ struct DecodeRuntime::Impl {
         for (const Point* s : fired)
             if (!s->done) b = std::min(b, s->block);
         Tensor x;
-        if (wrong && wrong->resume > wrong->block && wrong->resume <= b) {  // hook_resid_post: its output is the next block's input
+        if (wrong && wrong->resume > wrong->block &&
+            wrong->resume <= b) {  // hook_resid_post: its output is the next block's input
             b = wrong->resume;
             x = wrong->done_out;
         } else {
@@ -589,7 +601,8 @@ struct DecodeRuntime::Impl {
         const std::string n = "blocks." + std::to_string(b) + ".hook_resid_pre";
         const auto p = points.find(n);
         if (p != points.end() && seen[p->second.index])
-            return static_cast<size_t>(row) <= p->second.in.size() ? p->second.in[static_cast<size_t>(row) - 1] : Tensor();
+            return static_cast<size_t>(row) <= p->second.in.size() ? p->second.in[static_cast<size_t>(row) - 1]
+                                                                   : Tensor();
         const auto it = recorded.find(b);
         if (it == recorded.end() || it->second.dim() != 2 || it->second.shape[0] <= row) return {};
         const int64_t d = it->second.shape[1];
@@ -659,14 +672,17 @@ struct DecodeRuntime::Impl {
         const int64_t outer = s.row_dim ? act.shape[0] : 1, n = act.shape[dim];
         int64_t inner = 1;
         for (size_t k = dim + 1; k < act.shape.size(); ++k) inner *= act.shape[k];
-        auto width = [&](int64_t r) { return s.pattern ? pos + r + 1 : inner; };  // a pattern's row: the keys up to its token
+        auto width = [&](int64_t r) {
+            return s.pattern ? pos + r + 1 : inner;
+        };  // a pattern's row: the keys up to its token
         auto get = [&](int64_t r) {
             Shape shape = act.shape;
             shape[dim] = 1;
             if (s.pattern) shape[2] = width(r);
             Tensor t(shape);
             for (int64_t o2 = 0; o2 < outer; ++o2)
-                std::copy(act.ptr() + (o2 * n + r) * inner, act.ptr() + (o2 * n + r) * inner + width(r), t.ptr() + o2 * width(r));
+                std::copy(act.ptr() + (o2 * n + r) * inner, act.ptr() + (o2 * n + r) * inner + width(r),
+                          t.ptr() + o2 * width(r));
             return t;
         };
         auto put = [&](int64_t r, const Tensor& t) {
@@ -696,8 +712,8 @@ struct DecodeRuntime::Impl {
     }
 };
 
-DecodeRuntime::DecodeRuntime(const Model& model, const Tokens& prompt, const GenerateOptions& options, const Hooks* hooks,
-                             std::vector<TraceStep>* trace)
+DecodeRuntime::DecodeRuntime(const Model& model, const Tokens& prompt, const GenerateOptions& options,
+                             const Hooks* hooks, std::vector<TraceStep>* trace)
     : impl_(std::make_unique<Impl>(model, prompt, options, hooks, trace)) {}
 DecodeRuntime::~DecodeRuntime() = default;
 std::optional<int64_t> DecodeRuntime::next() { return impl_->next(); }

@@ -58,8 +58,8 @@ std::vector<LensEntry> logit_lens(const Model& model, const Tokens& tokens, int6
 // of each hook point lens_hook_points names, (rows, d_model) each. Every stage is decoded in one pass
 // over the unembedding.
 std::vector<std::string> lens_hook_points(const Model& model);
-std::vector<LensEntry> logit_lens_from(const Model& model, const ActivationCache& cache, int64_t row, int64_t target = -1,
-                                       int64_t k = 5);
+std::vector<LensEntry> logit_lens_from(const Model& model, const ActivationCache& cache, int64_t row,
+                                       int64_t target = -1, int64_t k = 5);
 
 // --- direct logit attribution --------------------------------------------------------
 // Split the final logit difference into contributions from the embeddings, every attention
@@ -87,11 +87,11 @@ struct TwoHop {
 };
 struct HeadScores {
     // Each matrix is (n_layers, widest layer's head count); NaN where a layer has fewer heads.
-    Tensor previous_token;   // attention to t-1
-    Tensor induction;        // to the token after the earlier copy of the current token
-    Tensor duplicate_token;  // to the earlier copy of the current token
-    Tensor first_token;      // to position 0 (attention sink)
-    Tensor self;             // to t itself
+    Tensor previous_token;            // attention to t-1
+    Tensor induction;                 // to the token after the earlier copy of the current token
+    Tensor duplicate_token;           // to the earlier copy of the current token
+    Tensor first_token;               // to position 0 (attention sink)
+    Tensor self;                      // to t itself
     std::vector<TwoHop> top_two_hop;  // best writer->reader pairs, any lag
 };
 HeadScores head_scores(const Model& model, int64_t segment_len = 24, int64_t n_samples = 8, uint64_t seed = 0);

@@ -20,7 +20,7 @@
 namespace tfi {
 
 class Tokenizer {
-public:
+  public:
     // From the text of a tokenizer.json. Throws std::runtime_error for anything unsupported.
     static Tokenizer from_json(const std::string& tokenizer_json);
     ~Tokenizer();
@@ -41,7 +41,7 @@ public:
 
     struct Impl;
 
-private:
+  private:
     explicit Tokenizer(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };

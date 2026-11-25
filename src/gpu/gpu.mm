@@ -22,8 +22,8 @@ namespace tfi {
 namespace detail {
 
 namespace {
-constexpr int64_t kDefaultMinRows = 256;      // tuned on an M5 Pro
-constexpr double kDefaultMinWork = 6e10;       // tuned on an M5 Pro (models of 1-85M parameters)
+constexpr int64_t kDefaultMinRows = 256;  // tuned on an M5 Pro
+constexpr double kDefaultMinWork = 6e10;  // tuned on an M5 Pro (models of 1-85M parameters)
 std::atomic<int64_t> g_min_rows{0};
 std::atomic<double> g_min_work{0};
 }  // namespace
@@ -836,14 +836,34 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
 }
 )";
 
-struct ActArgs { uint32_t n; int32_t kind; float k; };
-struct BiasArgs { uint32_t n, cols; };
-struct NormArgs { uint32_t d; float eps; uint32_t layernorm, has_b; };
-struct RopeArgs { uint32_t heads, D, nhalf, n, inverse; float scale; };
-struct PassArgs { uint32_t D, rot, n; };
-struct KvArgs { uint32_t rows, heads, D, cap, start; };
+struct ActArgs {
+    uint32_t n;
+    int32_t kind;
+    float k;
+};
+struct BiasArgs {
+    uint32_t n, cols;
+};
+struct NormArgs {
+    uint32_t d;
+    float eps;
+    uint32_t layernorm, has_b;
+};
+struct RopeArgs {
+    uint32_t heads, D, nhalf, n, inverse;
+    float scale;
+};
+struct PassArgs {
+    uint32_t D, rot, n;
+};
+struct KvArgs {
+    uint32_t rows, heads, D, cap, start;
+};
 constexpr int64_t kSplitKeys = 256;  // as the kernel's
-struct AttnArgs { uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
+struct AttnArgs {
+    uint32_t H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase;
+    float scale, cap;
+};
 
 // Write src as fp16; false if a value is outside fp16's range (or not finite).
 bool to_half(const float* src, __fp16* dst, int64_t n) {
@@ -903,7 +923,8 @@ struct Gpu::Impl {
         auto& cache = fp16 ? weights_fp16 : weights;
         auto it = cache.find(p);
         if (it != cache.end()) return it->second;
-        const NSUInteger bytes = static_cast<NSUInteger>(std::max<int64_t>(n, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float));
+        const NSUInteger bytes =
+            static_cast<NSUInteger>(std::max<int64_t>(n, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float));
         id<MTLBuffer> b = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         if (!b) throw std::runtime_error("GPU: could not allocate a weight buffer");
         if (!fp16) std::memcpy(b.contents, p, static_cast<size_t>(n) * sizeof(float));
@@ -941,7 +962,8 @@ struct Gpu::Impl {
     // ... with earlier positions' keys and values in fp16 (a KV cache kept in fp16), and the rounding to it
     id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, attn_mma_k_h, round_half_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
-        block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
+        block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k,
+        attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
 
     void load_kernels() {
         std::call_once(kernels_once, [this] {
@@ -1066,11 +1088,16 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const We
             const NSUInteger in_size = half[i] ? sizeof(__fp16) : sizeof(float);
             const MPSDataType w_type = wb[i].half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             const NSUInteger w_size = wb[i].half ? sizeof(__fp16) : sizeof(float);
-            MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * in_size
+            MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                            columns:k
+                                                                           rowBytes:k * in_size
                                                                            dataType:in_type];
-            MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * w_size
+            MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n
+                                                                            columns:k
+                                                                           rowBytes:k * w_size
                                                                            dataType:w_type];
-            MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n
+            MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                            columns:n
                                                                            rowBytes:n * sizeof(float)
                                                                            dataType:MPSDataTypeFloat32];
             MPSMatrix* mx = [[MPSMatrix alloc] initWithBuffer:(half[i] ? xh : xf) descriptor:dx];
@@ -1121,20 +1148,38 @@ struct Gpu::Seq::Impl {
         int64_t floats = 0;
     };
     struct Op {
-        enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd, Rope, Attention, AttentionBwd, Pattern, Apply, KvAppend, RoundHalf } kind;
+        enum Kind {
+            Linear,
+            LinearT,
+            Norm,
+            NormBwd,
+            Act,
+            Glu,
+            Add,
+            Copy,
+            ActBwd,
+            GluBwd,
+            Rope,
+            Attention,
+            AttentionBwd,
+            Pattern,
+            Apply,
+            KvAppend,
+            RoundHalf
+        } kind;
         int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0, j = -1;
-        int kb = -1;                     // Attention: each row's start in pk / pv (uint), or none
-        int more[4] = {0, 0, 0, 0};  // AttentionBwd: delta, dq, dk, dv
-        Gpu::Seq::AttnShape attn{};      // Attention
+        int kb = -1;                        // Attention: each row's start in pk / pv (uint), or none
+        int more[4] = {0, 0, 0, 0};         // AttentionBwd: delta, dq, dk, dv
+        Gpu::Seq::AttnShape attn{};         // Attention
         int64_t heads = 0, D = 0, rot = 0;  // Rope
         float scale = 1.f;                  // Rope
         int64_t rows = 0, n = 0;
-        int64_t offset = 0;            // Copy, KvAppend: where in slot a it starts (floats)
-        int64_t offset_y = 0;          // Copy: where in slot c it goes
-        const Tensor* W = nullptr;     // Norm, NormBwd
-        const Tensor* bias = nullptr;  // Norm
-        const Weight* lw = nullptr;    // Linear, LinearT
-        const Weight* lbias = nullptr; // Linear
+        int64_t offset = 0;             // Copy, KvAppend: where in slot a it starts (floats)
+        int64_t offset_y = 0;           // Copy: where in slot c it goes
+        const Tensor* W = nullptr;      // Norm, NormBwd
+        const Tensor* bias = nullptr;   // Norm
+        const Weight* lw = nullptr;     // Linear, LinearT
+        const Weight* lbias = nullptr;  // Linear
         GpuAct act = GpuAct::Relu;
         float eps = 0.f;
         bool layernorm = false;
@@ -1142,7 +1187,7 @@ struct Gpu::Seq::Impl {
     };
     std::vector<Slot> slots;
     std::vector<Op> ops;
-    id<MTLBuffer> flag = nil;  // set by half_k when an input does not fit fp16
+    id<MTLBuffer> flag = nil;   // set by half_k when an input does not fit fp16
     id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
     size_t split_bytes = 0;
     std::vector<id<MTLBuffer>> retired;  // replaced during an attempt: released once its command buffers finish
@@ -1239,9 +1284,17 @@ struct Gpu::Seq::Impl {
         const NSUInteger size = half ? sizeof(__fp16) : sizeof(float);
         const MPSDataType w_type = wb.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
         const NSUInteger w_size = wb.half ? sizeof(__fp16) : sizeof(float);
-        MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * size dataType:type];
-        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * w_size dataType:w_type];
-        MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:n * sizeof(float)
+        MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                        columns:k
+                                                                       rowBytes:k * size
+                                                                       dataType:type];
+        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n
+                                                                        columns:k
+                                                                       rowBytes:k * w_size
+                                                                       dataType:w_type];
+        MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                        columns:n
+                                                                       rowBytes:n * sizeof(float)
                                                                        dataType:MPSDataTypeFloat32];
         MPSMatrix* mx = [[MPSMatrix alloc] initWithBuffer:in descriptor:dx];
         MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb.buf descriptor:dw];
@@ -1268,15 +1321,20 @@ struct Gpu::Seq::Impl {
         if (m == 0 || k == 0) return;
         if (n == 0) throw std::logic_error("Gpu::Seq: linear_t with an empty input");
         end_compute();
-        MPSMatrixDescriptor* ddy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:n * sizeof(float)
+        MPSMatrixDescriptor* ddy = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                         columns:n
+                                                                        rowBytes:n * sizeof(float)
                                                                         dataType:MPSDataTypeFloat32];
         const Gpu::Impl::WBuf wb = g.weight_for(W, false);
         MPSMatrixDescriptor* dw =
             [MPSMatrixDescriptor matrixDescriptorWithRows:n
                                                   columns:k
-                                                 rowBytes:k * (wb.half ? sizeof(__fp16) : sizeof(float))
-                                                 dataType:wb.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
-        MPSMatrixDescriptor* ddx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * sizeof(float)
+                                                 rowBytes:k * (wb.half ? sizeof(__fp16) : sizeof(float))dataType:wb.half
+                                                              ? MPSDataTypeFloat16
+                                                              : MPSDataTypeFloat32];
+        MPSMatrixDescriptor* ddx = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                         columns:k
+                                                                        rowBytes:k * sizeof(float)
                                                                         dataType:MPSDataTypeFloat32];
         MPSMatrix* mdy = [[MPSMatrix alloc] initWithBuffer:slot(op.a).buf descriptor:ddy];
         MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb.buf descriptor:dw];
@@ -1286,12 +1344,8 @@ struct Gpu::Seq::Impl {
 
     void encode(const Op& op, bool fp16) {
         switch (op.kind) {
-            case Op::Linear:
-                encode_linear(op, fp16);
-                break;
-            case Op::LinearT:
-                encode_linear_t(op);
-                break;
+            case Op::Linear: encode_linear(op, fp16); break;
+            case Op::LinearT: encode_linear_t(op); break;
             case Op::NormBwd: {
                 const int64_t d = op.W->numel();
                 need(op.a, op.rows * d);
@@ -1309,7 +1363,7 @@ struct Gpu::Seq::Impl {
                 [e setBytes:&args length:sizeof args atIndex:4];
                 const NSUInteger tg = std::min<NSUInteger>(256, g.norm_bwd_k.maxTotalThreadsPerThreadgroup);
                 [e dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(op.rows), 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
             case Op::ActBwd:
@@ -1354,7 +1408,7 @@ struct Gpu::Seq::Impl {
                 [e setBytes:&args length:sizeof args atIndex:4];
                 const NSUInteger tg = std::min<NSUInteger>(256, g.norm_k.maxTotalThreadsPerThreadgroup);
                 [e dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(op.rows), 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
             case Op::Act:
@@ -1385,7 +1439,8 @@ struct Gpu::Seq::Impl {
             case Op::KvAppend: {  // rows = rows, heads, D, n = cap, rot = start, inverse = an fp16 cache
                 const int64_t n = op.rows * op.heads * op.D;
                 need(op.a, op.offset + n);
-                need(op.c, op.inverse ? (op.heads * op.n * op.D + 1) / 2 : op.heads * op.n * op.D);  // inverse: an fp16 cache
+                need(op.c,
+                     op.inverse ? (op.heads * op.n * op.D + 1) / 2 : op.heads * op.n * op.D);  // inverse: an fp16 cache
                 if (op.rot + op.rows > op.n) throw std::logic_error("Gpu::Seq: kv_append past the cache's capacity");
                 if (n == 0) break;
                 const KvArgs args{u32(op.rows), u32(op.heads), u32(op.D), u32(op.n), u32(op.rot)};
@@ -1405,7 +1460,8 @@ struct Gpu::Seq::Impl {
                 need(op.e, 4 * op.rows);
                 const int64_t n_rot = rows * half, n_pass = rows * (op.D - op.rot);
                 if (n_rot) {
-                    const RopeArgs args{u32(op.heads), u32(op.D), u32(half), u32(n_rot), op.inverse ? 1u : 0u, op.scale};
+                    const RopeArgs args{u32(op.heads),        u32(op.D), u32(half), u32(n_rot),
+                                        op.inverse ? 1u : 0u, op.scale};
                     id<MTLComputeCommandEncoder> e = compute();
                     [e setComputePipelineState:g.rope_k];
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
@@ -1429,8 +1485,10 @@ struct Gpu::Seq::Impl {
             case Op::Attention: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
-                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " + std::to_string(kMaxHeadDim));
-                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " +
+                                                std::to_string(kMaxHeadDim));
+                if (A.Hkv <= 0 || A.H % A.Hkv)
+                    throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 need(op.a, A.rows * A.H * A.D);
                 need(op.b, A.rows * A.Hkv * A.D);
                 need(op.d, A.rows * A.Hkv * A.D);
@@ -1443,8 +1501,16 @@ struct Gpu::Seq::Impl {
                 if (op.j >= 0) need(op.j, A.rows * A.H);
                 if (op.kb >= 0) need(op.kb, A.rows);
                 if (A.rows == 0) break;
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), u32(A.Tp), u32(A.window), A.has_slopes ? 1u : 0u, op.j >= 0 ? 1u : 0u,
-                                    op.kb >= 0 ? 1u : 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H),
+                                    u32(A.Hkv),
+                                    u32(A.D),
+                                    u32(A.Tp),
+                                    u32(A.window),
+                                    A.has_slopes ? 1u : 0u,
+                                    op.j >= 0 ? 1u : 0u,
+                                    op.kb >= 0 ? 1u : 0u,
+                                    A.scale,
+                                    A.cap};
                 // Few rows over more keys than one chunk, without lse (only gradient passes ask for it):
                 // split the keys across threadgroups (flash-decoding), then merge.
                 const int64_t max_keys = A.Tp + A.rows;  // no row attends to more
@@ -1452,7 +1518,8 @@ struct Gpu::Seq::Impl {
                 if (op.j < 0 && A.rows <= 8 && nsplit > 1) {
                     const size_t bytes = static_cast<size_t>(A.rows * A.H * nsplit * (A.D + 2)) * sizeof(float);
                     if (split_bytes < bytes) {
-                        if (split) retired.push_back(split);  // earlier command buffers of this attempt may still read it
+                        if (split)
+                            retired.push_back(split);  // earlier command buffers of this attempt may still read it
                         split = g.acquire(bytes);
                         split_bytes = bytes;
                     }
@@ -1471,7 +1538,8 @@ struct Gpu::Seq::Impl {
                     [e setBytes:&ns length:sizeof ns atIndex:9];
                     [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
                     const NSUInteger tg = std::min<NSUInteger>(256, g.attn_split_k.maxTotalThreadsPerThreadgroup);
-                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H * nsplit)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H * nsplit)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                     id<MTLComputeCommandEncoder> e2 = compute();
                     [e2 setComputePipelineState:g.attn_combine_k];
                     [e2 setBuffer:split offset:0 atIndex:0];
@@ -1479,13 +1547,15 @@ struct Gpu::Seq::Impl {
                     [e2 setBytes:&args length:sizeof args atIndex:2];
                     [e2 setBytes:&ns length:sizeof ns atIndex:3];
                     const NSUInteger tg2 = std::min<NSUInteger>(128, g.attn_combine_k.maxTotalThreadsPerThreadgroup);
-                    [e2 dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+                    [e2 dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
                     break;
                 }
                 const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
                 if (tiled) need(op.i, 4 * A.blocks);
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:tiled ? (A.half_prefix ? g.attn_mma_k_h : g.attn_mma_k) : (A.half_prefix ? g.attn_k_h : g.attn_k)];
+                [e setComputePipelineState:tiled ? (A.half_prefix ? g.attn_mma_k_h : g.attn_mma_k)
+                                                 : (A.half_prefix ? g.attn_k_h : g.attn_k)];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                 [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
                 [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
@@ -1498,20 +1568,25 @@ struct Gpu::Seq::Impl {
                 [e setBuffer:slot(op.j >= 0 ? op.j : op.c).buf offset:0 atIndex:9];
                 [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
                 if (tiled) {
-                    if (g.attn_mma_k.maxTotalThreadsPerThreadgroup < 128) throw std::runtime_error("GPU: the attention kernel needs 128 threads");
-                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    if (g.attn_mma_k.maxTotalThreadsPerThreadgroup < 128)
+                        throw std::runtime_error("GPU: the attention kernel needs 128 threads");
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     break;
                 }
                 const NSUInteger tg = std::min<NSUInteger>(128, g.attn_k.maxTotalThreadsPerThreadgroup);
-                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 break;
             }
             case Op::Pattern:
             case Op::Apply: {
                 const Gpu::Seq::AttnShape& A = op.attn;
-                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                if (A.Hkv <= 0 || A.H % A.Hkv)
+                    throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 const int64_t T = A.rows;
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u,   u32(A.window), A.has_slopes ? 1u : 0u,
+                                    0u,       0u,         A.scale,  A.cap};
                 const uint32_t t32 = u32(T);
                 id<MTLComputeCommandEncoder> e = compute();
                 if (op.kind == Op::Pattern) {  // q a, k b, lse f, slopes h, P c
@@ -1548,8 +1623,10 @@ struct Gpu::Seq::Impl {
             case Op::AttentionBwd: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
-                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " + std::to_string(kMaxHeadDim));
-                if (A.Hkv <= 0 || A.H % A.Hkv) throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                    throw std::invalid_argument("Gpu::Seq: attention needs a head size of 1 to " +
+                                                std::to_string(kMaxHeadDim));
+                if (A.Hkv <= 0 || A.H % A.Hkv)
+                    throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
                 const int64_t nq = A.rows * A.H * A.D, nkv = A.rows * A.Hkv * A.D;
                 need(op.a, nq);
                 need(op.b, nkv);
@@ -1574,7 +1651,8 @@ struct Gpu::Seq::Impl {
                     [e setBytes:args length:sizeof args atIndex:3];
                     dispatch(g.attn_delta_k, A.rows * A.H);
                 }
-                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u, u32(A.window), A.has_slopes ? 1u : 0u, 0u, 0u, A.scale, A.cap};
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u,   u32(A.window), A.has_slopes ? 1u : 0u,
+                                    0u,       0u,         A.scale,  A.cap};
                 auto common = [&](id<MTLComputeCommandEncoder> e) {
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                     [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
@@ -1592,7 +1670,8 @@ struct Gpu::Seq::Impl {
                     common(e);
                     [e setBuffer:slot(op.more[1]).buf offset:0 atIndex:9];
                     const NSUInteger tg = std::min<NSUInteger>(128, g.attn_bwd_dq_k.maxTotalThreadsPerThreadgroup);
-                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.H)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 }
                 {
                     id<MTLComputeCommandEncoder> e = compute();
@@ -1601,7 +1680,8 @@ struct Gpu::Seq::Impl {
                     [e setBuffer:slot(op.more[2]).buf offset:0 atIndex:9];
                     [e setBuffer:slot(op.more[3]).buf offset:0 atIndex:10];
                     const NSUInteger tg = std::min<NSUInteger>(128, g.attn_bwd_dkv_k.maxTotalThreadsPerThreadgroup);
-                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.Hkv)), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.rows * A.Hkv)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
                 }
                 break;
             }
@@ -1666,7 +1746,8 @@ struct Gpu::Seq::Impl {
                 int64_t linears = 0;
                 for (const Op& op : ops) {
                     encode(op, fp16);
-                    if ((op.kind == Op::Linear || op.kind == Op::LinearT) && ++linears % every == 0 && &op != &ops.back()) {
+                    if ((op.kind == Op::Linear || op.kind == Op::LinearT) && ++linears % every == 0 &&
+                        &op != &ops.back()) {
                         end_compute();
                         [cmd commit];
                         sent.push_back(cmd);
@@ -1810,8 +1891,8 @@ void Gpu::Seq::round_half(int x, int64_t n) {
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start, int64_t src_row,
-                         bool half) {
+void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t D, int64_t cap, int64_t start,
+                         int64_t src_row, bool half) {
     if (src == dst) throw std::invalid_argument("Gpu::Seq: kv_append into the slot it reads");
     if (src_row < 0) throw std::invalid_argument("Gpu::Seq: negative kv_append row");
     Impl::Op op{Impl::Op::KvAppend};
@@ -1827,8 +1908,10 @@ void Gpu::Seq::kv_append(int src, int dst, int64_t rows, int64_t heads, int64_t 
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta, bool inverse, float scale) {
-    if (rot < 0 || rot % 2 || rot > D) throw std::invalid_argument("Gpu::Seq: RoPE rotates an even number of values, at most D");
+void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_t rot, int inv_freq, int meta,
+                    bool inverse, float scale) {
+    if (rot < 0 || rot % 2 || rot > D)
+        throw std::invalid_argument("Gpu::Seq: RoPE rotates an even number of values, at most D");
     if (x == y) throw std::invalid_argument("Gpu::Seq: RoPE works out of place");
     Impl::Op op{Impl::Op::Rope};
     op.a = x;
@@ -1844,10 +1927,11 @@ void Gpu::Seq::rope(int x, int y, int64_t rows, int64_t heads, int64_t D, int64_
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape, int blk, int lse,
-                         int kbase) {
+void Gpu::Seq::attention(int q, int k, int v, int z, int pk, int pv, int meta, int slopes, const AttnShape& shape,
+                         int blk, int lse, int kbase) {
     if (z == q || z == k || z == v) throw std::invalid_argument("Gpu::Seq: attention writes z to a slot of its own");
-    if (lse >= 0 && (lse == q || lse == k || lse == v || lse == z)) throw std::invalid_argument("Gpu::Seq: attention writes lse to a slot of its own");
+    if (lse >= 0 && (lse == q || lse == k || lse == v || lse == z))
+        throw std::invalid_argument("Gpu::Seq: attention writes lse to a slot of its own");
     Impl::Op op{Impl::Op::Attention};
     op.a = q;
     op.b = k;
@@ -2003,10 +2087,11 @@ struct Gpu::Batch::Impl {
     MPSMatrix* matrix(const Mat& m, int64_t rows, int64_t cols) {
         Buf& b = at(m.buf);
         const NSUInteger size = b.half ? sizeof(__fp16) : sizeof(float);
-        MPSMatrixDescriptor* d = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(rows)
-                                                                       columns:static_cast<NSUInteger>(cols)
-                                                                      rowBytes:static_cast<NSUInteger>(m.ld) * size
-                                                                      dataType:b.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
+        MPSMatrixDescriptor* d =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(rows)
+                                                  columns:static_cast<NSUInteger>(cols)
+                                                 rowBytes:static_cast<NSUInteger>(m.ld) * size
+                                                 dataType:b.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
         return [[MPSMatrix alloc] initWithBuffer:b.buf offset:static_cast<NSUInteger>(m.offset) * size descriptor:d];
     }
     MPSMatrixMultiplication* mm(int64_t m, int64_t n, int64_t k, bool trans_b) {
@@ -2053,23 +2138,29 @@ struct Gpu::Batch::Impl {
         Buf& out = at(op.out);
         if (op.kind == Op::BlockSumsq) {
             const uint32_t nbr = u32(op.m / op.bm), nbc = u32(op.n / op.bn);
-            struct { uint32_t ld, bm, bn, nbc; } args{u32(op.c.ld), u32(op.bm), u32(op.bn), nbc};
+            struct {
+                uint32_t ld, bm, bn, nbc;
+            } args{u32(op.c.ld), u32(op.bm), u32(op.bn), nbc};
             [e setComputePipelineState:g.block_sumsq_k];
             [e setBuffer:c.buf offset:static_cast<NSUInteger>(op.c.offset) * sizeof(float) atIndex:0];
             [e setBuffer:out.buf offset:static_cast<NSUInteger>(op.out_offset) * sizeof(float) atIndex:1];
             [e setBytes:&args length:sizeof args atIndex:2];
             const NSUInteger tg = std::min<NSUInteger>(256, g.block_sumsq_k.maxTotalThreadsPerThreadgroup);
             if (nbr && nbc)
-                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(nbr) * nbc, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(nbr) * nbc, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         } else {
-            struct { uint32_t n, ld; } args{u32(op.n), u32(op.c.ld)};
+            struct {
+                uint32_t n, ld;
+            } args{u32(op.n), u32(op.c.ld)};
             [e setComputePipelineState:g.row_argmax_k];
             [e setBuffer:c.buf offset:static_cast<NSUInteger>(op.c.offset) * sizeof(float) atIndex:0];
             [e setBuffer:out.buf offset:static_cast<NSUInteger>(op.out_offset) * sizeof(uint32_t) atIndex:1];
             [e setBytes:&args length:sizeof args atIndex:2];
             const NSUInteger tg = std::min<NSUInteger>(256, g.row_argmax_k.maxTotalThreadsPerThreadgroup);
             if (op.m && op.n)
-                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(op.m), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(NSUInteger(op.m), 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         }
         [e endEncoding];
     }
@@ -2109,7 +2200,8 @@ Gpu::Batch::~Batch() {
 int Gpu::Batch::buffer(int64_t count, bool fp16) {
     if (count < 0) throw std::invalid_argument("Gpu::Batch: negative buffer size");
     Impl::Buf b;
-    b.buf = impl_->g.acquire(static_cast<size_t>(std::max<int64_t>(count, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float)));
+    b.buf =
+        impl_->g.acquire(static_cast<size_t>(std::max<int64_t>(count, 1)) * (fp16 ? sizeof(__fp16) : sizeof(float)));
     b.half = fp16;
     b.owned = true;
     impl_->bufs.push_back(b);
@@ -2183,7 +2275,8 @@ void Gpu::Batch::matmul(Mat A, Mat B, Mat C, int64_t m, int64_t n, int64_t k, bo
 
 void Gpu::Batch::block_sumsq(Mat C, int64_t rows, int64_t cols, int64_t bm, int64_t bn, int out, int64_t out_offset) {
     Impl& s = *impl_;
-    if (bm <= 0 || bn <= 0 || rows % bm || cols % bn) throw std::invalid_argument("Gpu::Batch: blocks must tile the matrix");
+    if (bm <= 0 || bn <= 0 || rows % bm || cols % bn)
+        throw std::invalid_argument("Gpu::Batch: blocks must tile the matrix");
     s.check(C, rows, cols);
     s.check(Mat{out, out_offset, (rows / bm) * (cols / bn)}, rows ? 1 : 0, (rows / bm) * (cols / bn));
     if (s.at(C.buf).half) throw std::invalid_argument("Gpu::Batch: block sums read float32 values");

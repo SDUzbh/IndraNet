@@ -100,7 +100,8 @@ Behavior behavior_of(const std::string& b) {
 
 // tokenizers' NormalizedString::split: the string cut at the pattern's matches, the pieces kept as
 // `behavior` says. Empty pieces are dropped (as PreTokenizedString::split does).
-std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& pattern, Behavior behavior, bool invert) {
+std::vector<std::pair<size_t, size_t>> split(const U32String& s, const Pattern& pattern, Behavior behavior,
+                                             bool invert) {
     std::vector<std::pair<std::pair<size_t, size_t>, bool>> parts;  // (range, is_match), covering s
     size_t prev = 0;
     for (const auto& m : pattern.find_all(s)) {
@@ -218,7 +219,8 @@ struct Tokenizer::Impl {
             }
         }
         for (const Normalizer& nm : normalizers)  // Replace(" ", "▁"), and Prepend("▁") (Llama 2's)
-            if (nm.kind == Normalizer::Replace && nm.pattern.literal == U" " && nm.content.size() == 1) space_mark = nm.content[0];
+            if (nm.kind == Normalizer::Replace && nm.pattern.literal == U" " && nm.content.size() == 1)
+                space_mark = nm.content[0];
         for (const Normalizer& nm : normalizers)
             if (nm.kind == Normalizer::Prepend && space_mark && nm.content == U32String(1, space_mark)) prepends = true;
         strip_space = !byte_level && space_mark && prepends;
@@ -231,7 +233,8 @@ struct Tokenizer::Impl {
         } else if (type == "NFC" || type == "NFD") {
             normalizers.push_back({type == "NFC" ? Normalizer::NFC : Normalizer::NFD, {}, {}});
         } else if (type == "Replace") {
-            normalizers.push_back({Normalizer::Replace, pattern_of(n.at("pattern")), utf8_decode(n.at("content").as_string())});
+            normalizers.push_back(
+                {Normalizer::Replace, pattern_of(n.at("pattern")), utf8_decode(n.at("content").as_string())});
         } else if (type == "Prepend") {
             normalizers.push_back({Normalizer::Prepend, {}, utf8_decode(n.at("prepend").as_string())});
         } else {
@@ -290,7 +293,8 @@ struct Tokenizer::Impl {
         for (size_t i = 0; i < v.keys.size(); ++i) vocab.emplace(v.keys[i], v.values[i].as_int());
         if (const json::Value* u = field(m, "unk_token")) {
             auto it = vocab.find(u->as_string());
-            if (it == vocab.end()) throw std::runtime_error("tokenizer.json: unk_token '" + u->as_string() + "' is not in the vocabulary");
+            if (it == vocab.end())
+                throw std::runtime_error("tokenizer.json: unk_token '" + u->as_string() + "' is not in the vocabulary");
             unk = it->second;
         }
         const json::Value& ms = m.at("merges");
@@ -310,8 +314,10 @@ struct Tokenizer::Impl {
             }
             auto ia = vocab.find(a), ib = vocab.find(b), im = vocab.find(a + b);
             if (ia == vocab.end() || ib == vocab.end() || im == vocab.end())
-                throw std::runtime_error("tokenizer.json: merge '" + a + " " + b + "' uses tokens not in the vocabulary");
-            merges.emplace((uint64_t(uint32_t(ia->second)) << 32) | uint32_t(ib->second), std::make_pair(int32_t(r), im->second));
+                throw std::runtime_error("tokenizer.json: merge '" + a + " " + b +
+                                         "' uses tokens not in the vocabulary");
+            merges.emplace((uint64_t(uint32_t(ia->second)) << 32) | uint32_t(ib->second),
+                           std::make_pair(int32_t(r), im->second));
         }
     }
 
@@ -327,7 +333,8 @@ struct Tokenizer::Impl {
             for (const json::Value& item : p.at("single").array) {
                 if (const json::Value* s = field(item, "SpecialToken")) {
                     const json::Value& entry = specials.at(s->at("id").as_string());
-                    for (const json::Value& id : entry.at("ids").array) (seen_text ? suffix : prefix).push_back(id.as_int());
+                    for (const json::Value& id : entry.at("ids").array)
+                        (seen_text ? suffix : prefix).push_back(id.as_int());
                 } else if (field(item, "Sequence")) {
                     if (seen_text) unsupported("a TemplateProcessing template with the text twice");
                     seen_text = true;
@@ -388,7 +395,9 @@ struct Tokenizer::Impl {
                     if (a->content.empty() || (best && a->content.size() <= best->content.size())) continue;
                     if (s.compare(i, a->content.size(), a->content) != 0) continue;
                     if (a->single_word) {
-                        auto word = [](char32_t c) { return detail::unicode_letter(c) || detail::unicode_number(c) || c == '_'; };
+                        auto word = [](char32_t c) {
+                            return detail::unicode_letter(c) || detail::unicode_number(c) || c == '_';
+                        };
                         const size_t e = i + a->content.size();
                         if ((i > 0 && word(s[i - 1]) && word(a->content.front())) ||
                             (e < s.size() && word(s[e]) && word(a->content.back())))
@@ -552,7 +561,8 @@ Tokenizer Tokenizer::from_json(const std::string& tokenizer_json) {
             seen.emplace(content, id);
             max_id = std::max(max_id, id);
             impl->added.push_back({utf8_decode(content), id, flag(e, "lstrip", false), flag(e, "rstrip", false),
-                                   flag(e, "single_word", false), flag(e, "normalized", false), flag(e, "special", false)});
+                                   flag(e, "single_word", false), flag(e, "normalized", false),
+                                   flag(e, "special", false)});
         }
     }
     impl->prepare_decoding();
@@ -567,7 +577,12 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special
         for (int b = 0; b < 256; ++b) t[chars[b]] = b;
         return t;
     }();
-    auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    auto hex = [](char c) {
+        return c >= '0' && c <= '9'   ? c - '0'
+               : c >= 'A' && c <= 'F' ? c - 'A' + 10
+               : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                      : -1;
+    };
     const std::string mark = m.space_mark ? utf8_encode(U32String(1, m.space_mark)) : std::string();
     std::string out;
     for (int64_t id : ids) {
@@ -583,8 +598,8 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids, bool skip_special
                 if (c < byte_of.size() && byte_of[c] >= 0) out.push_back(static_cast<char>(byte_of[c]));
                 else out += utf8_encode(U32String(1, c));
             }
-        } else if (m.byte_fallback && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>' && hex(tok[3]) >= 0 &&
-                   hex(tok[4]) >= 0) {  // <0xNN>: one byte
+        } else if (m.byte_fallback && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>' &&
+                   hex(tok[3]) >= 0 && hex(tok[4]) >= 0) {  // <0xNN>: one byte
             out.push_back(static_cast<char>(hex(tok[3]) * 16 + hex(tok[4])));
         } else if (!mark.empty()) {
             for (size_t i = 0; i < tok.size();) {

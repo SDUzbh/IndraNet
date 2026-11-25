@@ -51,7 +51,7 @@ void add_(Tensor& a, const Tensor& b);
 
 Tensor rows(const Tensor& A, int64_t begin, int64_t end);  // A[begin:end] of a 2-D tensor
 Tensor cols(const Tensor& A, int64_t begin, int64_t end);  // A[:, begin:end] of a 2-D tensor
-Tensor row(const Tensor& A, int64_t i);                     // A[i] as 1-D
+Tensor row(const Tensor& A, int64_t i);                    // A[i] as 1-D
 
 float dot(const float* a, const float* b, int64_t n);
 float frobenius(const Tensor& a);

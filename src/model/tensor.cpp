@@ -27,7 +27,8 @@ std::string shape_str(const Shape& s) {
 int64_t shape_numel(const Shape& s) {
     int64_t n = 1;
     for (int64_t d : s)
-        if (__builtin_mul_overflow(n, d, &n)) throw std::overflow_error("shape " + shape_str(s) + " has too many elements");
+        if (__builtin_mul_overflow(n, d, &n))
+            throw std::overflow_error("shape " + shape_str(s) + " has too many elements");
     return n;
 }
 
@@ -90,7 +91,8 @@ void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t
 #else
     if (trans_b) {
         for (int64_t i = 0; i < m; ++i)
-            for (int64_t j = 0; j < n; ++j) C[i * ldc + j] = (accumulate ? C[i * ldc + j] : 0.f) + dot(A + i * lda, B + j * ldb, k);
+            for (int64_t j = 0; j < n; ++j)
+                C[i * ldc + j] = (accumulate ? C[i * ldc + j] : 0.f) + dot(A + i * lda, B + j * ldb, k);
     } else {
         for (int64_t i = 0; i < m; ++i) {
             float* c = C + i * ldc;
@@ -117,8 +119,9 @@ Tensor matmul(const Tensor& A, const Tensor& B, bool transpose_b) {
     const int64_t m = A.shape[0], k = A.shape[1];
     const int64_t kb = transpose_b ? B.shape[1] : B.shape[0];
     const int64_t n = transpose_b ? B.shape[0] : B.shape[1];
-    if (k != kb) throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(B.shape) +
-                                             (transpose_b ? "^T" : ""));
+    if (k != kb)
+        throw std::invalid_argument("matmul shape mismatch " + shape_str(A.shape) + " @ " + shape_str(B.shape) +
+                                    (transpose_b ? "^T" : ""));
     Tensor C({m, n});
     if (m && n) gemm(transpose_b, m, n, k, A.ptr(), B.ptr(), C.ptr());
     return C;
@@ -127,7 +130,8 @@ Tensor matmul(const Tensor& A, const Tensor& B, bool transpose_b) {
 Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     const int64_t in = W.shape[1], out = W.shape[0];
-    if (x.size(-1) != in) throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
+    if (x.size(-1) != in)
+        throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
     // Treat x as (rows, in) and write straight into a tensor of the final shape: no copies.
     Shape s(x.shape.begin(), x.shape.end() - 1);  // x has at least one dim: x.size(-1) checked it
     s.push_back(out);
@@ -151,10 +155,15 @@ Tensor transpose2d(const Tensor& A) {
 }
 
 static void check_same(const Tensor& a, const Tensor& b, const char* op) {
-    if (a.shape != b.shape) throw std::invalid_argument(std::string(op) + ": shape " + shape_str(a.shape) + " vs " + shape_str(b.shape));
+    if (a.shape != b.shape)
+        throw std::invalid_argument(std::string(op) + ": shape " + shape_str(a.shape) + " vs " + shape_str(b.shape));
 }
 
-Tensor add(const Tensor& a, const Tensor& b) { Tensor r = a; add_(r, b); return r; }
+Tensor add(const Tensor& a, const Tensor& b) {
+    Tensor r = a;
+    add_(r, b);
+    return r;
+}
 
 Tensor sub(const Tensor& a, const Tensor& b) {
     check_same(a, b, "sub");

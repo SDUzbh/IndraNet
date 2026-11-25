@@ -19,10 +19,12 @@ U32String utf8_decode(const std::string& s) {
     for (size_t i = 0; i < n;) {
         const unsigned char b = p[i];
         int len = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 0;
-        if (len == 0 || i + len > n) throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i) + ")");
+        if (len == 0 || i + len > n)
+            throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i) + ")");
         char32_t c = len == 1 ? b : len == 2 ? (b & 0x1F) : len == 3 ? (b & 0x0F) : (b & 0x07);
         for (int k = 1; k < len; ++k) {
-            if ((p[i + k] & 0xC0) != 0x80) throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i + k) + ")");
+            if ((p[i + k] & 0xC0) != 0x80)
+                throw std::runtime_error("text is not valid UTF-8 (byte " + std::to_string(i + k) + ")");
             c = (c << 6) | (p[i + k] & 0x3F);
         }
         static const char32_t kMin[] = {0, 0, 0x80, 0x800, 0x10000};
@@ -101,10 +103,11 @@ char32_t compose(char32_t a, char32_t b) {
     if (a >= kSBase && a < kSBase + kSCount && (a - kSBase) % kTCount == 0 && b > kTBase && b < kTBase + kTCount)
         return a + (b - kTBase);
     const ud::Composition* end = std::end(ud::kCompositions);
-    const ud::Composition* it = std::lower_bound(std::begin(ud::kCompositions), end, std::make_pair(a, b),
-                                                 [](const ud::Composition& x, const std::pair<char32_t, char32_t>& v) {
-                                                     return x.first < v.first || (x.first == v.first && x.second < v.second);
-                                                 });
+    const ud::Composition* it =
+        std::lower_bound(std::begin(ud::kCompositions), end, std::make_pair(a, b),
+                         [](const ud::Composition& x, const std::pair<char32_t, char32_t>& v) {
+                             return x.first < v.first || (x.first == v.first && x.second < v.second);
+                         });
     return it != end && it->first == a && it->second == b ? it->cp : 0;
 }
 
@@ -116,8 +119,8 @@ bool unicode_letter(char32_t c) { return unicode_category(c)[0] == 'L'; }
 bool unicode_number(char32_t c) { return unicode_category(c)[0] == 'N'; }
 
 bool unicode_white_space(char32_t c) {
-    return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
-           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+    return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
 bool unicode_category_name(const std::string& name) {
@@ -144,7 +147,8 @@ U32String unicode_nfd(const U32String& s) {
         }
         size_t j = i;
         while (j < out.size() && combining_class(out[j])) ++j;
-        std::stable_sort(out.begin() + i, out.begin() + j, [](char32_t a, char32_t b) { return combining_class(a) < combining_class(b); });
+        std::stable_sort(out.begin() + i, out.begin() + j,
+                         [](char32_t a, char32_t b) { return combining_class(a) < combining_class(b); });
         i = j;
     }
     return out;

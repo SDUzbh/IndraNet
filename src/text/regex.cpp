@@ -48,8 +48,10 @@ bool item_matches(const Node::Item& it, char32_t c, bool icase) {
         case Node::Item::Category: m = unicode_in_category(c, it.category); break;
         case Node::Item::Space: m = unicode_white_space(c); break;
         case Node::Item::Digit: m = unicode_in_category(c, "Nd"); break;
-        case Node::Item::Word: m = unicode_letter(c) || unicode_in_category(c, "M") || unicode_in_category(c, "Nd") ||
-                                   unicode_in_category(c, "Pc"); break;
+        case Node::Item::Word:
+            m = unicode_letter(c) || unicode_in_category(c, "M") || unicode_in_category(c, "Nd") ||
+                unicode_in_category(c, "Pc");
+            break;
     }
     return m != it.negated;
 }
@@ -75,7 +77,7 @@ bool single(const Node& n, char32_t c) {
 bool is_single(const Node& n) { return n.kind == Node::Char || n.kind == Node::Any || n.kind == Node::Class; }
 
 class Parser {
-public:
+  public:
     explicit Parser(const std::string& pattern) : p_(utf8_decode(pattern)), src_(pattern) {}
 
     std::unique_ptr<Node> parse() {
@@ -84,7 +86,7 @@ public:
         return n;
     }
 
-private:
+  private:
     U32String p_;
     std::string src_;
     size_t i_ = 0;
@@ -160,7 +162,10 @@ private:
         for (size_t k = 0; k < digits; ++k) {
             if (!more()) fail("short hex escape");
             const char32_t c = p_[i_++];
-            const int d = c >= '0' && c <= '9' ? int(c - '0') : c >= 'a' && c <= 'f' ? int(c - 'a' + 10) : c >= 'A' && c <= 'F' ? int(c - 'A' + 10) : -1;
+            const int d = c >= '0' && c <= '9'   ? int(c - '0')
+                          : c >= 'a' && c <= 'f' ? int(c - 'a' + 10)
+                          : c >= 'A' && c <= 'F' ? int(c - 'A' + 10)
+                                                 : -1;
             if (d < 0) fail("bad hex digit");
             v = v * 16 + char32_t(d);
         }
@@ -172,10 +177,14 @@ private:
         if (!more()) fail("trailing backslash");
         const char32_t c = p_[i_++];
         switch (c) {
-            case 's': case 'S': item = {Node::Item::Space, 0, 0, "", c == 'S'}; return true;
-            case 'd': case 'D': item = {Node::Item::Digit, 0, 0, "", c == 'D'}; return true;
-            case 'w': case 'W': item = {Node::Item::Word, 0, 0, "", c == 'W'}; return true;
-            case 'p': case 'P': {
+            case 's':
+            case 'S': item = {Node::Item::Space, 0, 0, "", c == 'S'}; return true;
+            case 'd':
+            case 'D': item = {Node::Item::Digit, 0, 0, "", c == 'D'}; return true;
+            case 'w':
+            case 'W': item = {Node::Item::Word, 0, 0, "", c == 'W'}; return true;
+            case 'p':
+            case 'P': {
                 std::string name;
                 if (eat('{')) {
                     while (more() && peek() != '}') name.push_back(static_cast<char>(p_[i_++]));
@@ -300,15 +309,14 @@ private:
 using Cont = std::function<bool(size_t)>;
 
 class Matcher {
-public:
+  public:
     explicit Matcher(const U32String& s) : s_(s) {}
 
     bool match(const Node& n, size_t i, const Cont& k) const {
         switch (n.kind) {
             case Node::Char:
             case Node::Any:
-            case Node::Class:
-                return i < s_.size() && single(n, s_[i]) && k(i + 1);
+            case Node::Class: return i < s_.size() && single(n, s_[i]) && k(i + 1);
             case Node::Seq: return seq(n, 0, i, k);
             case Node::Alt:
                 for (const auto& c : n.children)
@@ -339,7 +347,7 @@ public:
         return false;
     }
 
-private:
+  private:
     const U32String& s_;
 
     bool seq(const Node& n, size_t idx, size_t i, const Cont& k) const {
@@ -349,9 +357,12 @@ private:
 
     bool repeat(const Node& n, size_t count, size_t i, const Cont& k) const {
         auto again = [&]() {
-            return count < n.max && match(*n.children[0], i, [&](size_t j) {
-                       return j != i && repeat(n, count + 1, j, k);  // an empty iteration ends the repeat
-                   });
+            return count < n.max && match(
+                                        *n.children[0], i,
+                                        [&](size_t j) {
+                                            return j != i &&
+                                                   repeat(n, count + 1, j, k);  // an empty iteration ends the repeat
+                                        });
         };
         if (n.lazy) return (count >= n.min && k(i)) || again();
         return again() || (count >= n.min && k(i));
@@ -370,10 +381,11 @@ std::vector<std::pair<size_t, size_t>> Regex::find_all(const U32String& s) const
     const Matcher m(s);
     for (size_t pos = 0; pos < s.size();) {
         size_t end = 0;
-        if (m.match(*root_, pos, [&](size_t j) {
-                end = j;
-                return true;
-            }) &&
+        if (m.match(*root_, pos,
+                    [&](size_t j) {
+                        end = j;
+                        return true;
+                    }) &&
             end > pos) {
             out.push_back({pos, end});
             pos = end;
