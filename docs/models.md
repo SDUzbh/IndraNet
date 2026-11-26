@@ -26,8 +26,9 @@ significant bits than fp16 (8 against 11).
 With fp16 weights the CPU still computes in float32: a model gives, bit for bit, what float32 weights
 holding the same rounded values give. On the GPU its matrix multiplies take fp16 inputs (the
 activations rounded to fp16, sums in float32), several times faster, with errors around 1e-3
-relative; a run with a value beyond fp16's range is repeated with float32 inputs. Weights in float32
-always multiply in float32.
+relative, and so does attention (queries, keys, values and attention weights in fp16), except when
+the attention pattern is captured or gradients are taken; a run with a value beyond fp16's range is
+repeated with float32 inputs. Weights in float32 always multiply in float32.
 
 The KV cache of an fp16 model holds its keys and values in fp16 too. A value beyond fp16's range
 (above 65,504 in size) can't be kept: it is cut off to ±65,504, which can change the output by far

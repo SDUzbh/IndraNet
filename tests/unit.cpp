@@ -1957,14 +1957,121 @@ static void test_gpu_attention_long() {
         const Tensor cpu = m.forward_rows_final(0, x, rb, nullptr);
         check_close(cpu, want);
         detail::set_gpu_attention(true);
-        for (bool tiled : {true, false}) {
-            detail::set_gpu_attention_tiled(tiled);
+        for (int kernel = 0; kernel < 3; ++kernel) {  // neural accelerators (where available), tiled, per row
+            detail::set_gpu_attention_tensor(kernel == 0);
+            detail::set_gpu_attention_tiled(kernel < 2);
             check_close(m.forward_rows_final(0, x, rb, nullptr), cpu);
         }
+        detail::set_gpu_attention_tensor(true);
         detail::set_gpu_attention_tiled(true);
         detail::set_gpu_attention(false);
         detail::set_gpu_min_rows(0);
         detail::set_gpu_min_work(0);
+    }
+}
+
+// The tiled attention kernels straight through Gpu::Seq, against attention in double: one segment after Tp earlier
+// positions (float32 or fp16, as a KV cache keeps them), head sizes 24 to 128, a window, ALiBi and a softcap,
+// blocks of 32, 64 and 128 rows; with the neural accelerators' kernel (where the GPU has them) and without. fp32
+// runs within float rounding; fp16 runs (half-precision products) within fp16's; and an fp16 run with a query
+// outside fp16's range is repeated in fp32, giving the fp32 run's result.
+static void test_gpu_attention_tiled() {
+    const auto gpu = detail::Gpu::create();
+    if (!gpu) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    struct Case {
+        int64_t D, H, Hkv, Tp, window;
+        float cap;
+        bool alibi, half_prefix;
+    };
+    for (const Case& c : {Case{24, 4, 2, 20, 0, 0.f, false, false}, Case{128, 2, 1, 37, 50, 4.f, true, true},
+                          Case{128, 4, 4, 0, 0, 0.f, false, false}, Case{24, 2, 2, 70, 40, 0.f, true, true},
+                          Case{64, 4, 2, 45, 0, 0.f, false, false}, Case{32, 2, 1, 33, 20, 3.f, true, true},
+                          Case{96, 2, 2, 51, 70, 0.f, false, false}}) {
+        const int64_t T = 150, H = c.H, Hkv = c.Hkv, D = c.D, Tp = c.Tp, rep = H / Hkv;
+        std::mt19937 rng(static_cast<unsigned>(D + Tp));
+        std::normal_distribution<float> nd;
+        std::vector<float> q(T * H * D), k(T * Hkv * D), v(T * Hkv * D), pk(Hkv * Tp * D), pv(Hkv * Tp * D);
+        for (auto* x : {&q, &k, &v, &pk, &pv})
+            for (float& f : *x) f = nd(rng);
+        if (c.half_prefix)  // what an fp16 cache holds
+            for (auto* x : {&pk, &pv})
+                for (float& f : *x) f = detail::half_to_float(detail::float_to_half(f));
+        std::vector<float> slopes = detail::alibi_slopes(H);
+        const float scale = 1.f / std::sqrt(static_cast<float>(D));
+        // Reference: row r at position Tp + r attends to keys lo..Tp + r (prefix first).
+        std::vector<double> want(T * H * D);
+        for (int64_t r = 0; r < T; ++r)
+            for (int64_t h = 0; h < H; ++h) {
+                const int64_t pos = Tp + r, g = h / rep, lo = c.window ? std::max<int64_t>(0, pos + 1 - c.window) : 0;
+                auto key = [&](int64_t j) { return j < Tp ? &pk[(g * Tp + j) * D] : &k[((j - Tp) * Hkv + g) * D]; };
+                auto val = [&](int64_t j) { return j < Tp ? &pv[(g * Tp + j) * D] : &v[((j - Tp) * Hkv + g) * D]; };
+                std::vector<double> p(pos + 1 - lo);
+                double mx = -1e300, sum = 0;
+                for (int64_t j = lo; j <= pos; ++j) {
+                    double s = 0;
+                    for (int64_t i = 0; i < D; ++i) s += double(q[(r * H + h) * D + i]) * key(j)[i];
+                    s *= scale;
+                    if (c.cap) s = c.cap * std::tanh(s / c.cap);
+                    if (c.alibi) s -= slopes[h] * double(pos - j);
+                    mx = std::max(mx, p[j - lo] = s);
+                }
+                for (double& x : p) sum += (x = std::exp(x - mx));
+                for (int64_t i = 0; i < D; ++i) {
+                    double o = 0;
+                    for (int64_t j = lo; j <= pos; ++j) o += p[j - lo] * val(j)[i];
+                    want[(r * H + h) * D + i] = o / sum;
+                }
+            }
+        detail::Gpu::Seq s(*gpu);
+        std::ranges::copy(k, s.reserve(1, std::ssize(k)));
+        std::ranges::copy(v, s.reserve(2, std::ssize(v)));
+        s.reserve(3, T * H * D);
+        const int64_t prefix = std::max<int64_t>(1, Hkv * Tp * D);
+        for (int slot : {4, 5}) {
+            const std::vector<float>& src = slot == 4 ? pk : pv;
+            if (c.half_prefix) {
+                auto* dst = reinterpret_cast<uint16_t*>(s.reserve(slot, (prefix + 1) / 2));
+                for (size_t i = 0; i < src.size(); ++i) dst[i] = detail::float_to_half(src[i]);
+            } else {
+                std::ranges::copy(src, s.reserve(slot, prefix));
+            }
+        }
+        auto* meta = reinterpret_cast<uint32_t*>(s.reserve(6, 4 * T));
+        for (int64_t r = 0; r < T; ++r) {
+            const uint32_t row[4] = {uint32_t(Tp + r), uint32_t(Tp), 0, uint32_t(T)};
+            std::copy_n(row, 4, meta + 4 * r);
+        }
+        std::ranges::copy(slopes, s.reserve(7, H));
+        auto run = [&](int64_t block_rows, bool fp16, float big = 0.f) {
+            std::vector<float> qq = q;
+            if (big) qq[(77 * H + 1) * D + 5] = big;
+            std::ranges::copy(qq, s.reserve(0, std::ssize(qq)));
+            std::vector<uint32_t> blk;
+            for (int64_t r = 0; r < T; r += block_rows)
+                blk.insert(blk.end(), {uint32_t(r), uint32_t(std::min(block_rows, T - r)), uint32_t(Tp), 0u});
+            std::ranges::copy(blk, reinterpret_cast<uint32_t*>(s.reserve(8, std::ssize(blk))));
+            const detail::Gpu::Seq::AttnShape shape{
+                T, H, Hkv, D, Tp, c.window, scale, c.cap, c.alibi, std::ssize(blk) / 4, c.half_prefix, block_rows};
+            s.attention(0, 1, 2, 3, Tp ? 4 : 1, Tp ? 5 : 2, 6, 7, shape, 8);
+            s.run(fp16);
+            return std::vector<float>(s.data(3), s.data(3) + T * H * D);
+        };
+        for (bool tensor : {true, false}) {  // the neural accelerators' kernel where available, and the tiled one
+            detail::set_gpu_attention_tensor(tensor);
+            for (int64_t block_rows : {32, 64, 128})
+                for (bool fp16 : {false, true}) {
+                    const std::vector<float> z = run(block_rows, fp16);
+                    double err = 0;
+                    for (size_t i = 0; i < z.size(); ++i) err = std::max(err, std::fabs(z[i] - want[i]));
+                    CHECK(err < (fp16 ? 4e-3 : 2e-6));
+                }
+            // fp16 with a query of 1e5: repeated in fp32, so exactly the fp32 run (whose own query is that 1e5).
+            CHECK(run(64, true, 1e5f) == run(64, false, 1e5f));
+        }
+        detail::set_gpu_attention_tensor(true);
     }
 }
 
@@ -5155,6 +5262,8 @@ int main(int argc, char** argv) {
             detail::set_gpu_attention(false);
         });
     run("gpu", "attention on the GPU: long sequences, both kernels = CPU (macOS)", test_gpu_attention_long);
+    run("gpu", "tiled GPU attention = attention in double: fp32 and fp16 runs, block sizes, fp16 overflow (macOS)",
+        test_gpu_attention_tiled);
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu",
             "attention + its backward on the GPU: batched gradients = run_with_gradients, attribution = CPU (macOS): " +

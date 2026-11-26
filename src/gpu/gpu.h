@@ -43,6 +43,9 @@ class Gpu {
     // half-precision W is then multiplied as it is, exactly (each fp16 value is an fp32 value).
     Tensor linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16 = false);
 
+    // (gpu_attention_tensor_available)
+    bool attention_tensor_available(int64_t D);
+
     // linear(x, Ws[i], bs[i]) for every i in one GPU submission: x is copied to the GPU once and
     // the thread waits once, instead of once per weight. Results are identical to separate
     // linear() calls. bs[i] may be null; bs may be empty (no biases).
@@ -107,15 +110,18 @@ class Gpu::Seq {
     // (Hkv, Tp, D), the rest from the segment's own rows. Scores are scaled, then softcapped (cap > 0), then ALiBi'd
     // (slopes: one per head, if has_slopes), within `window` keys if window > 0. Float32.
     // With `blocks` > 0 and D a multiple of 8 up to 128, slot `blk` divides the rows into that many
-    // blocks of up to kAttnBlockRows consecutive rows of one segment (4 uint32 each: first row, rows,
+    // blocks of up to block_rows consecutive rows of one segment (4 uint32 each: first row, rows,
     // segment start position, segment's first row), and each block's keys are read once for all its
-    // rows, on the matrix units (faster).
+    // rows, on the matrix units (faster). In an fp16 run without lse, those products take fp16 inputs
+    // (queries, keys, values and attention weights rounded to fp16, accumulated in float), like the fp16
+    // multiplies; a value outside fp16's range repeats the run in fp32.
     struct AttnShape {
         int64_t rows, H, Hkv, D, Tp, window;
         float scale, cap;
         bool has_slopes;
         int64_t blocks = 0;
         bool half_prefix = false;  // pk / pv hold fp16 values (a KV cache kept in fp16), 2 per float of the slot
+        int64_t block_rows = 32;   // the blocks' most rows: 8 to 128, a multiple of 8 (attn_block_rows)
     };
     // lse >= 0: also each (row, head)'s log of the sum of exp(score) into that slot (rows, H), for
     // attention_backward.
@@ -134,8 +140,10 @@ class Gpu::Seq {
     // (H, rows, rows) from q, k and attention()'s lse, as Model::attend's hook_pattern; and z = P v.
     void attention_pattern(int q, int k, int lse, int slopes, int P, const AttnShape& shape);
     void attention_apply(int P, int v, int z, const AttnShape& shape);
-    // Rows per attention block (AttnShape::blocks).
-    static constexpr int64_t kAttnBlockRows = 32;
+    // Rows per attention block (AttnShape::block_rows) for segments of at most `longest` rows: a bigger block
+    // reads each key once for more rows, but leaves more of its simdgroups idle on a short segment (M5 Pro: 64
+    // rows were as fast as or faster than 32 from 48 rows to 4096, and 128 no faster overall).
+    static int64_t attn_block_rows(int64_t longest) { return longest > 32 ? 64 : 32; }
     void glu_backward(int dpost, int pre, int up, int dpre, int dup, int64_t n, GpuAct act);
 
     // Run everything recorded since the last run in one submission and wait. With fp16, linear()
@@ -241,6 +249,12 @@ void set_gpu_min_rows(int64_t rows);
 double gpu_min_work();
 // For tests: 0 restores the default.
 void set_gpu_min_work(double multiply_adds);
+// Whether Gpu::Seq's tiled attention may run on the neural accelerators (Metal 4 tensor operations: Apple10 GPUs,
+// e.g. M5, on macOS 26) for head sizes 32, 64, 96 and 128; on (the default) uses them where they are available.
+// For tests, which compare both kernels.
+void set_gpu_attention_tensor(bool on);
+// Whether `gpu` has them, for a head size D.
+bool gpu_attention_tensor_available(Gpu& gpu, int64_t D);
 
 }  // namespace detail
 }  // namespace tfi

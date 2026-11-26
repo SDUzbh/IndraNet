@@ -2224,6 +2224,7 @@ struct GpuBlocks {
     int zs = kZ, lse = -1;                       // where attention() puts z (and lse, if >= 0)
     int dzs = kDZ;                               // where backward_before puts dL/dz
     int64_t blocks = 0;                          // attention blocks in kBlocks (0: the per-row kernel)
+    int64_t block_rows = 32;                     // ... of up to this many rows
     // Where attention reads earlier positions' keys and values, RoPE frequencies and ALiBi slopes
     // (a KV cache kept on the GPU gives each layer slots of its own: detail::GpuKV).
     int pk = kPK, pv = kPV, inv_freq = kInvFreq, slopes = kSlopes;
@@ -2325,9 +2326,15 @@ struct GpuBlocks {
                 row[2] = off;
                 row[3] = len;
             }
-            for (uint32_t r = 0; r < len; r += detail::Gpu::Seq::kAttnBlockRows)
-                blk.insert(blk.end(),
-                           {off + r, std::min<uint32_t>(detail::Gpu::Seq::kAttnBlockRows, len - r), start, off});
+        }
+        int64_t longest = 0;
+        for (int64_t n : batch.len) longest = std::max(longest, n);
+        block_rows = detail::Gpu::Seq::attn_block_rows(longest);
+        const auto br = static_cast<uint32_t>(block_rows);
+        for (int64_t sg = 0; sg < S; ++sg) {
+            const auto off = static_cast<uint32_t>(batch.offset[sg]), start = static_cast<uint32_t>(batch.start[sg]);
+            const auto len = static_cast<uint32_t>(batch.len[sg]);
+            for (uint32_t r = 0; r < len; r += br) blk.insert(blk.end(), {off + r, std::min(br, len - r), start, off});
         }
         blocks = tiled ? static_cast<int64_t>(blk.size() / 4) : 0;
         if (blocks) std::ranges::copy(blk, reinterpret_cast<uint32_t*>(s.reserve(kBlocks, blk.size())));
@@ -2459,7 +2466,8 @@ struct GpuBlocks {
                 c.attn_logit_softcap ? static_cast<float>(*c.attn_logit_softcap) : 0.f,
                 c.positional == "alibi",
                 blocks,
-                half_prefix && Tp > 0};
+                half_prefix && Tp > 0,
+                block_rows};
     }
     // Block `layer`'s attention on the GPU, into zs; with Tp > 0, positions before each segment's
     // start read kPK / kPV (Hkv, Tp, D). Needs write_rows and write_layer_inputs.

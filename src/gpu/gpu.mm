@@ -7,6 +7,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -42,6 +43,10 @@ double gpu_min_work() {
     return w > 0 ? w : kDefaultMinWork;
 }
 void set_gpu_min_work(double multiply_adds) { g_min_work = multiply_adds; }
+namespace {
+std::atomic<bool> g_attn_tensor{true};
+}  // namespace
+void set_gpu_attention_tensor(bool on) { g_attn_tensor = on; }
 
 // Kernels of Gpu::Seq, compiled when first needed. The math is src/model/vmath.h's (same polynomials),
 // so GPU and CPU agree to float rounding.
@@ -592,26 +597,32 @@ kernel void attn_bwd_dkv_k(device const float* q [[buffer(0)]], device const flo
 }
 
 
-// Tiled causal attention on the matrix units, for head sizes that are multiples of 8 up to 128: one
-// threadgroup of 4 simdgroups per block of up to 32 consecutive query rows of one segment, for one
-// head; simdgroup i takes rows 8i..8i+7. Each tile of 16 keys and values is loaded once into
-// threadgroup memory for all 32 rows, and the scores (Q K^T) and outputs (P V) are 8x8 matrix
-// products, with the softmax kept online (a running max and sum per row). blk: 4 uint32 per block
-// (first row, rows, segment start position, segment's first row).
+// Tiled causal attention on the matrix units (flash attention), for head sizes that are multiples of 8 up to
+// 128: one threadgroup of kAttnSG simdgroups per block of up to 8 kAttnSG consecutive query rows of one segment,
+// for one head; simdgroup i takes rows 8i..8i+7, its queries held in registers. Each tile of AK keys and values
+// is loaded once into threadgroup memory for all the block's rows, and the scores (Q K^T) and outputs (P V) are
+// 8x8 matrix products, with the softmax kept online (a running max and sum per row). A simdgroup skips the
+// products of a tile that none of its rows may attend to (past its last row, or before its first row's window).
+// MT is the type the products take: float, or half in fp16 runs (queries, keys, values and probabilities rounded
+// to fp16, accumulated in float, as the fp16 multiplies); a query, key or value outside fp16's range then sets
+// `flag`, and the run is repeated in fp32. The head size and simdgroups per block are function constants, so that
+// the loops over them unroll and the 8x8 blocks stay in registers. blk: 4 uint32 per block (first row, rows,
+// segment start position, segment's first row).
 //
 // In an 8x8 simdgroup matrix, lane l holds the elements at row 4*b4 + 2*b2 + b1 and columns
 // 4*b3 + 2*b0 and the next one (bi: bit i of l), so a row's 8 values are spread over the 4 lanes
 // differing in bits 0 and 3: row reductions are shuffles by 1 and 8.
-#define AQ 32
-#define AK 16
+constant uint kAttnD [[function_constant(0)]];   // head size
+constant uint kAttnSG [[function_constant(1)]];  // simdgroups per block
 #define AD 128
-#define ATTN_MMA_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* z [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
-template <typename PT>
+#define ATTN_MMA_PARAMS(PT) device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]], device float* z [[buffer(3)]], device const PT* pk [[buffer(4)]], device const PT* pv [[buffer(5)]], device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]], constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]], device const uint* kbase [[buffer(10)]], device atomic_uint* flag [[buffer(11)]], uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+template <typename PT, typename MT>
 kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
-    threadgroup float sh[AQ * AD];          // the block's queries, then each tile's keys and values
-    threadgroup float* Ks = sh;
-    threadgroup float* Vs = sh + AK * AD;
-    const uint D = a.D, b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    constexpr bool kHalf = sizeof(MT) == 2;
+    constexpr uint AK = kHalf ? 32 : 16;  // keys per tile: 16 KB of threadgroup memory either way
+    threadgroup MT Ks[AK * AD], Vs[AK * AD];
+    const uint D = kAttnD, nd = D / 8, D4 = D / 4, NT = 32 * kAttnSG;
+    const uint b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
     const uint off = blk[4 * b], nq = blk[4 * b + 1], start = blk[4 * b + 2], seg = blk[4 * b + 3];
     const uint kb = a.has_kbase != 0 ? kbase[off] : 0;  // a block's rows are one segment's
     const uint pos0 = start + (off - seg);   // position of the block's first row
@@ -623,43 +634,55 @@ kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
     const uint pos = pos0 + qi;
     const bool live = qi < nq;
     const uint row_lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+    // The keys this simdgroup's rows may attend to: from its first row's window start to its last row.
+    const bool sg_live = 8 * sg < nq;
+    const uint sg_first = pos0 + 8 * sg, sg_last = pos0 + min(8 * sg + 7, nq - 1);
+    const uint sg_lo = (a.window != 0 && sg_first + 1 > a.window) ? sg_first + 1 - a.window : 0;
     const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
-    const uint nd = D / 8;
-    for (uint e = tid; e < AQ * D; e += 128) {
-        const uint r = e / D, d = e % D;
-        sh[e] = r < nq ? q[(ulong(off + r) * a.H + h) * D + d] : 0.f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 Q[AD / 8], O[AD / 8];
+    bool bad = false;  // a value outside fp16's range (half products)
+    simdgroup_matrix<MT, 8, 8> Q[AD / 8];
+    simdgroup_float8x8 O[AD / 8];
+    device const float* qr = q + (ulong(off + min(qi, nq - 1)) * a.H + h) * D + fn;
     for (uint t = 0; t < nd; ++t) {
-        simdgroup_load(Q[t], sh, D, ulong2(8 * t, 8 * sg));
+        const float2 x = live ? *(device const float2*)(qr + 8 * t) : float2(0.f);
+        if (kHalf) bad = bad || !(fabs(x.x) <= 65504.f) || !(fabs(x.y) <= 65504.f);
+        Q[t].thread_elements()[0] = MT(x.x);
+        Q[t].thread_elements()[1] = MT(x.y);
         O[t] = simdgroup_float8x8(0.f);
     }
     float m = -INFINITY, l = 0.f;
     for (uint j0 = lo; j0 <= last; j0 += AK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);  // the queries or the previous tile are no longer read
-        for (uint e = tid; e < AK * D; e += 128) {
-            const uint jj = e / D, d = e % D, j = j0 + jj;
-            float kv = 0.f, vv = 0.f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // the previous tile is no longer read
+        for (uint e = tid; e < AK * D4; e += NT) {
+            const uint jj = e / D4, d = 4 * (e % D4), j = j0 + jj;
+            float4 kv = float4(0.f), vv = float4(0.f);
             if (j <= last) {
-                const ulong src = j < start ? (ulong(g) * a.Tp + kb + j) * D + d : (ulong(seg + j - start) * a.Hkv + g) * D + d;
-                kv = j < start ? float(pk[src]) : k[src];
-                vv = j < start ? float(pv[src]) : v[src];
+                if (j < start) {
+                    const ulong src = (ulong(g) * a.Tp + kb + j) * D + d;
+                    kv = float4(*(device const vec<PT, 4>*)(pk + src));
+                    vv = float4(*(device const vec<PT, 4>*)(pv + src));
+                } else {
+                    const ulong src = (ulong(seg + j - start) * a.Hkv + g) * D + d;
+                    kv = *(device const float4*)(k + src);
+                    vv = *(device const float4*)(v + src);
+                }
+                if (kHalf) bad = bad || any(!(fabs(kv) <= 65504.f)) || any(!(fabs(vv) <= 65504.f));
             }
-            Ks[e] = kv;
-            Vs[e] = vv;
+            *(threadgroup vec<MT, 4>*)(Ks + jj * D + d) = vec<MT, 4>(kv);
+            *(threadgroup vec<MT, 4>*)(Vs + jj * D + d) = vec<MT, 4>(vv);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!sg_live || j0 > sg_last || j0 + AK <= sg_lo) continue;  // nothing here for this simdgroup's rows
         simdgroup_float8x8 S[AK / 8];
         for (uint c = 0; c < AK / 8; ++c) {
             S[c] = simdgroup_float8x8(0.f);
             for (uint t = 0; t < nd; ++t) {
-                simdgroup_float8x8 Kt;
+                simdgroup_matrix<MT, 8, 8> Kt;
                 simdgroup_load(Kt, Ks, D, ulong2(8 * t, 8 * c), true);  // keys 8c.. as columns, dims 8t.. as rows
                 simdgroup_multiply_accumulate(S[c], Q[t], Kt, S[c]);
             }
         }
-        // Scale, softcap, ALiBi and mask this lane's 4 scores, then the online softmax for its row.
+        // Scale, softcap, ALiBi and mask this lane's scores, then the online softmax for its row.
         float sc[AK / 4];
         float tmax = -INFINITY;
         for (uint c = 0; c < AK / 8; ++c)
@@ -678,12 +701,13 @@ kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
         tmax = max(tmax, simd_shuffle_xor(tmax, 8));
         const float mnew = max(m, tmax);
         const float keep = m == -INFINITY ? 0.f : vexp(m - mnew);
+        simdgroup_matrix<MT, 8, 8> P[AK / 8];
         float psum = 0.f;
         for (uint c = 0; c < AK / 8; ++c)
             for (uint u = 0; u < 2; ++u) {
-                const float p = sc[2 * c + u] == -INFINITY ? 0.f : vexp(sc[2 * c + u] - mnew);
-                S[c].thread_elements()[u] = p;
-                psum += p;
+                const MT p = MT(sc[2 * c + u] == -INFINITY ? 0.f : vexp(sc[2 * c + u] - mnew));
+                P[c].thread_elements()[u] = p;
+                psum += float(p);  // the weights the products use
             }
         psum += simd_shuffle_xor(psum, 1);
         psum += simd_shuffle_xor(psum, 8);
@@ -692,22 +716,23 @@ kernel void attn_mma_kt(ATTN_MMA_PARAMS(PT)) {
         for (uint t = 0; t < nd; ++t) {
             O[t].thread_elements() *= keep;  // both of this lane's elements are in its row
             for (uint c = 0; c < AK / 8; ++c) {
-                simdgroup_float8x8 Vb;
+                simdgroup_matrix<MT, 8, 8> Vb;
                 simdgroup_load(Vb, Vs, D, ulong2(8 * t, 8 * c));
-                simdgroup_multiply_accumulate(O[t], S[c], Vb, O[t]);
+                simdgroup_multiply_accumulate(O[t], P[c], Vb, O[t]);
             }
         }
     }
+    if (kHalf && bad) atomic_store_explicit(flag, 1u, memory_order_relaxed);
     if (!live) return;
-    device float* zr = z + (ulong(off + qi) * a.H + h) * D;
-    for (uint t = 0; t < nd; ++t) {
-        zr[8 * t + fn] = O[t].thread_elements()[0] / l;
-        zr[8 * t + fn + 1] = O[t].thread_elements()[1] / l;
-    }
+    device float* zr = z + (ulong(off + qi) * a.H + h) * D + fn;
+    for (uint t = 0; t < nd; ++t)
+        *(device float2*)(zr + 8 * t) = float2(O[t].thread_elements()[0], O[t].thread_elements()[1]) / l;
     if (a.has_lse != 0 && fn == 0) lse[ulong(off + qi) * a.H + h] = m + log(l);
 }
-template [[host_name("attn_mma_k")]] kernel void attn_mma_kt<float>(ATTN_MMA_PARAMS(float));
-template [[host_name("attn_mma_k_h")]] kernel void attn_mma_kt<half>(ATTN_MMA_PARAMS(half));
+template [[host_name("attn_mma_k")]] kernel void attn_mma_kt<float, float>(ATTN_MMA_PARAMS(float));
+template [[host_name("attn_mma_k_h")]] kernel void attn_mma_kt<half, float>(ATTN_MMA_PARAMS(half));
+template [[host_name("attn_mma_hk")]] kernel void attn_mma_kt<float, half>(ATTN_MMA_PARAMS(float));
+template [[host_name("attn_mma_hk_h")]] kernel void attn_mma_kt<half, half>(ATTN_MMA_PARAMS(half));
 
 // One threadgroup per block: the sum of squares of a bm x bn block of a matrix with row stride ld.
 struct BlockArgs { uint ld, bm, bn, nbc; };
@@ -838,6 +863,137 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
 }
 )";
 
+// Causal attention on the neural accelerators of Apple10 GPUs (M5): Metal 4's tensor operations
+// (MetalPerformancePrimitives' matmul2d), macOS 26. Compiled on first use for one head size, TD, defined before
+// this source, after the math helpers of kKernelSource (its text up to kMathEnd). The same rows, blocks and
+// arguments as attn_mma_kt (rows, blocks of a segment's rows, earlier positions' keys and values in pk / pv,
+// window, softcap, ALiBi, lse), with the products' inputs of type MT: half in fp16 runs (q, k, v, pk, pv then
+// fp16 copies, converted by the caller, which flags values outside fp16's range), float otherwise.
+// Each simdgroup takes 16 of its block's rows on its own, over tiles of 32 keys: the scores (16 x 32) are a
+// cooperative tensor, masked and softmaxed online in registers (reductions across a row are reduce_rows, which
+// needs a single simdgroup), and the weights go straight into the product with the values. A product's result
+// is written to its cooperative destination (not added to it), so each tile's P V is added to the output here.
+const char* const kTensorKernelSource = R"(
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+struct AttnArgs { uint H, Hkv, D, Tp, window, has_slopes, has_lse, has_kbase; float scale, cap; };
+constant constexpr int SQ = 16, BK = 32;
+template <typename T>
+using dtensor = tensor<device T, dextents<int32_t, 2>, tensor_inline>;
+
+template <typename MT>
+kernel void attn_tensor_kt(device MT* q [[buffer(0)]], device MT* k [[buffer(1)]], device MT* v [[buffer(2)]],
+                           device float* z [[buffer(3)]], device MT* pk [[buffer(4)]], device MT* pv [[buffer(5)]],
+                           device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]],
+                           constant AttnArgs& a [[buffer(8)]], device float* lse [[buffer(9)]],
+                           device const uint* kbase [[buffer(10)]], uint tgid [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]]) {
+    using ext = dextents<int32_t, 2>;
+    const int D = TD;
+    const uint b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    const uint off = blk[4 * b], nq = blk[4 * b + 1], start = blk[4 * b + 2], seg = blk[4 * b + 3];
+    if (sg * SQ >= nq) return;
+    const uint r0 = off + sg * SQ, nr = min(uint(SQ), nq - sg * SQ);  // this simdgroup's rows
+    const uint pos0 = start + (r0 - seg), last = pos0 + nr - 1;        // and their positions
+    const uint kb = a.has_kbase != 0 ? kbase[off] : 0;
+    const uint lo = (a.window != 0 && pos0 + 1 > a.window) ? pos0 + 1 - a.window : 0;
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    auto tQ = dtensor<MT>(q + (ulong(r0) * a.H + h) * D, ext(D, int(nr)), array<int32_t, 2>{1, int(a.H * D)});
+    // Earlier positions' keys and values (Hkv, Tp, D) up to the segment's start, then the segment's own rows up
+    // to the block's last: reads past either end are bounds-checked (zeros), and masked.
+    auto pK = dtensor<MT>(pk + (ulong(g) * a.Tp + kb) * D, ext(D, int(start)), array<int32_t, 2>{1, D});
+    auto pV = dtensor<MT>(pv + (ulong(g) * a.Tp + kb) * D, ext(D, int(start)), array<int32_t, 2>{1, D});
+    auto nK = dtensor<MT>(k + (ulong(seg) * a.Hkv + g) * D, ext(D, int(off + nq - seg)), array<int32_t, 2>{1, int(a.Hkv * D)});
+    auto nV = dtensor<MT>(v + (ulong(seg) * a.Hkv + g) * D, ext(D, int(off + nq - seg)), array<int32_t, 2>{1, int(a.Hkv * D)});
+    constexpr auto d1 = matmul2d_descriptor(SQ, BK, TD, false, true);   // S = Q K^T
+    constexpr auto d2 = matmul2d_descriptor(SQ, TD, BK, false, false);  // O += P V
+    matmul2d<d1, execution_simdgroup> op1;
+    matmul2d<d2, execution_simdgroup> op2;
+    auto sK = nK.slice(0, 0);
+    auto sV = nV.slice(0, 0);
+    using PIn = decltype(op2.template get_left_input_cooperative_tensor<MT, MT, float>());
+    auto O = op2.template get_destination_cooperative_tensor<PIn, decltype(sV), float>();
+    for (int i = 0; i < O.get_capacity(); ++i) O[i] = 0.f;
+    auto m = op1.template get_row_reduction_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+    auto l = op1.template get_row_reduction_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+    for (int i = 0; i < m.get_capacity(); ++i) {
+        m[i] = -INFINITY;
+        l[i] = 0.f;
+    }
+    for (uint j0 = lo; j0 <= last;) {
+        const bool pre = j0 < start;
+        const uint jend = pre ? min(start, last + 1) : last + 1;  // this part's keys end here
+        sK = pre ? pK.slice(0, int(j0)) : nK.slice(0, int(j0 - start));
+        sV = pre ? pV.slice(0, int(j0)) : nV.slice(0, int(j0 - start));
+        auto S = op1.template get_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        for (int i = 0; i < S.get_capacity(); ++i) S[i] = 0.f;
+        op1.run(tQ, sK, S);
+        for (int i = 0; i < S.get_capacity(); ++i) {
+            if (!S.is_valid_element(i)) continue;
+            const auto idx = S.get_multidimensional_index(i);
+            const uint j = j0 + idx[0], rr = idx[1], pos = pos0 + rr;
+            const uint row_lo = (a.window != 0 && pos + 1 > a.window) ? pos + 1 - a.window : 0;
+            float x = -INFINITY;
+            if (rr < nr && j < jend && j <= pos && j >= row_lo) {
+                x = S[i] * a.scale;
+                if (a.cap != 0.f) x = a.cap * vtanh(x / a.cap);
+                if (slope != 0.f) x += -slope * float(pos - j);
+            }
+            S[i] = x;
+        }
+        auto rmax = op1.template get_row_reduction_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        for (int i = 0; i < rmax.get_capacity(); ++i) rmax[i] = -INFINITY;
+        reduce_rows(S, rmax, reduction_operation::max, -INFINITY);
+        auto keep = op1.template get_row_reduction_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        for (int i = 0; i < m.get_capacity(); ++i) {
+            const float mn = max(m[i], rmax[i]);
+            keep[i] = m[i] == -INFINITY ? 0.f : vexp(m[i] - mn);
+            m[i] = mn;
+        }
+        for (auto it = S.begin(); it != S.end(); it++) {
+            const auto r = m.map_iterator(it);
+            *it = *it == -INFINITY ? 0.f : float(MT(vexp(*it - *r)));  // the weight the product uses
+        }
+        auto rs = op1.template get_row_reduction_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        for (int i = 0; i < rs.get_capacity(); ++i) rs[i] = 0.f;
+        reduce_rows(S, rs, reduction_operation::sum, 0.f);
+        for (int i = 0; i < l.get_capacity(); ++i) l[i] = l[i] * keep[i] + rs[i];
+        auto Ot = op2.template get_destination_cooperative_tensor<PIn, decltype(sV), float>();
+        for (int i = 0; i < Ot.get_capacity(); ++i) Ot[i] = 0.f;
+        if constexpr (sizeof(MT) == 2) {
+            auto Sh = op1.template get_destination_cooperative_tensor<decltype(tQ), decltype(sK), MT>();
+            for (int i = 0; i < S.get_capacity(); ++i) Sh[i] = MT(S[i]);
+            auto P = op2.template get_left_input_cooperative_tensor<MT, MT, float>(Sh);
+            op2.run(P, sV, Ot);
+        } else {
+            auto P = op2.template get_left_input_cooperative_tensor<MT, MT, float>(S);
+            op2.run(P, sV, Ot);
+        }
+        for (auto it = O.begin(), jt = Ot.begin(); it != O.end(); it++, jt++) {
+            const auto f = keep.map_iterator(it);
+            *it = *it * *f + *jt;
+        }
+        j0 = pre && j0 + BK >= start ? max(start, lo) : j0 + BK;  // from the earlier positions' last tile to the segment's first key
+    }
+    for (auto it = O.begin(); it != O.end(); it++) {
+        const auto f = l.map_iterator(it);
+        *it /= *f;
+    }
+    O.store(dtensor<float>(z + (ulong(r0) * a.H + h) * D, ext(D, int(nr)), array<int32_t, 2>{1, int(a.H * D)}));
+    if (a.has_lse != 0)
+        for (int i = 0; i < l.get_capacity(); ++i) {
+            if (!l.is_valid_element(i)) continue;
+            const uint rr = l.get_multidimensional_index(i)[0];
+            if (rr < nr) lse[ulong(r0 + rr) * a.H + h] = m[i] + log(l[i]);
+        }
+}
+template [[host_name("attn_tensor_k")]] kernel void attn_tensor_kt<float>(device float*, device float*, device float*, device float*, device float*, device float*, device const uint*, device const float*, constant AttnArgs&, device float*, device const uint*, uint, uint);
+template [[host_name("attn_tensor_hk")]] kernel void attn_tensor_kt<half>(device half*, device half*, device half*, device float*, device half*, device half*, device const uint*, device const float*, constant AttnArgs&, device float*, device const uint*, uint, uint);
+)";
+// kKernelSource up to here holds the math helpers (vexp, vtanh, ...) that kTensorKernelSource uses too.
+const char* const kMathEnd = "// GpuAct order";
+
 struct ActArgs {
     uint32_t n;
     int32_t kind;
@@ -962,10 +1118,78 @@ struct Gpu::Impl {
     std::once_flag kernels_once;
     id<MTLComputePipelineState> kv_append_k, attn_split_k, attn_combine_k;
     // ... with earlier positions' keys and values in fp16 (a KV cache kept in fp16), and the rounding to it
-    id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, attn_mma_k_h, round_half_k;
+    id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, round_half_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
-        block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_mma_k, attn_delta_k, attn_bwd_dq_k,
-        attn_bwd_dkv_k, attn_pattern_k, attn_apply_k;
+        block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k,
+        attn_pattern_k, attn_apply_k;
+
+    id<MTLLibrary> lib;  // the kernels' library (load_kernels)
+    // The tiled attention kernel for a head size, block size and the types of its products and of earlier
+    // positions' keys and values, made on first use (its function constants give each its own pipeline).
+    std::mutex attn_mma_mutex;
+    std::map<std::tuple<int64_t, int64_t, bool, bool>, id<MTLComputePipelineState>> attn_mma;
+    id<MTLComputePipelineState> attn_mma_kernel(int64_t D, int64_t block_rows, bool half_math, bool half_prefix) {
+        std::scoped_lock lock(attn_mma_mutex);
+        const auto key = std::make_tuple(D, block_rows, half_math, half_prefix);
+        if (auto it = attn_mma.find(key); it != attn_mma.end()) return it->second;
+        id<MTLComputePipelineState> p = nil;
+        {
+            @autoreleasepool {
+                MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+                const uint32_t d = static_cast<uint32_t>(D), sg = static_cast<uint32_t>(block_rows / 8);
+                [cv setConstantValue:&d type:MTLDataTypeUInt atIndex:0];
+                [cv setConstantValue:&sg type:MTLDataTypeUInt atIndex:1];
+                const char* name = half_math ? (half_prefix ? "attn_mma_hk_h" : "attn_mma_hk")
+                                             : (half_prefix ? "attn_mma_k_h" : "attn_mma_k");
+                NSError* err = nil;
+                id<MTLFunction> f = [lib newFunctionWithName:@(name) constantValues:cv error:&err];
+                p = f ? [device newComputePipelineStateWithFunction:f error:&err] : nil;
+                if (!p) throw std::runtime_error(std::string("GPU: could not load kernel ") + name);
+                if (p.maxTotalThreadsPerThreadgroup < static_cast<NSUInteger>(4 * block_rows))
+                    throw std::runtime_error(std::format("GPU: the attention kernel needs {} threads", 4 * block_rows));
+            }
+        }
+        attn_mma[key] = p;
+        return p;
+    }
+
+    // The neural accelerators' attention kernels (kTensorKernelSource) for a head size: [0] float products, [1]
+    // half; nil where they are not available (not an Apple10 GPU, macOS before 26, built without the macOS 26
+    // SDK, another head size, or a compile failure: then the tiled kernel above is used).
+    std::mutex attn_tensor_mutex;
+    std::map<int64_t, std::array<id<MTLComputePipelineState>, 2>> attn_tensor;
+    id<MTLComputePipelineState> attn_tensor_kernel(int64_t D, bool half_math) {
+        if (D != 32 && D != 64 && D != 96 && D != 128) return nil;
+        std::scoped_lock lock(attn_tensor_mutex);
+        auto it = attn_tensor.find(D);
+        if (it == attn_tensor.end()) {
+            std::array<id<MTLComputePipelineState>, 2> p{nil, nil};
+#if defined(__MAC_26_0)
+            if (@available(macOS 26.0, *)) {
+                if ([device supportsFamily:MTLGPUFamilyApple10]) {
+                    @autoreleasepool {
+                        MTLCompileOptions* opt = [MTLCompileOptions new];
+                        opt.languageVersion = MTLLanguageVersion4_0;
+                        opt.mathMode = MTLMathModeSafe;
+                        const std::string base = kKernelSource;
+                        const std::string src = std::format("#define TD {}\n", D) +
+                                                base.substr(0, base.find(kMathEnd)) + kTensorKernelSource;
+                        NSError* err = nil;
+                        id<MTLLibrary> l = [device newLibraryWithSource:@(src.c_str()) options:opt error:&err];
+                        const char* names[2] = {"attn_tensor_k", "attn_tensor_hk"};
+                        for (int i = 0; i < 2 && l; ++i) {
+                            id<MTLFunction> f = [l newFunctionWithName:@(names[i])];
+                            p[i] = f ? [device newComputePipelineStateWithFunction:f error:&err] : nil;
+                            if (p[i] && p[i].maxTotalThreadsPerThreadgroup < 256) p[i] = nil;
+                        }
+                    }
+                }
+            }
+#endif
+            it = attn_tensor.emplace(D, p).first;
+        }
+        return it->second[half_math ? 1 : 0];
+    }
 
     void load_kernels() {
         std::call_once(kernels_once, [this] {
@@ -973,7 +1197,7 @@ struct Gpu::Impl {
                 MTLCompileOptions* opt = [MTLCompileOptions new];
                 opt.mathMode = MTLMathModeSafe;  // no fast-math rewrites: keep the CPU's arithmetic (macOS 15+)
                 NSError* err = nil;
-                id<MTLLibrary> lib = [device newLibraryWithSource:@(kKernelSource) options:opt error:&err];
+                lib = [device newLibraryWithSource:@(kKernelSource) options:opt error:&err];
                 if (!lib)
                     throw std::runtime_error(std::string("GPU: kernels did not compile: ") +
                                              (err ? err.localizedDescription.UTF8String : "unknown error"));
@@ -1001,10 +1225,8 @@ struct Gpu::Impl {
                 rope_k = make("rope_k");
                 rope_pass_k = make("rope_pass_k");
                 attn_k = make("attn_k");
-                attn_mma_k = make("attn_mma_k");
                 attn_split_k = make("attn_split_k");
                 attn_k_h = make("attn_k_h");
-                attn_mma_k_h = make("attn_mma_k_h");
                 attn_split_k_h = make("attn_split_k_h");
                 attn_combine_k = make("attn_combine_k");
                 attn_delta_k = make("attn_delta_k");
@@ -1031,6 +1253,9 @@ std::unique_ptr<Gpu> Gpu::create() {
         return gpu;
     }
 }
+
+bool Gpu::attention_tensor_available(int64_t D) { return impl_->attn_tensor_kernel(D, false) != nil; }
+bool gpu_attention_tensor_available(Gpu& gpu, int64_t D) { return gpu.attention_tensor_available(D); }
 
 Tensor Gpu::linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16) {
     return std::move(linear_many(x, {&W}, {b}, fp16)[0]);
@@ -1193,6 +1418,8 @@ struct Gpu::Seq::Impl {
     id<MTLBuffer> flag = nil;   // set by half_k when an input does not fit fp16
     id<MTLBuffer> split = nil;  // split-key attention's partial results (attn_split_k)
     size_t split_bytes = 0;
+    id<MTLBuffer> halves = nil;  // fp16 copies of attention's inputs for the neural accelerators (attn_tensor_hk)
+    size_t halves_bytes = 0;
     std::vector<id<MTLBuffer>> retired;  // replaced during an attempt: released once its command buffers finish
 
     // Encoding state of one attempt.
@@ -1557,8 +1784,80 @@ struct Gpu::Seq::Impl {
                 }
                 const bool tiled = A.blocks > 0 && A.D <= 128 && A.D % 8 == 0;
                 if (tiled) need(op.i, 4 * A.blocks);
+                if (tiled && (A.block_rows < 8 || A.block_rows > 128 || A.block_rows % 8))
+                    throw std::invalid_argument(std::format(
+                        "Gpu::Seq: attention blocks hold 8 to 128 rows, a multiple of 8 (got {})", A.block_rows));
+                // fp16 runs take half-precision products, unless lse is wanted (gradients, the pattern): it must
+                // match the scores those recompute in float.
+                const bool half_math = fp16 && op.j < 0;
+                // The neural accelerators where available: in fp16 runs on fp16 copies of q, k, v and the earlier
+                // positions' keys and values (made here, flagging values outside fp16's range); otherwise on the
+                // float32 values, unless those keys and values are fp16 (the tiled kernel then).
+                id<MTLComputePipelineState> tensor_k =
+                    tiled && A.block_rows % 16 == 0 && g_attn_tensor.load() && (half_math || !A.half_prefix)
+                        ? g.attn_tensor_kernel(A.D, half_math)
+                        : nil;
+                if (tensor_k) {
+                    const int64_t nq = A.rows * A.H * A.D, nkv = A.rows * A.Hkv * A.D, np = A.Hkv * A.Tp * A.D;
+                    const bool copy_prefix = half_math && !A.half_prefix && A.Tp > 0;
+                    id<MTLComputeCommandEncoder> e = compute();
+                    // Byte offsets of q, k, v and pk, pv in `halves` (16-byte aligned).
+                    auto al = [](int64_t n) { return static_cast<NSUInteger>((n * 2 + 15) / 16 * 16); };
+                    const NSUInteger oq = 0, ok = al(nq), ov = ok + al(nkv), op_k = ov + al(nkv),
+                                     op_v = op_k + (copy_prefix ? al(np) : 0), end = op_v + (copy_prefix ? al(np) : 0);
+                    if (half_math) {
+                        if (halves_bytes < end) {
+                            if (halves) retired.push_back(halves);  // earlier command buffers may still read it
+                            halves = g.acquire(end);
+                            halves_bytes = end;
+                        }
+                        auto to_half = [&](id<MTLBuffer> src, NSUInteger dst_off, int64_t n) {
+                            const uint32_t n32 = u32(n);
+                            [e setComputePipelineState:g.half_k];
+                            [e setBuffer:src offset:0 atIndex:0];
+                            [e setBuffer:halves offset:dst_off atIndex:1];
+                            [e setBuffer:flag offset:0 atIndex:2];
+                            [e setBytes:&n32 length:sizeof n32 atIndex:3];
+                            dispatch(g.half_k, n);
+                        };
+                        to_half(slot(op.a).buf, oq, nq);
+                        to_half(slot(op.b).buf, ok, nkv);
+                        to_half(slot(op.d).buf, ov, nkv);
+                        if (copy_prefix) {
+                            to_half(slot(op.e).buf, op_k, np);
+                            to_half(slot(op.f).buf, op_v, np);
+                        }
+                    }
+                    [e setComputePipelineState:tensor_k];
+                    if (half_math) {
+                        [e setBuffer:halves offset:oq atIndex:0];
+                        [e setBuffer:halves offset:ok atIndex:1];
+                        [e setBuffer:halves offset:ov atIndex:2];
+                    } else {
+                        [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                        [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                        [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                    }
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:3];
+                    if (copy_prefix) {
+                        [e setBuffer:halves offset:op_k atIndex:4];
+                        [e setBuffer:halves offset:op_v atIndex:5];
+                    } else {
+                        [e setBuffer:slot(op.e).buf offset:0 atIndex:4];
+                        [e setBuffer:slot(op.f).buf offset:0 atIndex:5];
+                    }
+                    [e setBuffer:slot(op.i).buf offset:0 atIndex:6];
+                    [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
+                    [e setBytes:&args length:sizeof args atIndex:8];
+                    [e setBuffer:slot(op.j >= 0 ? op.j : op.c).buf offset:0 atIndex:9];
+                    [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
+                    const NSUInteger threads = NSUInteger(2 * A.block_rows);  // a simdgroup per 16 rows
+                    [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+                    break;
+                }
                 id<MTLComputeCommandEncoder> e = compute();
-                [e setComputePipelineState:tiled ? (A.half_prefix ? g.attn_mma_k_h : g.attn_mma_k)
+                [e setComputePipelineState:tiled ? g.attn_mma_kernel(A.D, A.block_rows, half_math, A.half_prefix)
                                                  : (A.half_prefix ? g.attn_k_h : g.attn_k)];
                 [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                 [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
@@ -1572,10 +1871,9 @@ struct Gpu::Seq::Impl {
                 [e setBuffer:slot(op.j >= 0 ? op.j : op.c).buf offset:0 atIndex:9];
                 [e setBuffer:slot(op.kb >= 0 ? op.kb : op.g).buf offset:0 atIndex:10];
                 if (tiled) {
-                    if (g.attn_mma_k.maxTotalThreadsPerThreadgroup < 128)
-                        throw std::runtime_error("GPU: the attention kernel needs 128 threads");
+                    [e setBuffer:flag offset:0 atIndex:11];
                     [e dispatchThreadgroups:MTLSizeMake(NSUInteger(u32(A.blocks * A.H)), 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        threadsPerThreadgroup:MTLSizeMake(NSUInteger(4 * A.block_rows), 1, 1)];
                     break;
                 }
                 const NSUInteger tg = std::min<NSUInteger>(128, g.attn_k.maxTotalThreadsPerThreadgroup);
@@ -1787,6 +2085,7 @@ Gpu::Seq::~Seq() {
     }
     if (s.flag) s.g.release(s.flag);
     if (s.split) s.g.release(s.split);
+    if (s.halves) s.g.release(s.halves);
 }
 
 float* Gpu::Seq::reserve(int slot, int64_t floats) {
