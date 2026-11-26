@@ -3758,6 +3758,41 @@ static void test_forward_cached_many_layers() {
 
 // generate()'s trace: each step = the full-pass analyses at that position on the text so far (the
 // chosen token's probability and top tokens, logit lens, DLA, where each head attended), hooks included.
+// A whole sequence's attention on the CPU runs in blocks of query rows, each against the keys up to its last row
+// (from its first row's window start), unless a hook reads hook_pattern, which needs the whole pattern: both give
+// the same logits, over 300 positions (blocks of 128, the last partial), with windows shorter and longer than a
+// block, ALiBi, softcaps and grouped-query attention.
+static void test_cpu_attention_blocked() {
+    auto cfg = [](std::function<void(ModelConfig&)> edit) {
+        return tiny([&](ModelConfig& c) {
+            c.max_seq_len = 320;
+            edit(c);
+        });
+    };
+    const std::vector<ModelConfig> cfgs = {
+        cfg([](ModelConfig&) {}),
+        cfg([](ModelConfig& c) {
+            c.sliding_window = 50;
+            c.attn_logit_softcap = 4.0;
+        }),
+        cfg([](ModelConfig& c) {
+            c.positional = "alibi";
+            c.n_kv_heads = 1;
+            c.sliding_window = 200;
+        }),
+    };
+    for (const ModelConfig& c : cfgs) {
+        const Model m = random_model(c, 61);
+        const Tokens t = seq(300, 5);
+        int64_t calls = 0;
+        Hooks whole;  // reading hook_pattern: the whole-pattern path
+        whole.add_capture([](const std::string& n) { return n.ends_with("attn.hook_pattern"); },
+                          [&](const std::string&, Tensor& p) { calls += p.shape[1] == 300 && p.shape[2] == 300; });
+        check_close(m.forward(t), m.forward(t, &whole));
+        CHECK(calls == c.n_layers);
+    }
+}
+
 // A prompt cache: each call reuses the longest prefix its prompt shares with the cache's text (at least the last
 // token runs) and leaves the cache holding its prompt and new tokens; the output is a fresh call's (up to rounding:
 // a differing token must be a near tie in the full pass's logits). A call stopped early leaves what it ran; another
@@ -5280,6 +5315,8 @@ int main(int argc, char** argv) {
     }
     run("analysis", "KV cache: 12 layers (two-digit hook names), float32 and fp16, clamped values",
         test_forward_cached_many_layers);
+    run("core", "CPU attention in blocks = the whole pattern: windows, ALiBi, softcaps, GQA",
+        test_cpu_attention_blocked);
     run("core", "sampler: temperature, top_k, top_p", test_sampler);
     run("core", "sampler: temperature too small for a float's 1 / T", test_tiny_temperature);
     run("analysis", "speculative sampling = the model's distribution", test_speculative_sampling);

@@ -960,6 +960,9 @@ void apply_half(const float* probs, int64_t rows, int64_t first, int64_t ld, int
 // rows of D floats. `probs` (n rows, stride ld >= first + n) receives the attention pattern: each
 // row is masked and softmaxed over the keys it may attend to (j <= its position, within the
 // window); disallowed entries are exactly 0.
+// Query rows per block of a whole sequence's attention on the CPU (Model::attend_into).
+constexpr int64_t kCausalBlockRows = 128;
+
 struct HeadAttention {
     int64_t D;
     float scale, cap;  // cap 0 = no softcap
@@ -1071,7 +1074,7 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
     const bool hook_z = hooks && hooks->matches(hook_name(layer, kHookZ));
     Tensor zt = hook_z ? Tensor({T, H, D}) : Tensor();
     float* z = hook_z ? zt.ptr() : z_out;
-    if (!batch) {
+    if (!batch && hooks && hooks->matches(hook_name(layer, kHookPattern))) {  // the whole pattern, for its hook
         Tensor pattern({H, T, T});
         for (int64_t h = 0; h < H; ++h) {
             ha.slope = slopes.empty() ? 0.f : slopes[h];
@@ -1083,6 +1086,31 @@ void Model::attend_into(int64_t layer, const float* q2, const float* k2, const f
             const float* vh = v.ptr() + (h / rep) * T * D;
             ha.apply(pattern.ptr() + h * T * T, T, 0, T, Prefix{}, vh, z + h * D, H * D);
         }
+    } else if (!batch) {
+        // Blocks of query rows, each scored against the keys up to its last row only: the earlier ones as a prefix
+        // (from the first row's window start), the block's own as new keys. So the masked triangle above the
+        // diagonal blocks is skipped, and no T x T pattern is kept, only a block's rows of weights.
+        // Heads go side by side, each with weights of its own (M5 Pro, a 0.9B model's prompt pass of 4096 tokens:
+        // 1.6x faster than with the whole pattern, 1.1x with heads one after another; blocks of 64 to 512 rows
+        // about as fast).
+        const int64_t BQ = kCausalBlockRows;
+        side_by_side(H, [&](int64_t h) {
+            HeadAttention hh = ha;  // (its slope is the head's)
+            hh.slope = slopes.empty() ? 0.f : slopes[h];
+            const float* kh = k.ptr() + (h / rep) * T * D;
+            const float* vh = v.ptr() + (h / rep) * T * D;
+            std::vector<float> probs(static_cast<size_t>(std::min(BQ, T) * T));
+            for (int64_t r0 = 0; r0 < T; r0 += BQ) {
+                const int64_t n = std::min(BQ, T - r0);
+                // Positions relative to lo, the first row's window start: what finish() masks and ALiBi weighs are
+                // distances, the same either way.
+                const int64_t lo = hh.window ? std::max<int64_t>(0, r0 + 1 - hh.window) : 0, first = r0 - lo;
+                hh.pattern(q.ptr() + (h * T + r0) * D, n, first, Prefix{kh + lo * D, nullptr}, kh + r0 * D,
+                           probs.data(), first + n);
+                hh.apply(probs.data(), n, first, first + n, Prefix{vh + lo * D, nullptr}, vh + r0 * D,
+                         z + (r0 * H + h) * D, H * D);
+            }
+        });
     } else if (batch->cached) {
         // One segment continuing a cached sequence (forward_cached). The rep query heads sharing a key /
         // value head are next to each other in q ((H, T, D): rep * T rows), so they are scored and
