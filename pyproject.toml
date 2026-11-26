@@ -1,0 +1,20 @@
+# The tfi Python module (the engine's bindings), built from this repository with CMake and nanobind:
+#   pip install git+https://github.com/SDUzbh/IndraNet     or, in a checkout,   pip install .
+# The indranet package (PyTorch models, training, export) is python/pyproject.toml: pip install ./python
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tfi"
+version = "0.1.0"
+description = "Python bindings for IndraNet's tfi engine: logit lens, attribution, patching, ablation, circuits and generation with hooks"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.build-type = "Release"
+wheel.packages = []  # CMakeLists.txt installs the package (python/tfi/__init__.py and the built module)
+sdist.exclude = ["build*", "python/tests", "examples", ".github"]

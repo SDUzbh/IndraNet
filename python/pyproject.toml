@@ -16,5 +16,5 @@ hf = ["huggingface_hub"]           # indranet_hf downloading from the Hub (local
 
 [tool.setuptools.packages.find]
 include = ["indranet*"]
-# The tfi bindings (python/tfi) are a compiled module built in the repository with `make python`, used
-# from there (pytest.ini puts python/ on the path), not shipped in the wheel.
+# The tfi bindings (python/tfi) are a compiled module with a package of their own: pip install . in the
+# repository root (pyproject.toml there), or make python to build them in place for pytest.

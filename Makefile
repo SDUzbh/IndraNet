@@ -1,8 +1,11 @@
 # Build the tfi engine (library), the indra CLI and the test tools with make (no CMake needed).
 #   make            -> build/libtfi.a build/indra build/tfi_golden build/tfi_tests
 #   make test       -> C++ unit tests (golden tests against PyTorch run from pytest)
-#   make python     -> the Python bindings, python/tfi/_tfi*.so (CMake + nanobind: pip install nanobind;
-#                      PYTHON=... picks the interpreter, python3 by default)
+#   make python     -> the Python bindings in place, python/tfi/_tfi*.so, for working on them (CMake + nanobind:
+#                      pip install nanobind; PYTHON=... picks the interpreter, python3 by default). To use them,
+#                      pip install . instead (pyproject.toml).
+#   make install    -> libtfi.a, the headers and a pkg-config file under PREFIX (/usr/local by default), so that
+#                      c++ app.cpp $(pkg-config --cflags --libs tfi) builds against the engine
 #   make test GROUPS=gpu,fp16 FILTER=attention -> only those groups / tests whose name contains the text
 #                      (groups: core analysis grad fp16 gpu; build/tfi_tests --list shows them)
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
@@ -53,7 +56,15 @@ python:
 	cmake -S . -B $(BUILD)/python -DTFI_PYTHON=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$$(command -v $(PYTHON))" >/dev/null
 	cmake --build $(BUILD)/python --target _tfi --parallel
 
+PREFIX ?= /usr/local
+install: $(BUILD)/libtfi.a
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include/tfi
+	cp $(BUILD)/libtfi.a $(DESTDIR)$(PREFIX)/lib/
+	cp include/tfi/*.h $(DESTDIR)$(PREFIX)/include/tfi/
+	printf 'prefix=%s\nName: tfi\nDescription: IndraNet reverse-engineering engine\nVersion: 0.1.0\nCflags: -std=c++20 -I$${prefix}/include\nLibs: -L$${prefix}/lib -ltfi -pthread %s\n' \
+	  '$(PREFIX)' '$(LDLIBS)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/tfi.pc
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test python clean
+.PHONY: all test python install clean

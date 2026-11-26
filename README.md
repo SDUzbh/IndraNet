@@ -89,8 +89,36 @@ multiplies.
 
 ## From code
 
-C++: link `build/libtfi.a` with `-Iinclude` (on macOS add `-framework Accelerate -framework Metal
--framework MetalPerformanceShaders -framework Foundation`).
+**Python**: one command builds and installs the `tfi` module (it needs CMake and a C++20 compiler):
+
+```bash
+pip install git+https://github.com/SDUzbh/IndraNet     # or, in a checkout: pip install .
+```
+
+```python
+import tfi
+m = tfi.Model.load("model.safetensors", fp16=True)
+t = m.tokenize("When Mary and John went to the store, John gave a drink to")
+logits, cache = m.run_with_cache(t, names=["blocks.9.attn.hook_pattern"])   # numpy arrays
+def knock_out(z, name):
+    z[:, 7, :] = 0
+logits = m.forward(t, hooks={"blocks.15.attn.hook_z": knock_out})
+new = tfi.generate(m, t, max_new_tokens=20, hooks={"blocks.15.attn.hook_z": knock_out})
+```
+
+**C++ with CMake**: add the repository to your project and link `tfi::tfi`; include paths, C++20 and
+the macOS frameworks come with it.
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(indranet GIT_REPOSITORY https://github.com/SDUzbh/IndraNet GIT_TAG main)
+FetchContent_MakeAvailable(indranet)          # or add_subdirectory(path/to/IndraNet)
+target_link_libraries(your_app PRIVATE tfi::tfi)
+```
+
+After `cmake --install`, `find_package(tfi)` gives the same target. **Without CMake**: `make install
+PREFIX=$HOME/.local`, then `c++ app.cpp $(pkg-config --cflags --libs tfi)` (with
+`PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig`).
 
 ```cpp
 #include "tfi/analysis.h"
@@ -106,20 +134,6 @@ hooks.add("blocks.0.attn.hook_z", [](const std::string&, Tensor& z) { /* edit in
 Tensor edited = m.forward(t, &hooks);
 DLAResult dla = direct_logit_attribution(m, t, /*pos=*/4, /*target=*/3, /*other=*/9);
 Tokens more = generate(m, t, GenerateOptions{}, &hooks);    // hooks apply at every step
-```
-
-Python: `make python` builds the `tfi` module (needs CMake and `pip install nanobind`); use it with
-`PYTHONPATH=python`.
-
-```python
-import tfi
-m = tfi.Model.load("model.safetensors", fp16=True)
-t = m.tokenize("When Mary and John went to the store, John gave a drink to")
-logits, cache = m.run_with_cache(t, names=["blocks.9.attn.hook_pattern"])   # numpy arrays
-def knock_out(z, name):
-    z[:, 7, :] = 0
-logits = m.forward(t, hooks={"blocks.15.attn.hook_z": knock_out})
-new = tfi.generate(m, t, max_new_tokens=20, hooks={"blocks.15.attn.hook_z": knock_out})
 ```
 
 The Python functions mirror the C++ API (`logit_lens`, `patch`, `head_ablation`, `generate`, ...).

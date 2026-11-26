@@ -1,6 +1,7 @@
 """tfi: Python bindings for IndraNet's C++ interpretability engine.
 
-Build them once with ``make python`` (needs CMake and ``pip install nanobind``), then::
+Install them with ``pip install git+https://github.com/SDUzbh/IndraNet`` (or ``pip install .`` in a checkout;
+needs CMake and a C++20 compiler), then::
 
     import tfi
 
@@ -31,8 +32,8 @@ try:
         set_num_threads,
     )
 except ImportError as e:  # pragma: no cover - depends on the build
-    raise ImportError(f"the tfi bindings are not built ({e}); run `make python` in the repository root "
-                      "(needs CMake and `pip install nanobind`)") from e
+    raise ImportError(f"the tfi bindings are not built ({e}); run `pip install .` in the repository root, "
+                      "or `make python` to build them in place (needs CMake and `pip install nanobind`)") from e
 
 __all__ = [
     "KVCache", "Model", "Tokenizer", "composition_random_baseline", "composition_scores", "device",

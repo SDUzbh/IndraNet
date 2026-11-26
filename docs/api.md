@@ -7,7 +7,8 @@
 ```bash
 make            # build/indra (CLI), build/libtfi.a, build/tfi_tests, build/tfi_golden
 make test       # C++ unit tests
-make python     # the Python bindings, python/tfi/_tfi*.so (needs CMake and `pip install nanobind`)
+make python     # the Python bindings in place, python/tfi/_tfi*.so, for working on them
+make install    # libtfi.a, the headers and tfi.pc under PREFIX (/usr/local by default)
 ```
 
 Or with CMake: `cmake -S . -B build-cmake && cmake --build build-cmake`. On macOS, matrix
@@ -71,14 +72,20 @@ Tensor q_rows = Wq.rows(0, 16);                              // read as float32 
 page-aligned memory that the GPU uses in place, so no weight is held twice. Norm scales and biases
 are float32 tensors, read with `f32()`.
 
-Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accelerate -framework Metal
--framework MetalPerformanceShaders -framework Foundation`).
+To use the engine from your own C++ project, link the CMake target `tfi::tfi`: from
+`FetchContent_Declare(indranet GIT_REPOSITORY https://github.com/SDUzbh/IndraNet GIT_TAG main)` and
+`FetchContent_MakeAvailable(indranet)`, from `add_subdirectory(path/to/IndraNet)`, or from
+`find_package(tfi)` after `cmake --install`. It brings the include path, C++20 and (on macOS)
+Accelerate and Metal with it; the CLI and the tests are built only when IndraNet is the top-level
+project (`-DTFI_BUILD_TOOLS=ON` builds them anyway). Without CMake, `make install PREFIX=...` writes a
+pkg-config file: `c++ app.cpp $(pkg-config --cflags --libs tfi)`.
 
 ## Python bindings
 
-`make python` builds the module `tfi` (with CMake and [nanobind](https://github.com/wjakob/nanobind))
-into [python/tfi/](../python/tfi/). It is used from the repository: `pytest` puts `python/` on the
-path; elsewhere, set `PYTHONPATH=python`.
+`pip install git+https://github.com/SDUzbh/IndraNet` (or `pip install .` in a checkout) builds the
+module `tfi` with CMake and [nanobind](https://github.com/wjakob/nanobind) and installs it. To work on
+the bindings, `make python` builds it in place in [python/tfi/](../python/tfi/), where `pytest` finds
+it (it puts `python/` on the path).
 
 ```python
 import tfi
