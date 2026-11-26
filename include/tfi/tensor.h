@@ -29,15 +29,17 @@ struct Tensor {
     bool empty() const { return data.empty(); }
     float* ptr() { return data.data(); }
     const float* ptr() const { return data.data(); }
-    // Row i of the last dimension (the leading dimensions taken as one), as a view of the data.
-    std::span<float> row_view(int64_t i) {
+    // Row i of the last dimension (the leading dimensions taken as one), as a view of the data. Only on a tensor that
+    // outlives the view: on a temporary it would dangle, so that overload is deleted (take tfi::row(t, i) instead).
+    std::span<float> row_view(int64_t i) & {
         const int64_t w = shape.empty() ? 1 : shape.back();
         return {data.data() + i * w, static_cast<size_t>(w)};
     }
-    std::span<const float> row_view(int64_t i) const {
+    std::span<const float> row_view(int64_t i) const& {
         const int64_t w = shape.empty() ? 1 : shape.back();
         return {data.data() + i * w, static_cast<size_t>(w)};
     }
+    void row_view(int64_t i) const&& = delete;
 
     float& at(std::initializer_list<int64_t> idx);
     float at(std::initializer_list<int64_t> idx) const;

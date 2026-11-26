@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "../src/gpu/gpu.h"         // internal (macOS): GPU matrix multiplies
@@ -34,6 +35,12 @@
 #include "tfi/tokenizer.h"
 
 using namespace tfi;
+
+// Tensor::row_view borrows the tensor's data, so it is not callable on a temporary (the view would dangle).
+template <class T>
+concept HasRowView = requires(T&& t) { std::forward<T>(t).row_view(0); };
+static_assert(HasRowView<Tensor&> && HasRowView<const Tensor&>);
+static_assert(!HasRowView<Tensor> && !HasRowView<const Tensor>);
 
 static int g_failures = 0, g_checks = 0;
 
