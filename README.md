@@ -29,7 +29,7 @@ python -m indranet_hf path/to/checkpoint model.safetensors    # or a Hub repo id
 build/indra generate model.safetensors --text "The capital of France is" --max-new 30
 ```
 
-macOS builds use Accelerate and the GPU (macOS 15 or newer); elsewhere a portable CPU path is used.
+macOS builds use Accelerate and the GPU (macOS 26 or newer, built with Xcode 26); elsewhere a portable CPU path is used.
 `--fp16` keeps the weights in half precision, and `--device cpu|both|gpu` picks where work runs.
 
 ## Commands

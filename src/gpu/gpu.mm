@@ -6,6 +6,10 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#if !defined(__MAC_26_0)
+#error "macOS builds need the macOS 26 SDK (Xcode 26): the GPU code uses Metal 4"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -864,7 +868,7 @@ kernel void norm_bwd_k(device const float* x [[buffer(0)]], device const float* 
 )";
 
 // Causal attention on the neural accelerators of Apple10 GPUs (M5): Metal 4's tensor operations
-// (MetalPerformancePrimitives' matmul2d), macOS 26. Compiled on first use for one head size, TD, defined before
+// (MetalPerformancePrimitives' matmul2d). Compiled on first use for one head size, TD, defined before
 // this source, after the math helpers of kKernelSource (its text up to kMathEnd). The same rows, blocks and
 // arguments as attn_mma_kt (rows, blocks of a segment's rows, earlier positions' keys and values in pk / pv,
 // window, softcap, ALiBi, lse), with the products' inputs of type MT: half in fp16 runs (q, k, v, pk, pv then
@@ -1154,8 +1158,8 @@ struct Gpu::Impl {
     }
 
     // The neural accelerators' attention kernels (kTensorKernelSource) for a head size: [0] float products, [1]
-    // half; nil where they are not available (not an Apple10 GPU, macOS before 26, built without the macOS 26
-    // SDK, another head size, or a compile failure: then the tiled kernel above is used).
+    // half; nil where they are not available (not an Apple10 GPU, another head size, or a compile failure: then
+    // the tiled kernel above is used).
     std::mutex attn_tensor_mutex;
     std::map<int64_t, std::array<id<MTLComputePipelineState>, 2>> attn_tensor;
     id<MTLComputePipelineState> attn_tensor_kernel(int64_t D, bool half_math) {
@@ -1164,28 +1168,24 @@ struct Gpu::Impl {
         auto it = attn_tensor.find(D);
         if (it == attn_tensor.end()) {
             std::array<id<MTLComputePipelineState>, 2> p{nil, nil};
-#if defined(__MAC_26_0)
-            if (@available(macOS 26.0, *)) {
-                if ([device supportsFamily:MTLGPUFamilyApple10]) {
-                    @autoreleasepool {
-                        MTLCompileOptions* opt = [MTLCompileOptions new];
-                        opt.languageVersion = MTLLanguageVersion4_0;
-                        opt.mathMode = MTLMathModeSafe;
-                        const std::string base = kKernelSource;
-                        const std::string src = std::format("#define TD {}\n", D) +
-                                                base.substr(0, base.find(kMathEnd)) + kTensorKernelSource;
-                        NSError* err = nil;
-                        id<MTLLibrary> l = [device newLibraryWithSource:@(src.c_str()) options:opt error:&err];
-                        const char* names[2] = {"attn_tensor_k", "attn_tensor_hk"};
-                        for (int i = 0; i < 2 && l; ++i) {
-                            id<MTLFunction> f = [l newFunctionWithName:@(names[i])];
-                            p[i] = f ? [device newComputePipelineStateWithFunction:f error:&err] : nil;
-                            if (p[i] && p[i].maxTotalThreadsPerThreadgroup < 256) p[i] = nil;
-                        }
+            if ([device supportsFamily:MTLGPUFamilyApple10]) {
+                @autoreleasepool {
+                    MTLCompileOptions* opt = [MTLCompileOptions new];
+                    opt.languageVersion = MTLLanguageVersion4_0;
+                    opt.mathMode = MTLMathModeSafe;
+                    const std::string base = kKernelSource;
+                    const std::string src = std::format("#define TD {}\n", D) +
+                                            base.substr(0, base.find(kMathEnd)) + kTensorKernelSource;
+                    NSError* err = nil;
+                    id<MTLLibrary> l = [device newLibraryWithSource:@(src.c_str()) options:opt error:&err];
+                    const char* names[2] = {"attn_tensor_k", "attn_tensor_hk"};
+                    for (int i = 0; i < 2 && l; ++i) {
+                        id<MTLFunction> f = [l newFunctionWithName:@(names[i])];
+                        p[i] = f ? [device newComputePipelineStateWithFunction:f error:&err] : nil;
+                        if (p[i] && p[i].maxTotalThreadsPerThreadgroup < 256) p[i] = nil;
                     }
                 }
             }
-#endif
             it = attn_tensor.emplace(D, p).first;
         }
         return it->second[half_math ? 1 : 0];
@@ -1195,7 +1195,7 @@ struct Gpu::Impl {
         std::call_once(kernels_once, [this] {
             @autoreleasepool {
                 MTLCompileOptions* opt = [MTLCompileOptions new];
-                opt.mathMode = MTLMathModeSafe;  // no fast-math rewrites: keep the CPU's arithmetic (macOS 15+)
+                opt.mathMode = MTLMathModeSafe;  // no fast-math rewrites: keep the CPU's arithmetic
                 NSError* err = nil;
                 lib = [device newLibraryWithSource:@(kKernelSource) options:opt error:&err];
                 if (!lib)

@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
-# macOS builds need macOS 15 or newer (src/gpu/gpu.mm); set before project() so it takes effect.
-set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
-if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 15.0)
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version" FORCE)
+# macOS builds need macOS 26 or newer and its SDK (src/gpu/gpu.mm: Metal 4); set before project() so it takes effect.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS version")
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 26.0)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS version" FORCE)
 endif()
 project(IndraNet VERSION 0.1.0 LANGUAGES CXX)
 

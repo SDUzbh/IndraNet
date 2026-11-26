@@ -250,7 +250,7 @@ double gpu_min_work();
 // For tests: 0 restores the default.
 void set_gpu_min_work(double multiply_adds);
 // Whether Gpu::Seq's tiled attention may run on the neural accelerators (Metal 4 tensor operations: Apple10 GPUs,
-// e.g. M5, on macOS 26) for head sizes 32, 64, 96 and 128; on (the default) uses them where they are available.
+// e.g. M5) for head sizes 32, 64, 96 and 128; on (the default) uses them where they are available.
 // For tests, which compare both kernels.
 void set_gpu_attention_tensor(bool on);
 // Whether `gpu` has them, for a head size D.

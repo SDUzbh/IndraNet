@@ -15,7 +15,7 @@ Or with CMake: `cmake -S . -B build-cmake && cmake --build build-cmake`. On macO
 multiplies use Accelerate and the GPU; elsewhere a portable loop is used. `indra --device` picks
 where work runs: `both` (the default) sends work to the GPU when it is large enough to repay it,
 `cpu` never uses the GPU (also `--no-gpu`), and `gpu` runs everything it can on the GPU, attention
-included. macOS builds need macOS 15 or newer.
+included. macOS builds need macOS 26 or newer and its SDK (Xcode 26).
 
 ## C++ API
 
