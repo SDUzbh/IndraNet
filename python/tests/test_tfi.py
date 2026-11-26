@@ -304,6 +304,25 @@ def test_kv_cache_clamped(tfi, tmp_path):
         tfi.generate_batch(m16, [TOKENS, TOKENS[:3]], max_new_tokens=2, hooks=[None, hooks])
 
 
+def test_prompt_cache(tfi, tmp_path):
+    """A PromptCache: the next turn reuses the earlier text and gives a fresh call's tokens; editing hooks refused."""
+    _, path = exported(tmp_path)
+    m = tfi.Model.load(str(path))
+    pc = tfi.PromptCache()
+    out1 = tfi.generate(m, TOKENS, max_new_tokens=6, prompt_cache=pc)
+    assert pc.reused == 0 and pc.tokens == list(TOKENS) + out1[:-1] and len(pc) == len(pc.tokens)
+    turn = list(TOKENS) + out1 + [5, 9, 2]
+    out2 = tfi.generate(m, turn, max_new_tokens=6, prompt_cache=pc)
+    assert pc.reused == len(TOKENS) + len(out1) - 1
+    assert out2 == tfi.generate(m, turn, max_new_tokens=6)
+    with pytest.raises(ValueError):
+        tfi.generate(m, turn, prompt_cache=pc, hooks={"blocks.0.hook_attn_out": lambda a, name: a * 0})
+    tfi.generate(m, turn, prompt_cache=pc, captures={"blocks.0.hook_resid_pre": lambda a, name: None})
+    assert pc.reused == len(turn) - 1
+    pc.clear()
+    assert len(pc) == 0 and pc.tokens == []
+
+
 def test_generate_options(tfi, tmp_path):
     vocab = [chr(ord("a") + i % 26) + (str(i // 26) if i >= 26 else "") for i in range(V)]
     _, path = exported(tmp_path, vocab=vocab)

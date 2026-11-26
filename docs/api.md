@@ -58,6 +58,8 @@ generate(m, t, opt, nullptr, &trace);                        // (opt.trace says 
 std::vector<Tokens> both = generate_batch(m, {t, t}, opt, {nullptr, &hooks});  // baseline and intervention, one pass a step
 opt.speculative.draft_tokens = 8;                            // speculative decoding: prompt lookup,
 opt.speculative.draft = &small;                              // or a draft model with the same tokenizer
+PromptCache pc;                                              // keys and values kept between calls: the next
+opt.prompt_cache = &pc;                                      // call runs only what its prompt adds (pc.reused)
 Tokens fast = generate(m, t, opt);
 DecodeRuntime runtime(m, t, opt, &hooks);                    // tfi/runtime.h: the same decoding, a token at a time
 while (std::optional<int64_t> token = runtime.next()) { /* ... */ }
@@ -114,6 +116,8 @@ base, edited = tfi.generate_batch(m, [t, t], max_new_tokens=20,     # several at
                                   hooks=[None, {"blocks.15.attn.hook_z": knock_out}])
 stats = {}
 tfi.generate(m, t, max_new_tokens=200, speculate=8, stats=stats)   # speculative (draft=small for a model)
+pc = tfi.PromptCache()                     # kept between calls: the next one runs only what its prompt adds
+tfi.generate(m, t + new + more, prompt_cache=pc)
 cache = tfi.KVCache()                      # step by step: forward_cached runs only the new tokens
 logits = m.forward_cached(t, cache)
 logits = m.forward_cached([mary], cache)   # (1, vocab); hooks see the new rows

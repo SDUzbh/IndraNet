@@ -32,6 +32,28 @@ the cache holds fp16 keys and values too: half its memory, rounded like the weig
 keep it exact. It stops at the model's end-of-text tokens (stored for
 converted models; `--no-eos` ignores them), at `--stop` ids, or after `--max-new` tokens.
 
+## Prompt cache
+
+From C++ and Python, a prompt cache (`PromptCache`, given as `GenerateOptions::prompt_cache` or
+`generate(..., prompt_cache=)`) keeps the keys and values of the text a call ran. The next call
+reuses them for the longest prefix its prompt shares with that text and computes only the rest,
+then leaves the cache holding its own prompt and new tokens. So a conversation's next turn (the
+earlier turns, the reply and a new message), or another question after the same system prompt, runs
+only what is new: on the GPU the cache stays there between calls.
+
+```python
+cache = tfi.PromptCache()
+reply = tfi.generate(model, history, max_new_tokens=100, prompt_cache=cache)
+history += reply + model.tokenize(next_message, False)
+reply = tfi.generate(model, history, max_new_tokens=100, prompt_cache=cache)  # runs next_message only
+cache.reused                                                                   # positions taken from the cache
+```
+
+The output is what a fresh call gives, up to rounding (the reused positions were computed in other
+passes). A cache belongs to one model; a call with another starts it over. Hooks that edit
+activations would change the keys and values, so `generate` refuses them with a cache;
+capture-only hooks see the positions computed, not the reused ones.
+
 ## Speculative decoding
 
 `--speculate K` turns on speculative decoding. Each step proposes up to K tokens, and the model

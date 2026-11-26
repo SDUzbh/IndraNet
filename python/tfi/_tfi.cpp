@@ -450,13 +450,29 @@ NB_MODULE(_tfi, mod) {
             "normed"_a, "Unembedding (and final softcap) of final-normed rows (T, d_model).");
 
     // --- generation ----------------------------------------------------------------------
+    nb::class_<PromptCache>(
+        mod, "PromptCache",
+        "Keys and values of a text generate() ran, for later calls to start from (generate(..., prompt_cache=)): a "
+        "call reuses the longest prefix its prompt shares with tokens, computes only the rest, and leaves the cache "
+        "holding its own prompt and new tokens. So a conversation's next turn, or another question after the same "
+        "system prompt, runs only what is new. Output is a fresh call's up to rounding. For one model (another starts "
+        "it over); not with hooks that edit activations.")
+        .def(nb::init<>())
+        .def_prop_ro(
+            "tokens", [](const PromptCache& c) { return c.tokens; }, "The text the cache holds.")
+        .def_prop_ro(
+            "size", [](const PromptCache& c) { return c.kv.size(); }, "Positions held.")
+        .def("__len__", [](const PromptCache& c) { return c.kv.size(); })
+        .def_ro("reused", &PromptCache::reused, "Positions the last call took from the cache.")
+        .def("clear", &PromptCache::clear);
+
     mod.def(
         "generate",
         [](const Model& m, nb::object prompt, int64_t max_new_tokens, double temperature, int64_t top_k, double top_p,
            uint64_t seed, std::optional<Tokens> stop_tokens, bool stop_at_eos, std::optional<nb::dict> hooks,
            nb::object on_token, std::optional<nb::dict> captures, bool trace, int64_t trace_top_k, bool trace_lens,
            bool trace_dla, int64_t trace_attention, int64_t speculate, const Model* draft, int64_t ngram,
-           std::optional<nb::dict> stats) -> nb::object {
+           std::optional<nb::dict> stats, PromptCache* prompt_cache) -> nb::object {
             Tokens tokens;
             if (nb::isinstance<nb::str>(prompt)) {
                 const std::string text = nb::cast<std::string>(prompt);
@@ -485,6 +501,7 @@ NB_MODULE(_tfi, mod) {
             o.speculative.stats = &st;
             int64_t clamped = 0;
             o.kv_clamped = &clamped;
+            o.prompt_cache = prompt_cache;
             if (!on_token.is_none()) {
                 if (!PyCallable_Check(on_token.ptr())) throw std::invalid_argument("on_token is not callable");
                 nb::handle fn = on_token;  // borrowed: on_token outlives the call
@@ -516,7 +533,7 @@ NB_MODULE(_tfi, mod) {
         "seed"_a = 0, "stop_tokens"_a = nb::none(), "stop_at_eos"_a = true, "hooks"_a = nb::none(),
         "on_token"_a = nb::none(), "captures"_a = nb::none(), "trace"_a = false, "trace_top_k"_a = 5,
         "trace_lens"_a = true, "trace_dla"_a = true, "trace_attention"_a = 0, "speculate"_a = 0,
-        "draft"_a.none() = nb::none(), "ngram"_a = 3, "stats"_a = nb::none(),
+        "draft"_a.none() = nb::none(), "ngram"_a = 3, "stats"_a = nb::none(), "prompt_cache"_a.none() = nb::none(),
         "New token ids continuing prompt (token ids, or text for the model's tokenizer), with a KV cache. Greedy at "
         "temperature 0; otherwise sampled from the top_k most likely and the fewest reaching top_p, reproducibly from "
         "seed. Stops at stop_tokens, the model's eos_tokens (unless stop_at_eos is False), or when on_token(token) "
@@ -531,7 +548,8 @@ NB_MODULE(_tfi, mod) {
         "call, kept tokens only, in order, so they can keep state or pick rows. Hooks whose edits can't be predicted "
         "get little or no speedup. A draft "
         "with a smaller vocabulary stops proposing once the text holds a token past it. A stats dict receives "
-        "steps, drafted, accepted and reruns.");
+        "steps, drafted, accepted and reruns. prompt_cache (a PromptCache): start from its keys and values where the "
+        "prompt shares its text, and leave it holding this call's prompt and new tokens.");
 
     mod.def(
         "generate_batch",

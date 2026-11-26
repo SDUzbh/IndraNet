@@ -3758,6 +3758,91 @@ static void test_forward_cached_many_layers() {
 
 // generate()'s trace: each step = the full-pass analyses at that position on the text so far (the
 // chosen token's probability and top tokens, logit lens, DLA, where each head attended), hooks included.
+// A prompt cache: each call reuses the longest prefix its prompt shares with the cache's text (at least the last
+// token runs) and leaves the cache holding its prompt and new tokens; the output is a fresh call's (up to rounding:
+// a differing token must be a near tie in the full pass's logits). A call stopped early leaves what it ran; another
+// model starts the cache over; editing hooks are refused, capture-only hooks allowed; speculation keeps it.
+static void test_generate_prompt_cache(const Model& m, const Model& other) {
+    GenerateOptions o;
+    o.max_new_tokens = 6;
+    o.stop_at_eos = false;
+    GenerateOptions fresh = o;
+    // got and want greedy from prompt: equal, or where they first differ, a near tie in the full pass.
+    auto agree = [&](const Tokens& prompt, const Tokens& got, const Tokens& want) {
+        CHECK(got.size() == want.size());
+        Tokens text = prompt;
+        for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) {
+            if (got[i] != want[i]) {
+                const Tensor lg = m.forward(text);
+                const float* last = lg.ptr() + (lg.shape[0] - 1) * lg.shape[1];
+                CHECK(std::fabs(last[got[i]] - last[want[i]]) <=
+                      tol_for(m, 1e-4) * std::max(1.f, std::fabs(last[want[i]])));
+                return;
+            }
+            text.push_back(got[i]);
+        }
+    };
+    PromptCache pc;
+    o.prompt_cache = &pc;
+    const Tokens a = seq(7, 3);
+    const Tokens out1 = generate(m, a, o);
+    CHECK(pc.reused == 0 && pc.model == &m);
+    agree(a, out1, generate(m, a, fresh));
+    Tokens text = a;  // what the call ran: the prompt and its new tokens but the last
+    text.insert(text.end(), out1.begin(), out1.end() - 1);
+    CHECK(pc.tokens == text && pc.kv.size() == std::ssize(text));
+    // The next turn: the earlier text, the last reply token and a new message.
+    Tokens turn = a;
+    turn.insert(turn.end(), out1.begin(), out1.end());
+    turn.insert(turn.end(), {5, 9, 2});
+    const Tokens out2 = generate(m, turn, o);
+    CHECK(pc.reused == std::ssize(text));
+    agree(turn, out2, generate(m, turn, fresh));
+    // The same prompt again: all but its last token.
+    agree(turn, generate(m, turn, o), out2);
+    CHECK(pc.reused == std::ssize(turn) - 1);
+    // A prompt that differs at position 4: positions 0..3; a shorter one: its prefix.
+    Tokens branch = turn;
+    branch[4] = (branch[4] + 1) % m.cfg().vocab_size;
+    agree(branch, generate(m, branch, o), generate(m, branch, fresh));
+    CHECK(pc.reused == 4);
+    const Tokens head(branch.begin(), branch.begin() + 3);
+    agree(head, generate(m, head, o), generate(m, head, fresh));
+    CHECK(pc.reused == 2);
+    // Stopped after two tokens: the prompt and the first (the second never ran).
+    int calls = 0;
+    o.on_token = [&](int64_t) { return ++calls < 2; };
+    const Tokens two = generate(m, turn, o);
+    o.on_token = nullptr;
+    Tokens ran = turn;
+    ran.push_back(two.at(0));
+    CHECK(two.size() == 2 && pc.tokens == ran && pc.kv.size() == std::ssize(ran));
+    // No new tokens: the cache is left as it was.
+    o.max_new_tokens = 0;
+    CHECK(generate(m, a, o).empty() && pc.tokens == ran);
+    o.max_new_tokens = 6;
+    // Another model starts it over.
+    generate(other, turn, o);
+    CHECK(pc.reused == 0 && pc.model == &other);
+    // Editing hooks are refused (the cache untouched); capture-only hooks run on the positions computed.
+    Hooks edit;
+    edit.add("blocks.0.hook_attn_out", [](const std::string&, Tensor& t) { std::ranges::fill(t.data, 0.f); });
+    CHECK_THROWS(generate(m, turn, o, &edit));
+    CHECK(pc.model == &other);
+    generate(m, turn, o);
+    int64_t rows = 0;
+    Hooks cap;
+    cap.add_capture([](const std::string& n) { return n == "blocks.0.hook_resid_pre"; },
+                    [&](const std::string&, Tensor& t) { rows += t.shape[0]; });
+    agree(turn, generate(m, turn, o, &cap), generate(m, turn, fresh));
+    CHECK(pc.reused == std::ssize(turn) - 1 && rows == 1 + 5);  // the prompt's last token, then 5 new ones
+    // With speculation (prompt lookup): the same tokens as plain greedy.
+    o.speculative.draft_tokens = 3;
+    agree(branch, generate(m, branch, o), generate(m, branch, fresh));
+    CHECK(pc.reused == 4);
+    o.speculative.draft_tokens = 0;
+}
+
 static void test_generate_trace(const Model& m) {
     const Tokens prompt = seq(6, 73);
     GenerateOptions o;
@@ -4835,6 +4920,7 @@ static void test_gpu_forward_cached(const Model& m) {
     test_forward_cached_batch(m);
     test_generate(m);
     test_generate_trace(m);
+    test_generate_prompt_cache(m, random_model(m.cfg(), 43));  // the cache's GPU copy moves between calls
     test_generate_batch(m);
     test_generate_speculative(m, random_model(m.cfg(), 43));  // steps of several rows, rolled back on the GPU
     test_runtime_hooks(m, random_model(m.cfg(), 43));
@@ -5183,6 +5269,8 @@ int main(int argc, char** argv) {
             [&] { test_generate_batch(m); });
         run("analysis", "generate: greedy = argmax, stops, hooks, sampling: " + name, [&] { test_generate(m); });
         run("analysis", "generate's trace = full-pass analyses at each step: " + name, [&] { test_generate_trace(m); });
+        run("analysis", "prompt cache: reuses the shared prefix, = a fresh call: " + name,
+            [&] { test_generate_prompt_cache(m, random_model(cfg, 43)); });
         run("analysis", "speculative decoding: greedy = plain greedy, hooks, trace, limits: " + name,
             [&] { test_generate_speculative(m, random_model(cfg, 43)); });
         run("analysis", "decode runtime: hooks see what they see without speculation: " + name,

@@ -252,6 +252,9 @@ struct DecodeRuntime::Impl {
     std::map<int64_t, Tensor> recorded;     // block -> this pass's hook_resid_pre
     int64_t n_layers = 0;
 
+    PromptCache* const pc;  // options' prompt cache, if any
+    bool took = false;      // ... whose keys and values are in `cache` now, to be handed back
+
     const int64_t K;
     const bool speculate;
     const Model* draft;
@@ -278,8 +281,15 @@ struct DecodeRuntime::Impl {
     Impl(const Model& m, const Tokens& t, const GenerateOptions& options, const Hooks* hooks,
          std::vector<TraceStep>* tr)
         : model(m), prompt(t), o(options), user(hooks), trace(tr), sample(o), greedy(sample.greedy()),
-          K(o.speculative.draft_tokens), speculate(K > 0), draft(o.speculative.draft), ctx(t), want(K) {
+          pc(o.prompt_cache), K(o.speculative.draft_tokens), speculate(K > 0), draft(o.speculative.draft), ctx(t),
+          want(K) {
         if (prompt.empty()) throw std::invalid_argument("generate needs a prompt of at least one token");
+        if (pc && user)
+            for (const std::string& n : model.hook_names())
+                if (user->changes(n))
+                    throw std::invalid_argument(
+                        "generate: a prompt cache can't be used with hooks that edit activations (" + n +
+                        "): they change the keys and values");
         stop.insert(o.stop_tokens.begin(), o.stop_tokens.end());
         if (o.stop_at_eos) stop.insert(model.eos_tokens().begin(), model.eos_tokens().end());
         if (o.speculative.stats) *o.speculative.stats = {};
@@ -332,6 +342,18 @@ struct DecodeRuntime::Impl {
         }
     }
 
+    // The cache back to the prompt cache, holding the text so far: positions [0, n) are ctx's first n tokens (a
+    // pass's later rows, for tokens not yet delivered, are dropped).
+    ~Impl() {
+        if (!took) return;
+        try {
+            const int64_t n = std::min<int64_t>(cache.size(), std::ssize(ctx));
+            cache.truncate(n);
+            pc->kv = std::move(cache);
+            pc->tokens.assign(ctx.begin(), ctx.begin() + n);
+        } catch (...) { pc->clear(); }
+    }
+
     void add_trace(Hooks& h) {
         TraceRecorder* r = &*rec;
         h.add_capture([r](const std::string& n) { return r->points.contains(n); },
@@ -364,9 +386,24 @@ struct DecodeRuntime::Impl {
     // What cur's hooks are on hook point n: 0 nothing, 1 captures only, 2 edits.
     char mode(const std::string& n) const { return cur.changes(n) ? 2 : cur.matches(n) ? 1 : 0; }
 
-    // The prompt's pass, the same with and without speculation.
+    // The prompt's pass, the same with and without speculation. With a prompt cache, from its keys and values for the
+    // longest prefix the prompt shares with its text, but at least the last token.
     int64_t first_token() {
-        L = model.forward_cached(prompt, cache, plain_pass(), /*last_only=*/true);
+        int64_t from = 0;
+        if (pc) {
+            if (pc->model != &model) pc->clear();
+            const int64_t most = std::min<int64_t>({std::ssize(pc->tokens), pc->kv.size(), std::ssize(prompt) - 1});
+            while (from < most && pc->tokens[from] == prompt[from]) ++from;
+            cache = std::move(pc->kv);
+            pc->kv = KVCache();
+            pc->tokens.clear();
+            pc->model = &model;
+            pc->reused = from;
+            took = true;
+            cache.truncate(from);
+        }
+        L = model.forward_cached(from ? Tokens(prompt.begin() + from, prompt.end()) : prompt, cache, plain_pass(),
+                                 /*last_only=*/true);
         V = L.shape[1];
         if (speculate) stats.steps = 1;
         const int64_t t = sample(L.data);

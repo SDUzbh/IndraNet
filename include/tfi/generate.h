@@ -69,6 +69,28 @@ struct SpeculativeOptions {
     SpeculativeStats* stats = nullptr;  // if set, receives the counts
 };
 
+// The keys and values of a text generate() ran, for later calls to start from (GenerateOptions::prompt_cache). A call
+// takes the positions of the longest prefix its prompt shares with `tokens` from the cache and computes only the rest
+// (at least the prompt's last token, whose logits choose the first new one); afterwards the cache holds that call's
+// text, the prompt and the new tokens. So a conversation's next turn (the earlier turns, the reply and a new message)
+// or another question after the same system prompt runs only what is new. The cache moves into the call and back,
+// GPU copy included, without copying. The output is a fresh call's, up to rounding: the reused positions were computed
+// in other passes. For one model: a call with another model starts the cache over. Not with hooks that edit
+// activations (they change keys and values: generate() refuses them); capture-only hooks see the positions computed,
+// not the reused ones. One call at a time.
+struct PromptCache {
+    Tokens tokens;  // the text whose keys and values kv holds, a position each
+    KVCache kv;
+    int64_t reused = 0;            // positions the last call took from the cache
+    const Model* model = nullptr;  // whose keys and values they are
+    void clear() {
+        tokens.clear();
+        kv.clear();
+        reused = 0;
+        model = nullptr;
+    }
+};
+
 struct GenerateOptions {
     int64_t max_new_tokens = 32;
     double temperature = 0;  // 0: greedy, the most likely token (the lowest id among equal ones)
@@ -85,6 +107,9 @@ struct GenerateOptions {
     // If set, receives the KV cache's KVCache::clamped() once generation stops (generate_batch: summed over the
     // sequences): with an fp16 model, keys and values cut off at fp16's limit, which can change the output.
     int64_t* kv_clamped = nullptr;
+    // If set, the prompt starts from this cache's keys and values where it shares them, and leaves it holding this
+    // call's text (PromptCache). generate() only.
+    PromptCache* prompt_cache = nullptr;
 };
 
 // Picks the next token from a row of logits by GenerateOptions' rules: temperature, then top_k, then
@@ -138,7 +163,8 @@ Tokens generate(const Model& model, const Tokens& prompt, const GenerateOptions&
 // read once for all of them. A sequence that stops sits the later steps out. hooks (empty, or one per
 // sequence, each may be null) apply to their sequence only: each sees its own rows of every activation
 // (hook_pattern is not available). traces: one per sequence, as generate()'s trace (attention_top must
-// be 0). options.on_token and options.speculative are not used: give generate() one sequence for them.
+// be 0). options.on_token, options.speculative and options.prompt_cache are not used: give generate() one sequence for
+// them.
 std::vector<Tokens> generate_batch(const Model& model, const std::vector<Tokens>& prompts,
                                    const GenerateOptions& options = {}, const std::vector<const Hooks*>& hooks = {},
                                    std::vector<std::vector<TraceStep>>* traces = nullptr);

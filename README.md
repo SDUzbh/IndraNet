@@ -146,7 +146,7 @@ hook names.
 |---|---|
 | [docs/api.md](docs/api.md) | Building (make, CMake, devices), the C++ API and the Python bindings in full |
 | [docs/models.md](docs/models.md) | fp16 and bf16 files, memory mapping, the Hugging Face converter, the tokenizer |
-| [docs/generation.md](docs/generation.md) | Sampling, the KV cache, `--trace`, batches, speculative decoding |
+| [docs/generation.md](docs/generation.md) | Sampling, the KV cache, `--trace`, batches, the prompt cache, speculative decoding |
 | [docs/methods.md](docs/methods.md) | The full induction walkthrough, attribution and mixed patching, every method's limits |
 | [docs/testing.md](docs/testing.md) | What the tests check (golden tests against PyTorch and transformers), test groups, CI, releases |
 
