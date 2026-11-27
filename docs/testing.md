@@ -32,9 +32,9 @@
   checked for 14 model types, including post-norm and every activation, with hooks on both sides.
   On the same 14 types, batched GPU gradients must match one CPU backward pass per sequence at
   every hook point they report. Attribution and mixed patching on the GPU must match the CPU for
-  any batch size and keep the CPU tests' invariants. Attention on the GPU (both kernels) and its
-  backward pass must match the CPU's, also on sequences longer than the kernels' tiles, with head
-  sizes from 4 to 160. In GPU-only mode a single pass must match the CPU at every activation it
+  any batch size and keep the CPU tests' invariants. Attention on the GPU (every kernel, the neural
+  accelerators' included where the GPU has them) and its backward pass (likewise) must match the CPU's,
+  also on sequences longer than the kernels' tiles, with head sizes from 4 to 160. In GPU-only mode a single pass must match the CPU at every activation it
   caches, with hooks that edit every activation (the pattern too) and capture hooks among them.
 - **fp16 weights** (also `tests/unit.cpp`): the fp16 conversion must round trip every fp16 value,
   round to nearest-even and match the hardware's on arm64. A model with fp16 weights must compute

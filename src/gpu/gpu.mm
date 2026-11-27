@@ -994,6 +994,159 @@ kernel void attn_tensor_kt(device MT* q [[buffer(0)]], device MT* k [[buffer(1)]
 }
 template [[host_name("attn_tensor_k")]] kernel void attn_tensor_kt<float>(device float*, device float*, device float*, device float*, device float*, device float*, device const uint*, device const float*, constant AttnArgs&, device float*, device const uint*, uint, uint);
 template [[host_name("attn_tensor_hk")]] kernel void attn_tensor_kt<half>(device half*, device half*, device half*, device float*, device half*, device half*, device const uint*, device const float*, constant AttnArgs&, device float*, device const uint*, uint, uint);
+
+// Attention's backward pass on the neural accelerators, as attn_bwd_dq_k and attn_bwd_dkv_k (the scores recomputed
+// from q, k and the forward pass's lse; delta = dz . z from attn_delta_k), float products, for attn_tensor_kt's
+// blocks of a segment's rows with no earlier positions (segments start at position 0). Each simdgroup takes 16 of
+// its block's rows on its own. dq: for its 16 query rows of head h, over tiles of 32 keys, S = Q K^T and
+// dP = dZ V^T, then dQ += dS K. dk, dv: for its 16 key rows of kv head g, over the query heads that share it and
+// tiles of 32 of the segment's queries that attend to those keys, S^T = K Q^T and dP^T = V dZ^T, then
+// dV += P^T dZ and dK += dS^T Q. A product writes its cooperative destination, so each tile's is added here.
+
+// Whether the query at position qpos attends to the key at kpos.
+static bool attn_sees(uint qpos, uint kpos, uint window) {
+    return kpos <= qpos && (window == 0 || qpos - kpos < window);
+}
+
+// (p, dscore) from a raw score q . k, dp = dz . v, the row's lse and delta: as attn_score and attn_bwd_dq_k.
+static float2 attn_p_ds(float raw, float dp, float L, float dl, constant AttnArgs& a, float slope, uint qpos,
+                        uint kpos) {
+    float s = raw * a.scale, dcap = 1.f;
+    if (a.cap != 0.f) {
+        const float th = vtanh(s / a.cap);
+        s = a.cap * th;
+        dcap = 1.f - th * th;
+    }
+    if (slope != 0.f) s += -slope * float(qpos - kpos);
+    const float p = vexp(s - L);
+    return float2(p, p * (dp - dl) * dcap * a.scale);
+}
+
+kernel void attn_bwd_dq_tk(device float* q [[buffer(0)]], device float* k [[buffer(1)]],
+                           device float* v [[buffer(2)]], device float* dz [[buffer(3)]],
+                           device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],
+                           device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]],
+                           constant AttnArgs& a [[buffer(8)]], device float* dq [[buffer(9)]],
+                           uint tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    using ext = dextents<int32_t, 2>;
+    const int D = TD;
+    const uint b = tgid / a.H, h = tgid % a.H, g = h / (a.H / a.Hkv);
+    const uint off = blk[4 * b], nq = blk[4 * b + 1], seg = blk[4 * b + 3];
+    if (sg * SQ >= nq) return;
+    const uint r0 = off + sg * SQ, nr = min(uint(SQ), nq - sg * SQ);  // this simdgroup's rows
+    const uint pos0 = r0 - seg, last = pos0 + nr - 1;                  // and their positions
+    const uint lo = (a.window != 0 && pos0 + 1 > a.window) ? pos0 + 1 - a.window : 0;
+    const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+    const array<int32_t, 2> qs{1, int(a.H * D)}, ks{1, int(a.Hkv * D)};
+    auto tQ = dtensor<float>(q + (ulong(r0) * a.H + h) * D, ext(D, int(nr)), qs);
+    auto tG = dtensor<float>(dz + (ulong(r0) * a.H + h) * D, ext(D, int(nr)), qs);
+    // The segment's keys up to the last row's.
+    auto tK = dtensor<float>(k + (ulong(seg) * a.Hkv + g) * D, ext(D, int(last + 1)), ks);
+    auto tV = dtensor<float>(v + (ulong(seg) * a.Hkv + g) * D, ext(D, int(last + 1)), ks);
+    constexpr auto d1 = matmul2d_descriptor(SQ, BK, TD, false, true);   // S = Q K^T, dP = dZ V^T
+    constexpr auto d2 = matmul2d_descriptor(SQ, TD, BK, false, false);  // dQ += dS K
+    matmul2d<d1, execution_simdgroup> op1;
+    matmul2d<d2, execution_simdgroup> op2;
+    auto sK = tK.slice(0, 0);
+    auto sV = tV.slice(0, 0);
+    using SIn = decltype(op2.template get_left_input_cooperative_tensor<float, float, float>());
+    auto acc = op2.template get_destination_cooperative_tensor<SIn, decltype(sK), float>();
+    for (int i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.f;
+    for (uint j0 = lo; j0 <= last; j0 += BK) {
+        sK = tK.slice(0, int(j0));
+        sV = tV.slice(0, int(j0));
+        auto S = op1.template get_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        auto P = op1.template get_destination_cooperative_tensor<decltype(tQ), decltype(sK), float>();
+        for (int i = 0; i < S.get_capacity(); ++i) S[i] = P[i] = 0.f;
+        op1.run(tQ, sK, S);
+        op1.run(tG, sV, P);
+        for (int i = 0; i < S.get_capacity(); ++i) {
+            if (!S.is_valid_element(i)) continue;
+            const auto idx = S.get_multidimensional_index(i);
+            const uint j = j0 + idx[0], rr = idx[1], pos = pos0 + rr;
+            float ds = 0.f;
+            if (rr < nr && attn_sees(pos, j, a.window)) {
+                const ulong row = ulong(r0 + rr) * a.H + h;
+                ds = attn_p_ds(S[i], P[i], lse[row], delta[row], a, slope, pos, j).y;
+            }
+            S[i] = ds;
+        }
+        auto dS = op2.template get_left_input_cooperative_tensor<float, float, float>(S);
+        auto t = op2.template get_destination_cooperative_tensor<SIn, decltype(sK), float>();
+        for (int i = 0; i < t.get_capacity(); ++i) t[i] = 0.f;
+        op2.run(dS, sK, t);
+        for (int i = 0; i < acc.get_capacity(); ++i) acc[i] += t[i];
+    }
+    acc.store(dtensor<float>(dq + (ulong(r0) * a.H + h) * D, ext(D, int(nr)), qs));
+}
+
+kernel void attn_bwd_dkv_tk(device float* q [[buffer(0)]], device float* k [[buffer(1)]],
+                            device float* v [[buffer(2)]], device float* dz [[buffer(3)]],
+                            device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],
+                            device const uint* blk [[buffer(6)]], device const float* slopes [[buffer(7)]],
+                            constant AttnArgs& a [[buffer(8)]], device float* dk [[buffer(9)]],
+                            device float* dv [[buffer(10)]], device const uint* meta [[buffer(11)]],
+                            uint tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    using ext = dextents<int32_t, 2>;
+    const int D = TD;
+    const uint b = tgid / a.Hkv, g = tgid % a.Hkv, rep = a.H / a.Hkv;
+    const uint off = blk[4 * b], nq = blk[4 * b + 1], seg = blk[4 * b + 3];
+    if (sg * SQ >= nq) return;
+    const uint r0 = off + sg * SQ, nr = min(uint(SQ), nq - sg * SQ);  // this simdgroup's key rows
+    const uint pos0 = r0 - seg, last = pos0 + nr - 1;                  // and their positions
+    uint hi = meta[4 * seg + 3];  // queries at positions pos0..hi-1 attend to some of these keys
+    if (a.window != 0) hi = min(hi, last + a.window);
+    const array<int32_t, 2> qs{1, int(a.H * D)}, ks{1, int(a.Hkv * D)};
+    auto tK = dtensor<float>(k + (ulong(r0) * a.Hkv + g) * D, ext(D, int(nr)), ks);
+    auto tV = dtensor<float>(v + (ulong(r0) * a.Hkv + g) * D, ext(D, int(nr)), ks);
+    constexpr auto d1 = matmul2d_descriptor(SQ, BK, TD, false, true);   // S^T = K Q^T, dP^T = V dZ^T
+    constexpr auto d2 = matmul2d_descriptor(SQ, TD, BK, false, false);  // dV += P^T dZ, dK += dS^T Q
+    matmul2d<d1, execution_simdgroup> op1;
+    matmul2d<d2, execution_simdgroup> op2;
+    auto tQ = dtensor<float>(q + ulong(seg) * a.H * D, ext(D, int(hi)), qs);
+    auto sQ = tQ.slice(0, 0);
+    using SIn = decltype(op2.template get_left_input_cooperative_tensor<float, float, float>());
+    auto aK = op2.template get_destination_cooperative_tensor<SIn, decltype(sQ), float>();
+    auto aV = op2.template get_destination_cooperative_tensor<SIn, decltype(sQ), float>();
+    for (int i = 0; i < aK.get_capacity(); ++i) aK[i] = aV[i] = 0.f;
+    for (uint h = g * rep; h < (g + 1) * rep; ++h) {
+        const float slope = a.has_slopes != 0 ? slopes[h] : 0.f;
+        tQ = dtensor<float>(q + (ulong(seg) * a.H + h) * D, ext(D, int(hi)), qs);
+        auto tG = dtensor<float>(dz + (ulong(seg) * a.H + h) * D, ext(D, int(hi)), qs);
+        for (uint i0 = pos0; i0 < hi; i0 += BK) {
+            sQ = tQ.slice(0, int(i0));
+            auto sG = tG.slice(0, int(i0));
+            auto S = op1.template get_destination_cooperative_tensor<decltype(tK), decltype(sQ), float>();
+            auto P = op1.template get_destination_cooperative_tensor<decltype(tK), decltype(sQ), float>();
+            for (int i = 0; i < S.get_capacity(); ++i) S[i] = P[i] = 0.f;
+            op1.run(tK, sQ, S);
+            op1.run(tV, sG, P);
+            for (int i = 0; i < S.get_capacity(); ++i) {
+                if (!S.is_valid_element(i)) continue;
+                const auto idx = S.get_multidimensional_index(i);
+                const uint pos = i0 + idx[0], kr = idx[1], kpos = pos0 + kr;
+                float2 f = 0.f;
+                if (kr < nr && pos < hi && attn_sees(pos, kpos, a.window)) {
+                    const ulong row = ulong(seg + pos) * a.H + h;
+                    f = attn_p_ds(S[i], P[i], lse[row], delta[row], a, slope, pos, kpos);
+                }
+                S[i] = f.x;
+                P[i] = f.y;
+            }
+            auto Pt = op2.template get_left_input_cooperative_tensor<float, float, float>(S);
+            auto t = op2.template get_destination_cooperative_tensor<SIn, decltype(sQ), float>();
+            for (int i = 0; i < t.get_capacity(); ++i) t[i] = 0.f;
+            op2.run(Pt, sG, t);
+            for (int i = 0; i < aV.get_capacity(); ++i) aV[i] += t[i];
+            auto dSt = op2.template get_left_input_cooperative_tensor<float, float, float>(P);
+            for (int i = 0; i < t.get_capacity(); ++i) t[i] = 0.f;
+            op2.run(dSt, sQ, t);
+            for (int i = 0; i < aK.get_capacity(); ++i) aK[i] += t[i];
+        }
+    }
+    aK.store(dtensor<float>(dk + (ulong(r0) * a.Hkv + g) * D, ext(D, int(nr)), ks));
+    aV.store(dtensor<float>(dv + (ulong(r0) * a.Hkv + g) * D, ext(D, int(nr)), ks));
+}
 )";
 // kKernelSource up to here holds the math helpers (vexp, vtanh, ...) that kTensorKernelSource uses too.
 const char* const kMathEnd = "// GpuAct order";
@@ -1157,17 +1310,25 @@ struct Gpu::Impl {
         return p;
     }
 
-    // The neural accelerators' attention kernels (kTensorKernelSource) for a head size: [0] float products, [1]
-    // half; nil where they are not available (not an Apple10 GPU, another head size, or a compile failure: then
-    // the tiled kernel above is used).
+    // The neural accelerators' attention kernels (kTensorKernelSource) for a head size; nil where they are not
+    // available (not an Apple10 GPU, another head size, or a compile failure: then the tiled kernel above, or
+    // the backward pass's attn_bwd_dq_k and attn_bwd_dkv_k, are used).
     std::mutex attn_tensor_mutex;
-    std::map<int64_t, std::array<id<MTLComputePipelineState>, 2>> attn_tensor;
+    std::map<int64_t, std::array<id<MTLComputePipelineState>, 4>> attn_tensor;
     id<MTLComputePipelineState> attn_tensor_kernel(int64_t D, bool half_math) {
+        return attn_tensor_pipeline(D, half_math ? 1 : 0);
+    }
+    // The backward pass's kernels: dq, then dk and dv.
+    std::pair<id<MTLComputePipelineState>, id<MTLComputePipelineState>> attn_tensor_bwd(int64_t D) {
+        return {attn_tensor_pipeline(D, 2), attn_tensor_pipeline(D, 3)};
+    }
+    // [0] forward with float products, [1] half, [2] backward dq, [3] backward dk, dv.
+    id<MTLComputePipelineState> attn_tensor_pipeline(int64_t D, int which) {
         if (D != 32 && D != 64 && D != 96 && D != 128) return nil;
         std::scoped_lock lock(attn_tensor_mutex);
         auto it = attn_tensor.find(D);
         if (it == attn_tensor.end()) {
-            std::array<id<MTLComputePipelineState>, 2> p{nil, nil};
+            std::array<id<MTLComputePipelineState>, 4> p{nil, nil, nil, nil};
             if ([device supportsFamily:MTLGPUFamilyApple10]) {
                 @autoreleasepool {
                     MTLCompileOptions* opt = [MTLCompileOptions new];
@@ -1178,8 +1339,8 @@ struct Gpu::Impl {
                                             base.substr(0, base.find(kMathEnd)) + kTensorKernelSource;
                     NSError* err = nil;
                     id<MTLLibrary> l = [device newLibraryWithSource:@(src.c_str()) options:opt error:&err];
-                    const char* names[2] = {"attn_tensor_k", "attn_tensor_hk"};
-                    for (int i = 0; i < 2 && l; ++i) {
+                    const char* names[4] = {"attn_tensor_k", "attn_tensor_hk", "attn_bwd_dq_tk", "attn_bwd_dkv_tk"};
+                    for (int i = 0; i < 4 && l; ++i) {
                         id<MTLFunction> f = [l newFunctionWithName:@(names[i])];
                         p[i] = f ? [device newComputePipelineStateWithFunction:f error:&err] : nil;
                         if (p[i] && p[i].maxTotalThreadsPerThreadgroup < 256) p[i] = nil;
@@ -1188,7 +1349,7 @@ struct Gpu::Impl {
             }
             it = attn_tensor.emplace(D, p).first;
         }
-        return it->second[half_math ? 1 : 0];
+        return it->second[which];
     }
 
     void load_kernels() {
@@ -1256,6 +1417,13 @@ std::unique_ptr<Gpu> Gpu::create() {
 
 bool Gpu::attention_tensor_available(int64_t D) { return impl_->attn_tensor_kernel(D, false) != nil; }
 bool gpu_attention_tensor_available(Gpu& gpu, int64_t D) { return gpu.attention_tensor_available(D); }
+bool Gpu::attention_backward_tensor_available(int64_t D) {
+    const auto [dq, dkv] = impl_->attn_tensor_bwd(D);
+    return dq != nil && dkv != nil;
+}
+bool gpu_attention_backward_accelerated(Gpu& gpu, int64_t D) {
+    return g_attn_tensor.load() && gpu.attention_backward_tensor_available(D);
+}
 
 Tensor Gpu::linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16) {
     return std::move(linear_many(x, {&W}, {b}, fp16)[0]);
@@ -1955,6 +2123,39 @@ struct Gpu::Seq::Impl {
                 }
                 const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u,   u32(A.window), A.has_slopes ? 1u : 0u,
                                     0u,       0u,         A.scale,  A.cap};
+                // The neural accelerators where available, on the forward pass's blocks of rows.
+                using Pipes = std::pair<id<MTLComputePipelineState>, id<MTLComputePipelineState>>;
+                const auto [dq_k, dkv_k] = op.i >= 0 && A.blocks > 0 && A.block_rows % 16 == 0 && g_attn_tensor.load()
+                                               ? g.attn_tensor_bwd(A.D)
+                                               : Pipes{};
+                if (dq_k && dkv_k) {
+                    need(op.i, 4 * A.blocks);
+                    const NSUInteger threads = NSUInteger(2 * A.block_rows);  // a simdgroup per 16 rows
+                    for (int pass = 0; pass < 2; ++pass) {
+                        id<MTLComputeCommandEncoder> e = compute();
+                        [e setComputePipelineState:pass == 0 ? dq_k : dkv_k];
+                        [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
+                        [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
+                        [e setBuffer:slot(op.d).buf offset:0 atIndex:2];
+                        [e setBuffer:slot(op.e).buf offset:0 atIndex:3];
+                        [e setBuffer:slot(op.f).buf offset:0 atIndex:4];
+                        [e setBuffer:slot(op.more[0]).buf offset:0 atIndex:5];
+                        [e setBuffer:slot(op.i).buf offset:0 atIndex:6];
+                        [e setBuffer:slot(A.has_slopes ? op.h : op.g).buf offset:0 atIndex:7];
+                        [e setBytes:&args length:sizeof args atIndex:8];
+                        if (pass == 0) {
+                            [e setBuffer:slot(op.more[1]).buf offset:0 atIndex:9];
+                        } else {
+                            [e setBuffer:slot(op.more[2]).buf offset:0 atIndex:9];
+                            [e setBuffer:slot(op.more[3]).buf offset:0 atIndex:10];
+                            [e setBuffer:slot(op.g).buf offset:0 atIndex:11];
+                        }
+                        const NSUInteger groups = NSUInteger(u32(A.blocks * (pass == 0 ? A.H : A.Hkv)));
+                        [e dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+                    }
+                    break;
+                }
                 auto common = [&](id<MTLComputeCommandEncoder> e) {
                     [e setBuffer:slot(op.a).buf offset:0 atIndex:0];
                     [e setBuffer:slot(op.b).buf offset:0 atIndex:1];
@@ -2275,7 +2476,7 @@ void Gpu::Seq::attention_apply(int P, int v, int z, const AttnShape& shape) {
 
 void Gpu::Seq::attention_backward(const AttnSlots& in, int delta, int dq, int dk, int dv, const AttnShape& shape) {
     for (int o : {delta, dq, dk, dv})
-        for (int i : {in.q, in.k, in.v, in.z, in.dz, in.lse, in.meta, in.slopes})
+        for (int i : {in.q, in.k, in.v, in.z, in.dz, in.lse, in.meta, in.slopes, in.blk})
             if (o == i) throw std::invalid_argument("Gpu::Seq: attention's backward pass writes to slots of its own");
     if (delta == dq || delta == dk || delta == dv || dq == dk || dq == dv || dk == dv)
         throw std::invalid_argument("Gpu::Seq: attention's backward pass writes four different slots");
@@ -2293,6 +2494,7 @@ void Gpu::Seq::attention_backward(const AttnSlots& in, int delta, int dq, int dk
     op.more[1] = dq;
     op.more[2] = dk;
     op.more[3] = dv;
+    op.i = in.blk;
     op.attn = shape;
     impl_->ops.push_back(op);
 }

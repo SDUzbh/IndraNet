@@ -43,8 +43,9 @@ class Gpu {
     // half-precision W is then multiplied as it is, exactly (each fp16 value is an fp32 value).
     Tensor linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16 = false);
 
-    // (gpu_attention_tensor_available)
+    // (gpu_attention_tensor_available, gpu_attention_backward_accelerated)
     bool attention_tensor_available(int64_t D);
+    bool attention_backward_tensor_available(int64_t D);
 
     // linear(x, Ws[i], bs[i]) for every i in one GPU submission: x is copied to the GPU once and
     // the thread waits once, instead of once per weight. Results are identical to separate
@@ -131,9 +132,11 @@ class Gpu::Seq {
                    int blk = 0, int lse = -1, int kbase = -1);
     // attention()'s backward pass with no earlier positions (shape.Tp = 0): from dz (rows, H D) and
     // the forward pass's q, k, v, z and lse, dq into `dq` (rows, H D), dk and dv into `dk`, `dv`
-    // (rows, Hkv D); `delta` is scratch (rows, H).
+    // (rows, Hkv D); `delta` is scratch (rows, H). With blk >= 0, the forward pass's blocks (attention()'s
+    // `blk`, shape.blocks of them) let it run on the neural accelerators where they are available.
     struct AttnSlots {
         int q, k, v, z, dz, lse, meta, slopes;
+        int blk = -1;
     };
     void attention_backward(const AttnSlots& in, int delta, int dq, int dk, int dv, const AttnShape& shape);
     // One whole sequence (shape.rows rows at positions 0..rows-1, Tp = 0): the attention pattern P
@@ -255,6 +258,9 @@ void set_gpu_min_work(double multiply_adds);
 void set_gpu_attention_tensor(bool on);
 // Whether `gpu` has them, for a head size D.
 bool gpu_attention_tensor_available(Gpu& gpu, int64_t D);
+// Whether attention's backward pass (Gpu::Seq::attention_backward) for head size D runs on them: available, and
+// not turned off with set_gpu_attention_tensor.
+bool gpu_attention_backward_accelerated(Gpu& gpu, int64_t D);
 
 }  // namespace detail
 }  // namespace tfi

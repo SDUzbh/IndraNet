@@ -2522,8 +2522,8 @@ struct GpuBlocks {
         s.reserve(dq, R * H * D);
         s.reserve(dk, R * Hkv * D);
         s.reserve(kDV, R * Hkv * D);
-        s.attention_backward({q, k, a.v, a.z, dz, a.lse, kMeta, shape.has_slopes ? kSlopes : kMeta}, kDelta, dq, dk,
-                             kDV, shape);
+        s.attention_backward({q, k, a.v, a.z, dz, a.lse, kMeta, shape.has_slopes ? kSlopes : kMeta, kBlocks}, kDelta,
+                             dq, dk, kDV, shape);
         if (rope) {
             const detail::RopeTable t = detail::rope_table(c);
             const int nq = c.qk_norm ? kDQ1 : kDQ, nk = c.qk_norm ? kDK1 : kDK;
@@ -2907,7 +2907,14 @@ std::vector<ActivationCache> Model::gradients_rows(const Tensor& x0, const detai
 
     detail::Gpu::Seq s(*batch.gpu);
     GpuBlocks gb{*this, s, R, d};
-    const bool gpu_attention = detail::gpu_only() || (g_gpu_attention.load() && gpu_attention_fits(layer_cfgs_, 0));
+    // Attention and its backward pass on the GPU in GPU-only mode, and in both mode too where every layer's run on
+    // the neural accelerators: then faster than the CPU's backward pass (M5 Pro, 0.9B model, attribution patching
+    // with 4 steps: 3.0 s against 5.0 at 1024 tokens, 8.3 against 23.4 at 2048) and no pattern is kept per segment.
+    const bool accelerated = g_attn_tiled.load() && std::ranges::all_of(layer_cfgs_, [&](const ModelConfig& c) {
+                                 return detail::gpu_attention_backward_accelerated(*batch.gpu, c.head_dim());
+                             });
+    const bool gpu_attention =
+        detail::gpu_only() || ((g_gpu_attention.load() || accelerated) && gpu_attention_fits(layer_cfgs_, 0));
     if (gpu_attention) gb.write_rows(batch, g_attn_tiled.load());
     std::vector<std::pair<int, int>> qk_slots(L);  // with gpu_attention: each layer's q, k after qk()
     auto use_attn_slots = [&](int64_t l) {

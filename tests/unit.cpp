@@ -5445,12 +5445,19 @@ int main(int argc, char** argv) {
     run("gpu", "single passes on the GPU in GPU-only mode: long sequences (macOS)", [&] {
         for (const auto& [name, cfg] : long_attention_configs()) test_gpu_single_pass(random_model(cfg, 54), 48);
     });
-    run("gpu", "attention + its backward on the GPU: long sequences, gradients = run_with_gradients (macOS)", [&] {
-        detail::set_gpu_attention(true);
-        for (const auto& [name, cfg] : long_attention_configs())
-            test_gpu_gradients(random_model(cfg, 52), {48, 17, 33, 1});
-        detail::set_gpu_attention(false);
-    });
+    run("gpu",
+        "attention + its backward on the GPU: long sequences, gradients = run_with_gradients, neural accelerators "
+        "on and off (macOS)",
+        [&] {
+            detail::set_gpu_attention(true);
+            for (const bool tensor : {true, false}) {
+                detail::set_gpu_attention_tensor(tensor);
+                for (const auto& [name, cfg] : long_attention_configs())
+                    test_gpu_gradients(random_model(cfg, 52), {48, 17, 33, 1});
+            }
+            detail::set_gpu_attention_tensor(true);
+            detail::set_gpu_attention(false);
+        });
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu", "GPU batched gradients = run_with_gradients (macOS): " + name,
             [&] { test_gpu_gradients(random_model(cfg, 44)); });

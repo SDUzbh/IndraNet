@@ -230,7 +230,8 @@ class Model {
                               const Hooks* hooks = nullptr) const;
     // Internal, for attribution patching (macOS, needs batch.gpu): forward and backward passes of
     // several whole sequences stacked as in forward_rows (every segment starts at position 0), from
-    // `x0`, the (rows, d_model) input to block 0, everything but attention on the GPU.
+    // `x0`, the (rows, d_model) input to block 0, on the GPU: attention too in GPU-only mode, or where it and
+    // its backward pass run on the neural accelerators (Apple10 GPUs, e.g. M5); otherwise attention on the CPU.
     // `dmetric(s, logits)` gives dF/d(logits) for segment s's scalar F, from the logits (1, vocab) of
     // its last row. Returns each segment's gradients, as run_with_gradients would, for the hook points
     // the filter accepts among hook_embed, hook_resid_pre / _mid / _post, hook_attn_out, hook_mlp_out
