@@ -82,7 +82,8 @@ class Weight {
 };
 
 // y = x @ W^T + b (W (out, in), as linear() above) with a model weight. A half-precision W is
-// converted to float32 in blocks of rows as the multiply goes, so the full float32 copy never exists.
+// converted to float32 in blocks of rows as the multiply goes, up to 16M values (64 MB) at a time, in a
+// buffer each calling thread keeps for its next call.
 // With 1-16 rows of x (a generated token, a speculative step), it multiplies straight from the weights
 // instead, split across threads; float32 and fp16 weights take the same steps, so fp16 gives what float32
 // weights holding the same rounded values give, bit for bit, and each row's output is the same whatever

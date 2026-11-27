@@ -23,14 +23,12 @@ namespace tfi {
 
 namespace {
 
-// Converted half-precision blocks hold about this many floats (1 MB), per thread.
-constexpr int64_t kBlockFloats = int64_t(1) << 18;
-
-std::vector<float>& block_buffer(int64_t floats) {
-    thread_local std::vector<float> buf;
-    if (std::ssize(buf) < floats) buf.resize(static_cast<size_t>(floats));
-    return buf;
-}
+// A half-precision weight multiplied by many rows (a prompt) is converted to float32 in blocks of up to
+// this many floats (64 MB, kept per thread), each block then one library multiply. The blocks are this
+// large because the library is slow on narrow ones: on an M5 Pro with 4096 rows, 32-row blocks of a
+// 2048x8192 weight took 2.9 times as long as float32 weights, 1024-row ones 1.01. Most weights fit
+// whole; the conversion costs about as much as reading the weights once more.
+constexpr int64_t kBlockFloats = int64_t(1) << 24;
 
 // Up to this many rows, a linear layer multiplies straight from the weights (direct_rows): for one row
 // (a generated token) converting fp16 weights to float32 first would cost more than the multiply, and
@@ -40,7 +38,7 @@ constexpr int64_t kDirectRows = 4;
 // the weights in turn, chunk by chunk, so that a chunk read from memory for the first group is still in
 // the cache for the others. Each row's sums are the same instructions whatever the group, so a row's
 // output doesn't depend on how many rows the call has. Measured on an M5 Pro (8192x2048, 16 rows): 0.98 ms
-// against the library's 1.44 on float32 weights, 0.69 against 2.4 on fp16 (converted blocks).
+// against the library's 1.44 on float32 weights, 0.69 against 2.0 on fp16 (converted blocks).
 constexpr int64_t kDirectMaxRows = 16;
 
 // sum[r] += x[r][k] * w[k] for k in [k0, in), one statement each for the multiply and the add (a
@@ -171,6 +169,17 @@ void run_row_chunks(int64_t total, int64_t in, F&& rows) {
     (void)chunks;  // elsewhere one thread: the chunks run in order, as one
 #endif
     rows(0, total);
+}
+
+// Rows j..j+n-1 of the fp16 weight W as float32, in a per-thread buffer (valid until the next call on
+// this thread), converted side by side.
+const float* converted_rows(const Weight& W, int64_t j, int64_t n) {
+    thread_local std::vector<float> buf;
+    const int64_t in = W.shape[1];
+    if (std::ssize(buf) < n * in) buf.resize(static_cast<size_t>(n * in));
+    float* dst = buf.data();
+    run_row_chunks(n, in, [&](int64_t a, int64_t b) { W.read_rows(j + a, j + b, dst + a * in); });
+    return dst;
 }
 
 // Several weights reading the same x rows (1..kDirectMaxRows): their rows taken as one range, so that a
@@ -343,11 +352,10 @@ Tensor linear(const Tensor& x, const Weight& W, const Weight* b) {
             detail::gemm(/*trans_b=*/true, n_rows, out, in, x.ptr(), in, W.f32_data(), in, y.ptr(), out);
         } else {
             const int64_t block = std::min(out, std::max<int64_t>(1, kBlockFloats / in));
-            std::vector<float>& buf = block_buffer(block * in);
             for (int64_t j = 0; j < out; j += block) {
                 const int64_t nb = std::min(block, out - j);
-                W.read_rows(j, j + nb, buf.data());
-                detail::gemm(/*trans_b=*/true, n_rows, nb, in, x.ptr(), in, buf.data(), in, y.ptr() + j, out);
+                detail::gemm(/*trans_b=*/true, n_rows, nb, in, x.ptr(), in, converted_rows(W, j, nb), in, y.ptr() + j,
+                             out);
             }
         }
     }
@@ -404,11 +412,10 @@ Tensor matmul(const Tensor& A, const Weight& W) {
         return C;
     }
     const int64_t block = std::min(n, std::max<int64_t>(1, kBlockFloats / k));
-    std::vector<float>& buf = block_buffer(block * k);
     for (int64_t j = 0; j < n; j += block) {
         const int64_t nb = std::min(block, n - j);
-        W.read_rows(j, j + nb, buf.data());
-        detail::gemm(/*trans_b=*/false, m, k, nb, A.ptr() + j, n, buf.data(), k, C.ptr(), k, /*accumulate=*/j > 0);
+        detail::gemm(/*trans_b=*/false, m, k, nb, A.ptr() + j, n, converted_rows(W, j, nb), k, C.ptr(), k,
+                     /*accumulate=*/j > 0);
     }
     return C;
 }
