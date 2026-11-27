@@ -188,6 +188,13 @@ def test_cli_commands(tools, tmp_path, opts):
         assert expected in r.stdout, f"{cmd}: {r.stdout}"
     bad = subprocess.run([str(tools / "indra"), "dla", str(path), "--tokens", toks], capture_output=True, text=True)
     assert bad.returncode == 1 and "missing --target" in bad.stderr
+    # An option the command doesn't read is an error, not silently ignored.
+    typo = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
+                           "--methdo", "attribution"], capture_output=True, text=True)
+    assert typo.returncode == 1 and "patch has no option --methdo (did you mean --method?)" in typo.stderr
+    other = subprocess.run([str(tools / "indra"), "run", str(path), "--tokens", toks, "--mode", "zero"],
+                           capture_output=True, text=True)
+    assert other.returncode == 1 and "run has no option --mode (it is an option of ablate)" in other.stderr
     zero = subprocess.run([str(tools / "indra"), "ablate", str(path), "--tokens", toks, "--mode", "zero"],
                           capture_output=True, text=True)
     assert zero.returncode == 0 and "zero-ablated" in zero.stdout

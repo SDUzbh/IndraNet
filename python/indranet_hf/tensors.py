@@ -6,6 +6,7 @@ slicing and transposing them needs no conversion; values are converted only wher
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -106,7 +107,10 @@ def write(path: Path, tensors: Dict[str, Tuple[str, Tuple[int, ...], "callable"]
     The data starts at a multiple of ``align`` bytes from the file's start, and so does every 2-D
     tensor (a matrix): small ``__padding<k>`` U8 tensors fill the gaps, since safetensors allows no
     holes in the data. Readers that know the convention skip them; to others they are harmless extra
-    tensors. ``align=1`` writes the tensors back to back."""
+    tensors. ``align=1`` writes the tensors back to back.
+
+    The file is written next to ``path`` under a temporary name and renamed to ``path`` only when it is
+    complete, so a failure or an interruption part way leaves an existing file at ``path`` as it was."""
     entries = []  # (name, dtype, shape, produce or None for padding, offset, size)
     offset = 0
     for name, (dtype, shape, produce) in tensors.items():
@@ -122,15 +126,24 @@ def write(path: Path, tensors: Dict[str, Tuple[str, Tuple[int, ...], "callable"]
         header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [at, at + n]}
     raw = json.dumps(header, separators=(",", ":")).encode()
     raw += b" " * (-(8 + len(raw)) % max(align, 8))  # spaces may pad the header; the data starts aligned
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(raw)))
-        f.write(raw)
-        for name, dtype, shape, produce, _, n in entries:
-            if produce is None:
-                f.write(bytes(n))
-                continue
-            a = np.ascontiguousarray(produce(), dtype=NUMPY[dtype])
-            if a.shape != tuple(shape):
-                raise AssertionError(f"{name}: produced shape {a.shape}, planned {tuple(shape)}")
-            f.write(a.tobytes())
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(struct.pack("<Q", len(raw)))
+            f.write(raw)
+            for name, dtype, shape, produce, _, n in entries:
+                if produce is None:
+                    f.write(bytes(n))
+                    continue
+                a = np.ascontiguousarray(produce(), dtype=NUMPY[dtype])
+                if a.shape != tuple(shape):
+                    raise AssertionError(f"{name}: produced shape {a.shape}, planned {tuple(shape)}")
+                f.write(a.tobytes())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:  # KeyboardInterrupt too: no half-written file left behind
+        tmp.unlink(missing_ok=True)
+        raise
     return 8 + len(raw) + offset

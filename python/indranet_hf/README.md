@@ -48,8 +48,12 @@ the engine computes them exactly up to that length and refuses longer sequences.
 
 - **Config:** IndraNet's own config, with every field explicit. Hugging Face's `config.json` alone
   doesn't describe the computation: part of it is in each family's modeling code, and that part is
-  encoded here (`families.py`). Layers that differ (sliding window, RoPE base) become
-  `layer_overrides`. The original `config.json` is kept in the file's metadata as `hf_config`.
+  encoded here (`families.py`). Layers that differ (sliding window, RoPE base, rotated fraction or
+  scaling) become `layer_overrides`. The original `config.json` is kept in the file's metadata as
+  `hf_config`; a model downloaded from the Hub also records `hf_repo` and `hf_commit`, the commit
+  the download was of.
+- **Writing:** the file is written under a temporary name next to the output and renamed when
+  complete, so a failed or interrupted conversion leaves an earlier file there as it was.
 - **Weights:** renamed to IndraNet's names, with fused matrices split and transposed ones turned
   round. Weight matrices keep the checkpoint's type by default (bf16 stays bf16), or take
   `--dtype float32|float16|bfloat16`; a matrix with a value outside the asked type's range stays

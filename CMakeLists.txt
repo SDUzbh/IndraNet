@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.21)
 # macOS builds need macOS 26 or newer and its SDK (src/gpu/gpu.mm: Metal 4); set before project() so it takes effect.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS version")
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 26.0)
+  message(WARNING "CMAKE_OSX_DEPLOYMENT_TARGET ${CMAKE_OSX_DEPLOYMENT_TARGET} is below macOS 26, which IndraNet needs "
+                  "(src/gpu/gpu.mm uses Metal 4); building for 26.0 instead")
   set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS version" FORCE)
 endif()
 project(IndraNet VERSION 0.1.0 LANGUAGES CXX)

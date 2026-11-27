@@ -38,6 +38,11 @@ def resolve(source: Union[str, Path], revision: Optional[str] = None) -> Path:
                                   allow_patterns=["*.json", "*.safetensors", "merges.txt"]))
 
 
+def hub_commit(folder: Path) -> Optional[str]:
+    """The commit a Hub download is of: huggingface_hub keeps each in its cache as snapshots/<commit>."""
+    return folder.name if folder.parent.name == "snapshots" and re.fullmatch(r"[0-9a-f]{40}", folder.name) else None
+
+
 def shard_files(folder: Path) -> List[Path]:
     index = folder / "model.safetensors.index.json"
     if index.exists():
@@ -90,8 +95,9 @@ def convert(source: Union[str, Path], out: Union[str, Path], dtype: str = "auto"
     ``"bfloat16"``; a weight with a value that doesn't fit the asked type stays float32, with a
     warning. Norms and biases are always float32. With ``vocab`` the tokenizer's token strings are
     stored for display, and the tokenizer itself (tokenizer.json) for the engine's --text, unless it
-    uses something the engine doesn't implement (a warning says what). Returns a summary: the IndraNet config, tensor count, file size and the
-    weights kept float32.
+    uses something the engine doesn't implement (a warning says what). A model downloaded from the Hub
+    records where it came from in the file's metadata: ``hf_repo`` and ``hf_commit``. Returns a
+    summary: the IndraNet config, tensor count, file size and the weights kept float32.
     """
     if dtype != "auto" and dtype not in DTYPES:
         raise ValueError(f"dtype must be 'auto', 'float32', 'float16' or 'bfloat16', got {dtype!r}")
@@ -122,6 +128,11 @@ def convert(source: Union[str, Path], out: Union[str, Path], dtype: str = "auto"
         warnings.warn(f"kept in float32 (values outside the asked type's range): {', '.join(kept)}")
     meta = {"format": "indranet", "format_version": FORMAT_VERSION, "config": json.dumps(cfg),
             "source": "huggingface", "hf_model_type": hf["model_type"], "hf_config": json.dumps(hf)}
+    if not Path(source).is_dir():  # downloaded: which repository, at which commit
+        meta["hf_repo"] = str(source)
+        commit = hub_commit(folder)
+        if commit:
+            meta["hf_commit"] = commit
     if vocab:
         v = vocab_mod.load(folder, cfg["vocab_size"])
         if v is not None:

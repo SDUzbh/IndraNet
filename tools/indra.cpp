@@ -131,6 +131,73 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
+// The options each command reads; anything else on its command line is an error, so that a misspelled
+// option isn't silently ignored. Every command also takes kCommonOptions.
+const std::set<std::string> kCommonOptions = {"threads", "device", "no-gpu", "fp16", "fp32"};
+const std::map<std::string, std::set<std::string>>& command_options() {
+    static const std::map<std::string, std::set<std::string>> opts = [] {
+        const std::set<std::string> input = {"tokens", "text", "repeat-random", "seed", "no-special-tokens"};
+        auto with_input = [&](std::set<std::string> more) {
+            more.insert(input.begin(), input.end());
+            return more;
+        };
+        return std::map<std::string, std::set<std::string>>{
+            {"info", {}},
+            {"run", with_input({"top"})},
+            {"lens", with_input({"pos", "target", "top"})},
+            {"dla", with_input({"pos", "target", "other", "top"})},
+            {"heads", {"seg", "samples", "seed"}},
+            {"patch",
+             {"clean", "clean-text", "corrupt", "corrupt-text", "no-special-tokens", "pos", "target", "other", "site",
+              "raw", "method", "steps", "verify", "compare"}},
+            {"ablate", with_input({"mode", "reference", "reference-text", "reference-file", "reference-random"})},
+            {"circuits", {"top", "tokens-sampled"}},
+            {"attn", with_input({"layer", "head", "top", "pos"})},
+            {"tokenize", {"text", "text-file", "no-special-tokens"}},
+            {"generate", with_input({"max-new", "temperature", "top-k", "top-p", "stop", "no-eos", "trace", "speculate",
+                                     "draft", "ngram"})},
+        };
+    }();
+    return opts;
+}
+
+size_t edit_distance(const std::string& x, const std::string& y) {
+    std::vector<size_t> d(y.size() + 1);
+    std::iota(d.begin(), d.end(), size_t(0));
+    for (size_t i = 1; i <= x.size(); ++i) {
+        size_t diag = d[0];
+        d[0] = i;
+        for (size_t j = 1; j <= y.size(); ++j) {
+            const size_t up = d[j];
+            d[j] = std::min({d[j] + 1, d[j - 1] + 1, diag + (x[i - 1] != y[j - 1])});
+            diag = up;
+        }
+    }
+    return d[y.size()];
+}
+
+// Throws for an unknown command, or an option the command doesn't read (with the likely intended one).
+void check_options(const Args& a) {
+    const auto& all = command_options();
+    const auto it = all.find(a.command);
+    if (it == all.end()) throw std::invalid_argument(std::format("unknown command '{}'", a.command));
+    for (const auto& [k, v] : a.opts) {
+        if (it->second.contains(k) || kCommonOptions.contains(k)) continue;
+        std::string best;
+        size_t best_d = 3;  // suggest only close names: at most 2 edits
+        for (const std::set<std::string>* names : {&it->second, &kCommonOptions})
+            for (const std::string& o : *names)
+                if (const size_t d = edit_distance(k, o); d < best_d) best_d = d, best = o;
+        std::string users;
+        for (const auto& [cmd, names] : all)
+            if (names.contains(k)) users += (users.empty() ? "" : ", ") + cmd;
+        throw std::invalid_argument(std::format("{} has no option --{}{}", a.command, k,
+                                                !best.empty()    ? std::format(" (did you mean --{}?)", best)
+                                                : !users.empty() ? std::format(" (it is an option of {})", users)
+                                                                 : ""));
+    }
+}
+
 Tokens parse_tokens(const std::string& s) {
     Tokens t;
     std::stringstream ss(s);
@@ -558,7 +625,7 @@ std::vector<Tokens> reference_tokens(const Args& a, const Model& m, int64_t T) {
         while (std::getline(f, line)) {
             while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
             if (line.empty() || line[0] == '#') continue;
-            refs.push_back(m.vocab().empty() ? parse_tokens(line) : m.tokenize(line));
+            refs.push_back(m.vocab().empty() ? parse_tokens(line) : m.tokenize(line, !a.has("no-special-tokens")));
         }
     }
     if (a.has("reference-random")) {
@@ -803,6 +870,7 @@ int main(int argc, char** argv) {
     }
     try {
         const Args a = parse_args(argc, argv);
+        check_options(a);
         if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
         if (a.has("device") || a.has("no-gpu")) {
             const std::string dev = a.has("device") ? a.get("device") : "cpu";
@@ -834,9 +902,7 @@ int main(int argc, char** argv) {
             {"heads", cmd_heads}, {"patch", cmd_patch},       {"ablate", cmd_ablate}, {"circuits", cmd_circuits},
             {"attn", cmd_attn},   {"generate", cmd_generate},
         };
-        auto it = commands.find(a.command);
-        if (it == commands.end()) throw std::invalid_argument(std::format("unknown command '{}'", a.command));
-        return it->second(a, m);
+        return commands.at(a.command)(a, m);  // check_options has refused other commands
     } catch (const std::exception& e) {
         std::fprintf(stderr, "indra: %s\n\n%s", e.what(), kUsage);
         return 1;

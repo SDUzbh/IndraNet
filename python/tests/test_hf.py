@@ -61,6 +61,21 @@ def test_safetensors_write_and_read(tmp_path):
     assert np.array_equal(tensors.bf16_to_f32(s.get("b")), a.T)
 
 
+def test_interrupted_write_keeps_the_existing_file(tmp_path):
+    out = tmp_path / "m.safetensors"
+    a = np.ones((2, 3), np.float32)
+    tensors.write(out, {"a": ("F32", (2, 3), lambda: a)}, {})
+    before = out.read_bytes()
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        tensors.write(out, {"a": ("F32", (2, 3), lambda: a), "b": ("F32", (2, 3), interrupted)}, {})
+    assert out.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["m.safetensors"]  # no temporary file left
+
+
 def test_config_fields_match_indranet():
     """The converter writes every engine field of ModelConfig, and nothing else."""
     assert set(CONFIG_FIELDS) == {f.name for f in dataclasses.fields(ModelConfig)} - TRAINING_ONLY
@@ -113,6 +128,20 @@ def test_layer_rules_without_layer_types():
 def test_newer_rope_parameters():
     hf = dict(LLAMA2_7B, rope_theta=None, rope_parameters={"rope_type": "default", "rope_theta": 500000.0})
     assert translate_config(hf)["rope_theta"] == 500000.0
+
+
+def test_rope_fraction_per_layer_type():
+    """rope_parameters per layer type may rotate different fractions; each layer keeps its own."""
+    hf = dict(model_type="gemma3_text", hidden_size=64, intermediate_size=96, num_attention_heads=4, num_key_value_heads=4,
+              head_dim=16, num_hidden_layers=3, vocab_size=97, sliding_window=8,
+              layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+              rope_parameters={"sliding_attention": {"rope_type": "default", "rope_theta": 1e4, "partial_rotary_factor": 0.5},
+                               "full_attention": {"rope_type": "default", "rope_theta": 1e6, "partial_rotary_factor": 1.0}})
+    c = translate_config(hf)
+    per = [{**c, **c["layer_overrides"].get(str(i), {})} for i in range(3)]
+    assert [(p["rope_theta"], p["rope_fraction"]) for p in per] == [(1e4, 0.5), (1e6, 1.0), (1e4, 0.5)]
+    cfg = ModelConfig.from_dict(c)
+    assert [cfg.layer_config(i).rope_fraction for i in range(3)] == [0.5, 1.0, 0.5]
 
 
 LLAMA31_SCALING = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
@@ -228,6 +257,33 @@ def test_converted_files_are_page_aligned(tmp_path):
         assert np.array_equal(loaded[k], ours.get(k))
     tensors.write(tmp_path / "packed.safetensors", {"m": ("F32", (2, 3), lambda: np.ones((2, 3), np.float32))}, {}, align=1)
     assert tensors.Shards([tmp_path / "packed.safetensors"]).names() == ["m"]
+
+
+def _metadata(path: Path) -> dict:
+    raw = path.read_bytes()
+    return json.loads(raw[8:8 + int.from_bytes(raw[:8], "little")])["__metadata__"]
+
+
+def test_convert_records_the_hub_source(tmp_path, monkeypatch):
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    (tmp_path / "cache" / "snapshots").mkdir(parents=True)
+    snapshot = _tiny_llama_folder(tmp_path / "cache" / "snapshots" / commit)  # as huggingface_hub's cache holds it
+    asked = {}
+
+    def snapshot_download(repo, revision=None, allow_patterns=None):
+        asked.update(repo=repo, revision=revision)
+        return str(snapshot)
+
+    hub = type(sys)("huggingface_hub")
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.chdir(tmp_path)  # so "someone/tiny" is not a local folder
+    convert("someone/tiny", tmp_path / "hub.safetensors", revision="v1")
+    assert asked == {"repo": "someone/tiny", "revision": "v1"}
+    meta = _metadata(tmp_path / "hub.safetensors")
+    assert (meta["hf_repo"], meta["hf_commit"]) == ("someone/tiny", commit)
+    convert(snapshot, tmp_path / "local.safetensors")  # a local folder: no Hub source to record
+    assert not {"hf_repo", "hf_commit"} & set(_metadata(tmp_path / "local.safetensors"))
 
 
 def test_convert_refuses_unknown_tensors(tmp_path):
@@ -502,6 +558,33 @@ def test_engine_tokenizer_matches_tokenizers(tools, tmp_path, style):
         assert r.returncode == 0, r.stderr
         last = r.stdout.rstrip("\n").split("\n")[-1]
         assert last.rstrip() == ("--tokens " + ",".join(map(str, hf.encode(text).ids))).rstrip(), f"{style} {text!r}"
+
+
+def test_ablation_reference_file_follows_no_special_tokens(tools, tmp_path):
+    """--reference-file lines are tokenized as --text and --reference-text are: with --no-special-tokens,
+    no BOS, so references as long as the input give per-position means, the same as --reference-text."""
+    from indranet import DecoderLM
+    from indranet.export import export_model
+    from indranet_hf import vocab as vocab_mod
+    hf, d = _tokenizer("llama3")  # adds BOS
+    folder = tmp_path / "hf"
+    folder.mkdir()
+    (folder / "tokenizer.json").write_text(json.dumps(d), encoding="utf-8")
+    V = hf.get_vocab_size()
+    torch.manual_seed(0)
+    model = DecoderLM(ModelConfig(vocab_size=V, d_model=16, n_layers=1, n_heads=2, max_seq_len=32))
+    path = tmp_path / "m.safetensors"
+    export_model(model, path, vocab=[hf.id_to_token(i) for i in range(V)],
+                 metadata={"tokenizer": json.dumps(vocab_mod.tokenizer(folder), separators=(",", ":"))})
+    text, refs = "hello world hello there", ["hello world hello there", "hello there hello world"]
+    assert len({len(hf.encode(t, add_special_tokens=False).ids) for t in [text, *refs]}) == 1
+    (tmp_path / "refs.txt").write_text("\n".join(refs) + "\n", encoding="utf-8")
+    base = [str(tools / "indra"), "ablate", str(path), "--text", text, "--no-special-tokens"]
+    from_file = subprocess.run(base + ["--reference-file", str(tmp_path / "refs.txt")], capture_output=True, text=True)
+    from_text = subprocess.run(base + ["--reference-text", ";".join(refs)], capture_output=True, text=True)
+    assert from_file.returncode == 0 and from_text.returncode == 0, from_file.stderr + from_text.stderr
+    assert "one per position" in from_file.stdout
+    assert from_file.stdout == from_text.stdout
 
 
 def test_unsupported_tokenizer_is_not_stored(tmp_path):

@@ -36,7 +36,7 @@ CONFIG_FIELDS = (
     "attention", "mlp", "activation", "qk_norm", "sliding_window", "attn_scale", "attn_logit_softcap",
     "parallel_residual", "bias", "tie_embeddings", "embed_scale", "final_logit_softcap", "layer_overrides",
 )
-PER_LAYER = ("sliding_window", "rope_theta", "rope_scaling")  # what can differ between layers of a converted model
+PER_LAYER = ("sliding_window", "rope_theta", "rope_fraction", "rope_scaling")  # what can differ between layers of a converted model
 
 ACTIVATIONS = {
     "silu": "silu", "swish": "silu", "gelu": "gelu", "gelu_new": "gelu_tanh", "gelu_pytorch_tanh": "gelu_tanh",
@@ -207,8 +207,7 @@ class LlamaStyle:
         for t in self.layer_types(hf):
             theta, frac, scaling = rope(hf, t)
             layers.append({"sliding_window": window if t == "sliding_attention" else None, "rope_theta": theta,
-                           "rope_scaling": scaling})
-            cfg["rope_fraction"] = frac
+                           "rope_fraction": frac, "rope_scaling": scaling})
         return with_layers(cfg, layers)
 
     def tensors(self, cfg: dict, names) -> Dict[str, Out]:
