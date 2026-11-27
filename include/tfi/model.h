@@ -19,6 +19,7 @@ namespace tfi {
 
 namespace detail {
 struct RowBatch;       // internal (src/model/ops.h)
+struct GradientOptions;  // internal (src/model/ops.h)
 struct KVRef;          // internal (src/model/ops.h): earlier keys or values for attention
 struct TokenizerSlot;  // a stored tokenizer.json and, once parsed, the Tokenizer (src/model/model.cpp)
 class Gpu;             // internal (src/gpu/gpu.h, macOS)
@@ -234,11 +235,16 @@ class Model {
     // its backward pass run on the neural accelerators (Apple10 GPUs, e.g. M5); otherwise attention on the CPU.
     // `dmetric(s, logits)` gives dF/d(logits) for segment s's scalar F, from the logits (1, vocab) of
     // its last row. Returns each segment's gradients, as run_with_gradients would, for the hook points
-    // the filter accepts among hook_embed, hook_resid_pre / _mid / _post, hook_attn_out, hook_mlp_out
-    // and attn.hook_z (no others).
+    // the filter accepts: all of them but hook_final, and attn.hook_pattern when several segments' attention
+    // runs on the GPU.
     std::vector<ActivationCache> gradients_rows(const Tensor& x0, const detail::RowBatch& batch,
                                                 const std::function<Tensor(int64_t, const Tensor&)>& dmetric,
                                                 const NameFilter& filter) const;
+    // ... and with options (detail::GradientOptions): hooks, dmetric on every row's logits (then hook_final's
+    // gradient too), the logits handed back.
+    std::vector<ActivationCache> gradients_rows(const Tensor& x0, const detail::RowBatch& batch,
+                                                const std::function<Tensor(int64_t, const Tensor&)>& dmetric,
+                                                const NameFilter& filter, const detail::GradientOptions& opt) const;
     // Internal (macOS): this model's GPU context for batched patching, created on first use and
     // kept with its copies of the weights; nullptr without a Metal device or on other systems.
     detail::Gpu* gpu() const;
@@ -255,7 +261,9 @@ class Model {
     // only the path through attention (as PyTorch autograd on indranet's hook points gives).
     // The forward pass is forward()'s. `hooks` may edit activations; the backward pass then treats
     // each edited value as the activation itself (e.g. replacing hook_embed runs the model on other
-    // embeddings). If `acts` is given it receives every activation. Returns the logits.
+    // embeddings). If `acts` is given it receives every activation. Returns the logits. On macOS the
+    // whole pass runs on the GPU where a single pass of the tokens would (forward()'s rule), with the same
+    // results up to float rounding; the embeddings are made on the CPU.
     Tensor run_with_gradients(const Tokens& tokens, const std::function<Tensor(const Tensor& logits)>& dlogits,
                               ActivationCache& grads, NameFilter filter = nullptr, ActivationCache* acts = nullptr,
                               const Hooks* hooks = nullptr) const;

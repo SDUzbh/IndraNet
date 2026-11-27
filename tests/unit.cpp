@@ -2396,6 +2396,77 @@ static void test_gpu_gradients(const Model& m, const std::vector<int64_t>& lens 
 }
 #endif
 
+#ifdef TFI_USE_ACCELERATE
+// run_with_gradients on the GPU = on the CPU, at every hook point, for a gradient on every row's logits: without
+// hooks, with hooks that edit every activation (q, k, v, the pattern, z and hook_final included), with hooks that
+// edit only the patterns, and with the activations wanted (captures). In GPU-only mode, and in both mode where a
+// single pass goes to the GPU (its attention there or on the CPU, by head size).
+static void test_gpu_run_with_gradients(const Model& m, int64_t T) {
+    const HalfTolerance half_tolerance(m);
+    if (!m.gpu()) {
+        std::printf("     (no Metal device: GPU path not tested)\n");
+        return;
+    }
+    const Tokens t = seq(T, 37);
+    auto dlogits = [](const Tensor& logits) {
+        Tensor dl(logits.shape);
+        for (int64_t i = 0; i < dl.numel(); ++i)
+            dl.data[i] = 0.05f * std::sin(0.37f * static_cast<float>(i)) + 0.01f * logits.data[i];
+        return dl;
+    };
+    Hooks edit;  // every activation but the embeddings (made on the CPU either way), each element differently
+    edit.add_filter([](const std::string& n) { return n != "hook_embed" && n != "hook_pos_embed"; },
+                    [](const std::string&, Tensor& a) {
+                        for (int64_t i = 0; i < a.numel(); ++i) a.data[i] *= 1.f + 0.01f * static_cast<float>(i % 5);
+                    });
+    Hooks patterns;  // only the patterns: rows no longer summing to 1
+    patterns.add_filter([](const std::string& n) { return n.ends_with("hook_pattern"); },
+                        [](const std::string&, Tensor& a) {
+                            for (int64_t i = 0; i < a.numel(); ++i)
+                                a.data[i] *= 0.9f + 0.05f * static_cast<float>(i % 3);
+                        });
+    const double tol = tol_for(m, 1e-3);
+    auto near = [&](const Tensor& got, const Tensor& want, const std::string& what) {
+        CHECK(got.shape == want.shape);
+        if (got.shape != want.shape) return;
+        const bool ok = max_abs_diff(got, want) <= tol * std::max(1.f, max_abs(want));
+        CHECK(ok);
+        if (!ok) std::printf("     %s: %g off (max %g)\n", what.c_str(), max_abs_diff(got, want), max_abs(want));
+    };
+    auto same = [&](const ActivationCache& got, const ActivationCache& want) {
+        CHECK(got.size() == want.size());
+        for (const auto& [name, w] : want) {
+            CHECK(got.contains(name));
+            if (got.contains(name)) near(got.at(name), w, name);
+        }
+    };
+    const auto only_some = [](const std::string& n) { return n.ends_with("hook_resid_pre") || n.ends_with("hook_q"); };
+    for (const Hooks* h : std::initializer_list<const Hooks*>{nullptr, &edit, &patterns})
+        for (const bool acts : {false, true})
+            for (const bool filtered : {false, true}) {
+                const NameFilter filter = filtered ? NameFilter(only_some) : NameFilter();
+                ActivationCache cg, ca;
+                set_device(Device::Cpu);
+                const Tensor cl = m.run_with_gradients(t, dlogits, cg, filter, acts ? &ca : nullptr, h);
+                CHECK(cg.contains("blocks.0.attn.hook_q") && (filtered || cg.contains("blocks.0.attn.hook_pattern")));
+                for (const Device dev : {Device::Gpu, Device::Both}) {
+                    set_device(dev);
+                    detail::set_gpu_min_rows(1);  // both mode: the GPU, for this short pass
+                    detail::set_gpu_min_work(1);
+                    ActivationCache gg, ga;
+                    const Tensor gl = m.run_with_gradients(t, dlogits, gg, filter, acts ? &ga : nullptr, h);
+                    detail::set_gpu_min_rows(0);
+                    detail::set_gpu_min_work(0);
+                    near(gl, cl, "logits");
+                    CHECK(max_abs_diff(gl, cl) > 0.f);  // the GPU really ran
+                    same(gg, cg);
+                    if (acts) same(ga, ca);
+                }
+                set_device(Device::Both);
+            }
+}
+#endif
+
 static void test_nan_never_matches() {
     Tensor a({3}, {1.f, 2.f, 3.f}), b = a;
     b.data[1] = NAN;
@@ -5461,6 +5532,13 @@ int main(int argc, char** argv) {
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu", "GPU batched gradients = run_with_gradients (macOS): " + name,
             [&] { test_gpu_gradients(random_model(cfg, 44)); });
+    for (const auto& [name, cfg] : gpu_block_configs())
+        run("gpu",
+            "run_with_gradients on the GPU = CPU: every hook point, every row's logits, editing hooks (macOS): " + name,
+            [&] { test_gpu_run_with_gradients(random_model(cfg, 58), 9); });
+    run("gpu", "run_with_gradients on the GPU = CPU: long sequences, editing hooks (macOS)", [&] {
+        for (const auto& [name, cfg] : long_attention_configs()) test_gpu_run_with_gradients(random_model(cfg, 59), 48);
+    });
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu", "attribution + mixed patching on the GPU = CPU (macOS): " + name,
             [&] { test_gpu_attribution(random_model(cfg, 45)); });

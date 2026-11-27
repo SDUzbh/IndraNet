@@ -143,6 +143,15 @@ class Gpu::Seq {
     // (H, rows, rows) from q, k and attention()'s lse, as Model::attend's hook_pattern; and z = P v.
     void attention_pattern(int q, int k, int lse, int slopes, int P, const AttnShape& shape);
     void attention_apply(int P, int v, int z, const AttnShape& shape);
+    // The backward pass of attention_apply from such a pattern P (a hook may have edited it), as grad.cpp's
+    // attention_backward takes it: from dz and the forward pass's q, k, v and z = P v, dq, dk, dv as
+    // attention_backward gives them, with dP = dz v^T (H, rows, rows) into `dP` (hook_pattern's gradient) and
+    // the scores' gradient into `dS` (scratch, the same size), where it is P (dP - dz . z) x the softcap's
+    // derivative where P != 0 x scale. in.lse, meta, slopes and blk are not read.
+    void attention_backward_pattern(const AttnSlots& in, int P, int dP, int dS, int delta, int dq, int dk, int dv,
+                                    const AttnShape& shape);
+    // dP = dz v^T (H, rows, rows) of one whole sequence, every entry: hook_pattern's gradient.
+    void attention_dpattern(int dz, int v, int dP, const AttnShape& shape);
     // Rows per attention block (AttnShape::block_rows) for segments of at most `longest` rows: a bigger block
     // reads each key once for more rows, but leaves more of its simdgroups idle on a short segment (M5 Pro: 64
     // rows were as fast as or faster than 32 from 48 rows to 4096, and 128 no faster overall).

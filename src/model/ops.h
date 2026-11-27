@@ -12,6 +12,8 @@
 
 namespace tfi {
 
+class Hooks;
+
 class Model;
 
 namespace detail {
@@ -127,6 +129,13 @@ struct KVRef {
         D = t->shape[2];
     }
     bool empty() const { return !f && !h; }
+};
+
+// Model::gradients_rows beyond attribution patching's use: run_with_gradients on the GPU.
+struct GradientOptions {
+    const Hooks* hooks = nullptr;           // the pass's hooks (one sequence only), as run_with_gradients takes them
+    bool all_rows = false;                  // dmetric gets a segment's every row's logits (len, vocab), not its last
+    std::vector<Tensor>* logits = nullptr;  // receives the logits dmetric got, per segment
 };
 
 struct RowBatch {

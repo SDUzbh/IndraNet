@@ -151,7 +151,10 @@ unmeasured. When the estimates were far off, unmeasured sites may be too. Exact 
 default) has no such risk.
 
 The gradients come from `Model::run_with_gradients` (or `metric_gradients`): a backward pass that
-produces activation gradients only, no weight gradients. It costs about one forward pass.
+produces activation gradients only, no weight gradients. It costs about one forward pass. On macOS it
+runs on the GPU wherever a single forward pass of the same tokens would, hooks included: a hook that
+edits an activation pauses the pass there, as in a forward pass, and the backward pass then takes the
+edited value as the activation. Every hook point's gradient is available either way.
 
 ## Approximations and limits
 

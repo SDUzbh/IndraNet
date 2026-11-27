@@ -491,6 +491,53 @@ kernel void attn_apply_k(device const float* P [[buffer(0)]], device const float
     z[t] = s;
 }
 
+// Attention's backward pass from an explicit pattern P (H, T, T) of one whole sequence, z = P v, as grad.cpp's
+// attention_backward takes it (a hook may have edited P, masked entries included): dP = dz v^T at every entry,
+// one thread each (also hook_pattern's gradient); the scores' gradient dS = P (dP - delta) x the softcap's
+// derivative where P != 0 x scale; then dq = dS k (attn_apply_k), dk = dS^T q and dv = P^T dz (attn_apply_t_k).
+kernel void attn_dpattern_k(device const float* dz [[buffer(0)]], device const float* v [[buffer(1)]],
+                            device float* dP [[buffer(2)]], constant AttnArgs& a [[buffer(3)]],
+                            constant uint& T [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    if (t >= a.H * T * T) return;
+    const uint j = t % T, i = (t / T) % T, h = t / (T * T), g = h / (a.H / a.Hkv);
+    device const float* x = dz + (ulong(i) * a.H + h) * a.D;
+    device const float* y = v + (ulong(j) * a.Hkv + g) * a.D;
+    float s = 0.f;
+    for (uint d = 0; d < a.D; ++d) s += x[d] * y[d];
+    dP[t] = s;
+}
+kernel void attn_dscore_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                          device const float* P [[buffer(2)]], device const float* dP [[buffer(3)]],
+                          device const float* delta [[buffer(4)]], device float* dS [[buffer(5)]],
+                          constant AttnArgs& a [[buffer(6)]], constant uint& T [[buffer(7)]],
+                          uint t [[thread_position_in_grid]]) {
+    if (t >= a.H * T * T) return;
+    const uint j = t % T, i = (t / T) % T, h = t / (T * T), g = h / (a.H / a.Hkv);
+    const float p = P[t];
+    float ds = p * (dP[t] - delta[ulong(i) * a.H + h]);
+    if (a.cap != 0.f && p != 0.f) {
+        device const float* qr = q + (ulong(i) * a.H + h) * a.D;
+        device const float* kr = k + (ulong(j) * a.Hkv + g) * a.D;
+        float raw = 0.f;
+        for (uint d = 0; d < a.D; ++d) raw += qr[d] * kr[d];
+        const float th = vtanh(raw * a.scale / a.cap);
+        ds *= 1.f - th * th;
+    }
+    dS[t] = ds * a.scale;
+}
+// out (T, Hkv D): out[j, g] = sum over kv head g's query heads h and rows i of M[h, i, j] x[i, h], a thread
+// per value.
+kernel void attn_apply_t_k(device const float* M [[buffer(0)]], device const float* x [[buffer(1)]],
+                           device float* out [[buffer(2)]], constant AttnArgs& a [[buffer(3)]],
+                           constant uint& T [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    if (t >= T * a.Hkv * a.D) return;
+    const uint d = t % a.D, g = (t / a.D) % a.Hkv, j = t / (a.D * a.Hkv), rep = a.H / a.Hkv;
+    float s = 0.f;
+    for (uint h = g * rep; h < (g + 1) * rep; ++h)
+        for (uint i = 0; i < T; ++i) s += M[(ulong(h) * T + i) * T + j] * x[(ulong(i) * a.H + h) * a.D + d];
+    out[t] = s;
+}
+
 // dq: one threadgroup per (row, head), its keys in tiles of 1024 (as attn_k).
 kernel void attn_bwd_dq_k(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
                           device const float* dz [[buffer(3)]], device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],
@@ -1278,7 +1325,7 @@ struct Gpu::Impl {
     id<MTLComputePipelineState> kv_append_k_h, attn_k_h, attn_split_k_h, round_half_k;
     id<MTLComputePipelineState> act_k, glu_k, add_k, copy_k, bias_k, half_k, norm_k, norm_bwd_k, act_bwd_k, glu_bwd_k,
         block_sumsq_k, row_argmax_k, rope_k, rope_pass_k, attn_k, attn_delta_k, attn_bwd_dq_k, attn_bwd_dkv_k,
-        attn_pattern_k, attn_apply_k;
+        attn_pattern_k, attn_apply_k, attn_dpattern_k, attn_dscore_k, attn_apply_t_k;
 
     id<MTLLibrary> lib;  // the kernels' library (load_kernels)
     // The tiled attention kernel for a head size, block size and the types of its products and of earlier
@@ -1395,6 +1442,9 @@ struct Gpu::Impl {
                 attn_bwd_dkv_k = make("attn_bwd_dkv_k");
                 attn_pattern_k = make("attn_pattern_k");
                 attn_apply_k = make("attn_apply_k");
+                attn_dpattern_k = make("attn_dpattern_k");
+                attn_dscore_k = make("attn_dscore_k");
+                attn_apply_t_k = make("attn_apply_t_k");
             }
         });
     }
@@ -1560,6 +1610,8 @@ struct Gpu::Seq::Impl {
             AttentionBwd,
             Pattern,
             Apply,
+            DPattern,
+            PatternBwd,
             KvAppend,
             RoundHalf
         } kind;
@@ -2090,6 +2142,58 @@ struct Gpu::Seq::Impl {
                 }
                 break;
             }
+            case DPattern:
+            case PatternBwd: {
+                const Gpu::Seq::AttnShape& A = op.attn;
+                if (A.Hkv <= 0 || A.H % A.Hkv)
+                    throw std::invalid_argument("Gpu::Seq: attention heads must group evenly");
+                const int64_t T = A.rows, nq = T * A.H * A.D, nkv = T * A.Hkv * A.D, np = A.H * T * T;
+                const AttnArgs args{u32(A.H), u32(A.Hkv), u32(A.D), 0u,   u32(A.window), A.has_slopes ? 1u : 0u,
+                                    0u,       0u,         A.scale,  A.cap};
+                const uint32_t t32 = u32(T);
+                // dP = dz v^T: DPattern's dz a, v d, dP c; PatternBwd's dz e, v d, dP g.
+                const int dz = op.kind == Op::DPattern ? op.a : op.e, dP = op.kind == Op::DPattern ? op.c : op.g;
+                need(dz, nq);
+                need(op.d, nkv);
+                need(dP, np);
+                if (op.kind == Op::PatternBwd) {  // q a, k b, z c, P f, dS h; delta, dq, dk, dv in more
+                    need(op.a, nq);
+                    need(op.b, nkv);
+                    need(op.c, nq);
+                    need(op.f, np);
+                    need(op.h, np);
+                    need(op.more[0], T * A.H);
+                    need(op.more[1], nq);
+                    need(op.more[2], nkv);
+                    need(op.more[3], nkv);
+                }
+                if (T == 0) break;
+                id<MTLComputeCommandEncoder> e = compute();
+                auto run_k = [&](id<MTLComputePipelineState> k, std::initializer_list<int> bufs, int64_t n) {
+                    [e setComputePipelineState:k];
+                    NSUInteger i = 0;
+                    for (int b : bufs) [e setBuffer:slot(b).buf offset:0 atIndex:i++];
+                    [e setBytes:&args length:sizeof args atIndex:i++];
+                    [e setBytes:&t32 length:sizeof t32 atIndex:i];
+                    dispatch(k, n);
+                };
+                run_k(g.attn_dpattern_k, {dz, op.d, dP}, np);
+                if (op.kind == Op::DPattern) break;
+                {
+                    const uint32_t a2[2] = {u32(A.D), u32(T * A.H)};
+                    [e setComputePipelineState:g.attn_delta_k];
+                    [e setBuffer:slot(op.e).buf offset:0 atIndex:0];
+                    [e setBuffer:slot(op.c).buf offset:0 atIndex:1];
+                    [e setBuffer:slot(op.more[0]).buf offset:0 atIndex:2];
+                    [e setBytes:a2 length:sizeof a2 atIndex:3];
+                    dispatch(g.attn_delta_k, T * A.H);
+                }
+                run_k(g.attn_dscore_k, {op.a, op.b, op.f, op.g, op.more[0], op.h}, np);
+                run_k(g.attn_apply_k, {op.h, op.b, op.more[1]}, nq);       // dq = dS k
+                run_k(g.attn_apply_t_k, {op.h, op.a, op.more[2]}, nkv);    // dk = dS^T q
+                run_k(g.attn_apply_t_k, {op.f, op.e, op.more[3]}, nkv);    // dv = P^T dz
+                break;
+            }
             case AttentionBwd: {
                 const Gpu::Seq::AttnShape& A = op.attn;
                 if (A.D <= 0 || A.D > kMaxHeadDim)
@@ -2470,6 +2574,43 @@ void Gpu::Seq::attention_apply(int P, int v, int z, const AttnShape& shape) {
     op.a = P;
     op.d = v;
     op.c = z;
+    op.attn = shape;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention_dpattern(int dz, int v, int dP, const AttnShape& shape) {
+    if (dP == dz || dP == v) throw std::invalid_argument("Gpu::Seq: the pattern's gradient goes to a slot of its own");
+    Impl::Op op{Impl::Op::DPattern};
+    op.a = dz;
+    op.d = v;
+    op.c = dP;
+    op.attn = shape;
+    impl_->ops.push_back(op);
+}
+
+void Gpu::Seq::attention_backward_pattern(const AttnSlots& in, int P, int dP, int dS, int delta, int dq, int dk, int dv,
+                                          const AttnShape& shape) {
+    const int outs[] = {dP, dS, delta, dq, dk, dv};
+    for (int o : outs) {
+        for (int i : {in.q, in.k, in.v, in.z, in.dz, P})
+            if (o == i) throw std::invalid_argument("Gpu::Seq: attention's backward pass writes to slots of its own");
+        if (std::ranges::count(outs, o) != 1)
+            throw std::invalid_argument("Gpu::Seq: attention's backward pass writes six different slots");
+    }
+    if (shape.Tp != 0) throw std::invalid_argument("Gpu::Seq: attention's backward pass takes no earlier positions");
+    Impl::Op op{Impl::Op::PatternBwd};
+    op.a = in.q;
+    op.b = in.k;
+    op.d = in.v;
+    op.c = in.z;
+    op.e = in.dz;
+    op.f = P;
+    op.g = dP;
+    op.h = dS;
+    op.more[0] = delta;
+    op.more[1] = dq;
+    op.more[2] = dk;
+    op.more[3] = dv;
     op.attn = shape;
     impl_->ops.push_back(op);
 }

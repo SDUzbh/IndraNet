@@ -34,6 +34,11 @@ Tensor linear_backward(const Tensor& dy, const Weight& W) {
 
 namespace detail {
 
+// model.cpp: run_with_gradients on the GPU, where a single pass would go there; false (nothing done) otherwise.
+bool gradients_on_gpu(const Model& m, const Tokens& tokens, const std::function<Tensor(const Tensor&)>& dlogits,
+                      ActivationCache& grads, const NameFilter& filter, ActivationCache* acts, const Hooks* hooks,
+                      Tensor& logits);
+
 Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
                      const Tensor& dy) {
     if (c.norm == "none") return dy;
@@ -301,6 +306,8 @@ struct Backward {
 Tensor Model::run_with_gradients(const Tokens& tokens, const std::function<Tensor(const Tensor& logits)>& dlogits_fn,
                                  ActivationCache& grads, NameFilter filter, ActivationCache* acts,
                                  const Hooks* hooks) const {
+    if (Tensor logits; detail::gradients_on_gpu(*this, tokens, dlogits_fn, grads, filter, acts, hooks, logits))
+        return logits;
     ActivationCache cache;
     Tensor logits = run_with_cache(tokens, cache, nullptr, hooks);
     Tensor dl = dlogits_fn(logits);
