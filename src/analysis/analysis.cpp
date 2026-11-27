@@ -17,10 +17,13 @@
 #include <stdexcept>
 #include <thread>
 
+#include "analysis/testing.h"
 #include "gpu/gpu.h"
 #include "gpu/gpu_chunks.h"
-#include "model/half.h"
 #include "model/ops.h"
+#include "model/placement.h"
+#include "support/half.h"
+#include "support/parallel.h"
 
 #ifdef TFI_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -28,40 +31,9 @@
 
 namespace tfi {
 
+using detail::parallel_for;
+
 namespace {
-
-std::atomic<int> g_threads{0};  // 0 = TFI_THREADS, else every core
-std::atomic<int> g_device{-1};  // a Device, or -1: TFI_NO_GPU decides
-
-// Run fn(0..n-1) on up to num_threads() threads. Jobs are independent; the first exception any job
-// throws is re-thrown here after the workers stop.
-template <std::invocable<int64_t> F>
-void parallel_for(int64_t n, F&& fn) {
-    const int64_t workers = std::min<int64_t>(num_threads(), n);
-    if (workers <= 1) {
-        for (int64_t i = 0; i < n; ++i) fn(i);
-        return;
-    }
-    std::atomic<int64_t> next{0};
-    std::exception_ptr error;
-    std::mutex error_mutex;
-    auto work = [&] {
-        for (int64_t i; (i = next.fetch_add(1)) < n;) {
-            try {
-                fn(i);
-            } catch (...) {
-                std::scoped_lock lock(error_mutex);
-                if (!error) error = std::current_exception();
-                next = n;  // stop handing out jobs
-            }
-        }
-    };
-    std::vector<std::jthread> threads;
-    for (int64_t w = 1; w < workers; ++w) threads.emplace_back(work);
-    work();
-    threads.clear();  // joins them
-    if (error) std::rethrow_exception(error);
-}
 
 const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
@@ -154,44 +126,6 @@ CompScores compose(const HeadCache& writer, const HeadCache& reader) {
 }
 
 }  // namespace
-
-void set_num_threads(int n) { g_threads = n < 0 ? 0 : n; }
-
-void set_device(Device d) {
-    if (d == Device::Gpu) {
-#ifdef TFI_USE_ACCELERATE
-        if (!detail::Gpu::create()) throw std::runtime_error("GPU-only: this Mac has no Metal GPU");
-#else
-        throw std::runtime_error("GPU-only needs macOS with a Metal GPU");
-#endif
-    }
-    g_device = static_cast<int>(d);
-    detail::set_gpu_only(d == Device::Gpu);
-}
-
-Device device() {
-    if (const int d = g_device.load(); d >= 0) return static_cast<Device>(d);
-    static const Device from_env = [] {  // read once: every linear layer asks
-        const char* env = std::getenv("TFI_NO_GPU");
-        return !env || !*env || std::string(env) == "0" ? Device::Both : Device::Cpu;
-    }();
-    return from_env;
-}
-
-void set_use_gpu(bool use) { set_device(use ? Device::Both : Device::Cpu); }
-
-bool use_gpu() { return device() != Device::Cpu; }
-
-int num_threads() {
-    if (const int n = g_threads.load(); n > 0) return n;
-    static const int from_env = [] {  // TFI_THREADS, else the cores: read once, as every linear layer asks
-        if (const char* env = std::getenv("TFI_THREADS"))
-            if (const int n = std::atoi(env); n > 0) return n;
-        const unsigned n = std::thread::hardware_concurrency();
-        return n ? static_cast<int>(n) : 1;
-    }();
-    return from_env;
-}
 
 float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
     const int64_t V = logits.shape[1];
@@ -529,12 +463,11 @@ int64_t head_batch_rows() { return g_head_batch_rows ? g_head_batch_rows.load() 
 int64_t ablation_batch_rows() { return g_head_batch_rows ? g_head_batch_rows.load() : kAblationBatchRows; }
 #ifdef TFI_USE_ACCELERATE
 // Attribution patching's gradient runs (steps sequences of P rows), tuned on an M5 Pro: aim for 8
-// batches running in parallel, at most 256 rows each. When the GPU is used at all (enough work:
-// gpu_min_work()), a batch goes to it from a quarter of gpu_min_rows() rows (default 64): one
-// such sequence already runs faster there than on the CPU.
+// batches running in parallel, at most 256 rows each, and at least the rows of a batch that goes to the GPU
+// (detail::min_gradient_batch_rows).
 int64_t gradient_batch_rows(int64_t steps, int64_t P) {
     if (g_head_batch_rows) return g_head_batch_rows.load();
-    const int64_t min_rows = std::max<int64_t>(1, detail::gpu_min_rows() / 4);
+    const int64_t min_rows = detail::min_gradient_batch_rows();
     const int64_t per = std::min(std::max((steps + 7) / 8, (min_rows + P - 1) / P), std::max<int64_t>(1, 256 / P));
     return per * P;
 }
@@ -573,12 +506,6 @@ std::vector<Batch> make_batches(std::vector<std::vector<int64_t>> items_per_laye
 
 #ifdef TFI_USE_ACCELERATE
 // Multiply-adds per row per block, about: the blocks' 2-D weights over the layers.
-double block_weights_per_layer(const Model& m) {
-    double n = 0;
-    for (const auto& [name, w] : m.weights())
-        if (w.dim() == 2 && name.starts_with("blocks.")) n += static_cast<double>(w.numel());
-    return n / static_cast<double>(std::max<int64_t>(1, m.cfg().n_layers));
-}
 
 // Multiply-adds of the batches big enough for the GPU (gpu_min_rows): each runs its rows from its
 // layer to the last.
@@ -587,7 +514,7 @@ double gpu_work(const Model& m, const std::vector<Batch>& batches) {
     for (const Batch& b : batches)
         if (b.rows >= detail::gpu_min_rows())
             rows_x_layers += static_cast<double>(b.rows) * static_cast<double>(m.cfg().n_layers - b.layer);
-    return rows_x_layers > 0 ? rows_x_layers * block_weights_per_layer(m) : 0.0;
+    return rows_x_layers > 0 ? rows_x_layers * detail::block_weights_per_layer(m) : 0.0;
 }
 #endif
 
@@ -596,14 +523,12 @@ double gpu_work(const Model& m, const std::vector<Batch>& batches) {
 // otherwise everything runs on the CPU.
 detail::Gpu* gpu_for(const Model& m, const std::vector<Batch>& batches) {
 #ifdef TFI_USE_ACCELERATE
-    if (!use_gpu()) return nullptr;
-    const double work = gpu_work(m, batches);
-    if (work > 0 && (m.has_gpu() || work >= detail::gpu_min_work())) return m.gpu();
+    return detail::gpu_for_work(m, gpu_work(m, batches));
 #else
     (void)m;
     (void)batches;
-#endif
     return nullptr;
+#endif
 }
 
 bool same_floats(std::span<const float> a, const float* b) { return std::memcmp(a.data(), b, a.size_bytes()) == 0; }
@@ -866,14 +791,9 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     std::vector<int64_t> cpu_steps;
     detail::Gpu* gpu = nullptr;
 #ifdef TFI_USE_ACCELERATE
-    // Only with enough work in all to repay starting the GPU (gpu_min_work; a forward and backward
-    // pass count as 3 passes).
-    if (use_gpu() &&
-        (m.has_gpu() ? steps * P >= detail::gpu_min_rows()
-                     : 3.0 * static_cast<double>(steps * P * m.cfg().n_layers) * block_weights_per_layer(m) >=
-                           detail::gpu_min_work()))
+    if (detail::gradient_runs_use_gpu(m, steps * P))
         for (Batch& b : make_batches({all_steps}, [P](int64_t) { return P; }, gradient_batch_rows(steps, P))) {
-            if (b.rows >= std::max<int64_t>(1, detail::gpu_min_rows() / 4) && (gpu || (gpu = m.gpu())))
+            if (b.rows >= detail::min_gradient_batch_rows() && (gpu || (gpu = m.gpu())))
                 gpu_batches.push_back(std::move(b));
             else cpu_steps.insert(cpu_steps.end(), b.items.begin(), b.items.end());
         }
@@ -1332,12 +1252,6 @@ int64_t circuits_run_bytes() {
     return b > 0 ? b : int64_t(512) << 20;
 }
 
-// The model's GPU for one weight-based computation of `work` multiply-adds, or null: then the CPU
-// does it (as for the batched passes: only above gpu_min_work, unless the GPU has started already).
-detail::Gpu* gpu_for_work(const Model& m, double work) {
-    if (!use_gpu() || work <= 0 || (!m.has_gpu() && work < detail::gpu_min_work())) return nullptr;
-    return m.gpu();
-}
 
 // How a GPU circuits computation went: too little work (the CPU does it), done, or a value too
 // large for fp16 inputs (it runs again in float32).
@@ -1393,7 +1307,7 @@ GpuRun composition_gpu(const Model& m, const std::vector<std::pair<int64_t, int6
             work += 3.0 * double(H(lb) * D(lb)) * double(d) * double(H(la) * D(la));
             scratch = std::max(scratch, 3 * H(lb) * D(lb) * H(la) * D(la));
         }
-    detail::Gpu* gpu = gpu_for_work(m, work);
+    detail::Gpu* gpu = detail::gpu_for_work(m, work);
     if (!gpu) return GpuRun::NotWorth;
     detail::Gpu::Batch batch(*gpu);
     using Mat = detail::Gpu::Batch::Mat;
@@ -1645,7 +1559,7 @@ GpuRun ov_copying_gpu(const Model& m, int64_t max_tokens, Tensor& out, bool fp16
         max_hd = std::max(max_hd, HD);
         max_kv = std::max(max_kv, KV);
     }
-    detail::Gpu* gpu = gpu_for_work(m, work);
+    detail::Gpu* gpu = detail::gpu_for_work(m, work);
     if (!gpu) return GpuRun::NotWorth;
     const OvInputs in(m, max_tokens);
     detail::Gpu::Batch batch(*gpu);
@@ -1726,7 +1640,7 @@ GpuRun ov_pair_copying_gpu(const Model& m, int64_t max_tokens, const std::vector
             max_m = std::max(max_m, KV(lb) * H(la) * D(la));
         }
     }
-    detail::Gpu* gpu = gpu_for_work(m, work);
+    detail::Gpu* gpu = detail::gpu_for_work(m, work);
     if (!gpu) return GpuRun::NotWorth;
     const OvInputs in(m, max_tokens);
     detail::Gpu::Batch batch(*gpu);

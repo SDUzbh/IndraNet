@@ -1,4 +1,5 @@
-// Internal building blocks shared by the forward pass (model.cpp) and the backward pass (grad.cpp).
+// Internal building blocks shared by the forward pass (model.cpp), the backward pass (grad.cpp) and the GPU
+// lowering (gpu_lowering.cpp).
 // Not part of the public API.
 #pragma once
 
@@ -7,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "core/gemm.h"
 #include "tfi/config.h"
 #include "tfi/tensor.h"
 
@@ -44,11 +46,6 @@ void check_rope_length(const ModelConfig& c, const RopeTable& t, int64_t n_posit
 void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse = false,
                  const std::vector<int64_t>* positions = nullptr);
 std::vector<float> alibi_slopes(int64_t n);
-// C(m,n) = A(m,k) @ op(B) with row strides lda/ldb/ldc; op(B) = B (k,n) or, with trans_b, B(n,k)^T.
-// With accumulate, C += A @ op(B).
-void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t lda, const float* B, int64_t ldb,
-          float* C, int64_t ldc, bool accumulate = false);
-
 // Backward pass of Model::norm (prefix's weight, config c) over the last dimension: dL/dx given its
 // input x and dL/dy (grad.cpp).
 Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
@@ -66,53 +63,12 @@ struct AttentionGrads {
 AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& dz, const Tensor& q, const Tensor& k,
                                   const Tensor& v, const Tensor& P, const Tensor* q0, const Tensor* k0);
 
-// Rows of several sequences stacked into one (R, d) activation, so that many patched passes run
-// through the blocks together and every linear layer is one large matrix multiply
-// (Model::forward_rows). Segment s is rows [offset[s], offset[s] + len[s]) of the stack: positions
-// [start[s], start[s] + len[s]) of its sequence. Positions before start[s] are not recomputed:
-// attention takes their keys and values from prefix_k / prefix_v[layer] ((Hkv, T, D), e.g. a cached
-// run's hook_k / hook_v), which must hold what those positions would have produced.
-// For tests: rows per batched pass (residual-stream patching; head patching, ablation and
-// reference means); 0 restores the defaults.
-void set_patch_batch_rows(int64_t residual, int64_t heads);
 // For tests: check every KV cache after each forward_cached step (KVCache::check: the up-to-date prefixes
 // of its CPU and GPU copies, and their values where both hold them), as TFI_CHECK_KV=1 does.
 void set_check_kv(bool on);
 // For tests: cached keys (of one layer) from which an fp16 cache's key / value heads run side by side on the CPU;
 // 0 restores the default.
 void set_kv_side_by_side(int64_t values);
-// For tests (macOS): false runs a batched pass's GPU work one linear layer at a time, the residual
-// stream returning to the CPU after each, instead of keeping it on the GPU (Model::run_rows).
-void set_gpu_resident(bool on);
-// For tests (macOS): true computes a batched pass's attention (and, in gradient passes, its backward
-// pass) on the GPU outside GPU-only mode too. By default only GPU-only mode and single passes do:
-// elsewhere the CPU's attention, overlapping the GPU's work on other batches, is faster than the GPU
-// kernels (tiled: 0.83-0.94x at 128 tokens, 0.59-0.86x at 512).
-void set_gpu_attention(bool on);
-// For tests (macOS): false computes GPU attention with the per-row kernel instead of the tiled one
-// (head sizes that are multiples of 8 up to 128; other heads always use the per-row kernel).
-void set_gpu_attention_tiled(bool on);
-// For tests (macOS): the GPU's circuits computations keep each run's inputs under this many bytes,
-// splitting the work into several runs if needed; 0 restores the default (512 MB).
-void set_circuits_run_bytes(int64_t bytes);
-
-// Whether a single pass (Model::forward_from) of T rows through `layers` blocks of `layer_weights`
-// weights each goes to the GPU, `started` saying whether it is running, with the batched passes'
-// thresholds min_rows and min_work (gpu_min_rows, gpu_min_work). The batched passes' rule, or, once
-// the GPU is running, from 2 rows when a layer holds kSinglePassLayerWeights weights or the rows x
-// a layer's weights reach kSinglePassRowWork (tuned on an M5 Pro, models of 4x256 to 24x1024).
-constexpr double kSinglePassLayerWeights = 3e6, kSinglePassRowWork = 5e7;
-bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows,
-                        double min_work);
-// Whether Model::run_with_gradients of T tokens runs on the GPU (macOS, where a single pass of them would). Its
-// forward half then multiplies in float32 even with fp16 weights, unlike forward() there.
-bool gradients_go_to_gpu(const Model& m, int64_t T);
-
-// The sampler's weights (Sampler, generate.cpp): w[i] = exp((logits[i] - top) * scale) in float, for logits
-// at most `top`; 0 where that exponent is below -87 (exp under fp32's smallest normal), and for NaN and
-// -inf. The same bits on every platform: exp_weight's operations, four at a time on ARM.
-float exp_weight(float x);  // exp(x) for x <= 0, 0 below -87 and for NaN
-void exp_weights(std::span<const float> logits, float top, float scale, std::span<float> w);
 
 // One layer's earlier keys or values for attention, (H, T, D) row-major: float32 (a cached run's hook_k /
 // hook_v, a float32 KV cache) or fp16 bit patterns (a KV cache kept in fp16, read as it is). From a Tensor
@@ -141,6 +97,12 @@ struct GradientOptions {
     std::vector<Tensor>* logits = nullptr;  // receives the logits dmetric got, per segment
 };
 
+// Rows of several sequences stacked into one (R, d) activation, so that many patched passes run
+// through the blocks together and every linear layer is one large matrix multiply
+// (Model::forward_rows). Segment s is rows [offset[s], offset[s] + len[s]) of the stack: positions
+// [start[s], start[s] + len[s]) of its sequence. Positions before start[s] are not recomputed:
+// attention takes their keys and values from prefix_k / prefix_v[layer] ((Hkv, T, D), e.g. a cached
+// run's hook_k / hook_v), which must hold what those positions would have produced.
 struct RowBatch {
     std::vector<int64_t> start, len, offset;
     std::vector<KVRef> prefix_k, prefix_v;  // per layer; unused when every start is 0

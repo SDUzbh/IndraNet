@@ -318,12 +318,12 @@ class Model {
 
     ModelConfig cfg_;
     std::vector<ModelConfig> layer_cfgs_;
-    // Every block's hook point names ("blocks.3.hook_resid_pre", ...; model.cpp's HookPoint order), built
+    // Every block's hook point names ("blocks.3.hook_resid_pre", ...; model_impl.h's HookPoint order), built
     // once: each pass names them all, and building them each time cost a decoding step of a small model
     // several percent.
     std::vector<std::string> hook_names_;
     const std::string& hook_name(int64_t layer, int point) const;
-    // The same for each block's parameters' names ("blocks.3.attn.q_proj.weight" and ".bias"; model.cpp's
+    // The same for each block's parameters' names ("blocks.3.attn.q_proj.weight" and ".bias"; model_impl.h's
     // Param order), which the passes look up by name.
     std::vector<std::string> param_names_;
     const std::string& param_name(int64_t layer, int param, bool bias = false) const;

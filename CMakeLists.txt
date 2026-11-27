@@ -24,7 +24,31 @@ else()
 endif()
 option(TFI_BUILD_TOOLS "Build indra, tfi_golden and tfi_tests" ${tfi_tools_default})
 
-file(GLOB TFI_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*/*.cpp)
+# The library's layers, lowest first (docs/architecture.md). A layer may use only the layers below it; tfi_deps_<layer>
+# lists them. The library is one archive of every layer; TFI_CHECK_LAYERS also builds each layer as a shared
+# library linked only to the layers below it, so that any call into a layer above fails to link, and
+# tools/check_layers.py (the ctest test "layers") checks the same of every #include.
+set(TFI_LAYERS support text core gpu model analysis generation)
+set(tfi_deps_support)
+set(tfi_deps_text support)
+set(tfi_deps_core support)
+set(tfi_deps_gpu core support)
+set(tfi_deps_model gpu core text support)
+set(tfi_deps_analysis model gpu core text support)
+set(tfi_deps_generation analysis model gpu core text support)
+option(TFI_CHECK_LAYERS "Also link each layer of the library on its own, to check that none uses a layer above it" OFF)
+
+set(TFI_SOURCES)
+foreach(layer ${TFI_LAYERS})
+  file(GLOB tfi_layer_sources CONFIGURE_DEPENDS src/${layer}/*.cpp)
+  set(tfi_sources_${layer} ${tfi_layer_sources})
+  list(APPEND TFI_SOURCES ${tfi_layer_sources})
+endforeach()
+file(GLOB tfi_stray CONFIGURE_DEPENDS src/*.cpp src/*/*.cpp)
+list(REMOVE_ITEM tfi_stray ${TFI_SOURCES})
+if(tfi_stray)
+  message(FATAL_ERROR "Sources outside the library's layers (TFI_LAYERS): ${tfi_stray}")
+endif()
 add_library(tfi STATIC ${TFI_SOURCES})
 add_library(tfi::tfi ALIAS tfi)  # the name find_package(tfi) gives, so either way of adding tfi links the same
 target_compile_features(tfi PUBLIC cxx_std_20)
@@ -32,6 +56,7 @@ if(TFI_PYTHON OR SKBUILD)
   set_target_properties(tfi PROPERTIES POSITION_INDEPENDENT_CODE ON)  # linked into a shared module
 endif()
 target_include_directories(tfi PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+target_include_directories(tfi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)  # internal headers: "model/ops.h", ...
 target_compile_options(tfi PRIVATE -Wall -Wextra)
 find_package(Threads REQUIRED)
 target_link_libraries(tfi PUBLIC Threads::Threads)
@@ -48,11 +73,33 @@ if(APPLE)
     set(CMAKE_OBJCXX_STANDARD 20)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
     target_sources(tfi PRIVATE src/gpu/gpu.mm)
+    list(APPEND tfi_sources_gpu src/gpu/gpu.mm)
     set_source_files_properties(src/gpu/gpu.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(tfi PUBLIC TFI_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
     target_link_libraries(tfi PUBLIC "-framework Accelerate" "-framework Metal" "-framework MetalPerformanceShaders"
                                      "-framework Foundation")
   endif()
+endif()
+
+if(TFI_CHECK_LAYERS)
+  get_target_property(tfi_defs tfi INTERFACE_COMPILE_DEFINITIONS)
+  get_target_property(tfi_libs tfi INTERFACE_LINK_LIBRARIES)
+  foreach(layer ${TFI_LAYERS})
+    add_library(tfi_layer_${layer} SHARED ${tfi_sources_${layer}})
+    target_compile_features(tfi_layer_${layer} PRIVATE cxx_std_20)
+    target_include_directories(tfi_layer_${layer} PRIVATE include src)
+    target_compile_options(tfi_layer_${layer} PRIVATE -Wall -Wextra)
+    if(tfi_defs)
+      target_compile_definitions(tfi_layer_${layer} PRIVATE ${tfi_defs})
+    endif()
+    foreach(dep ${tfi_deps_${layer}})
+      target_link_libraries(tfi_layer_${layer} PRIVATE tfi_layer_${dep})
+    endforeach()
+    target_link_libraries(tfi_layer_${layer} PRIVATE ${tfi_libs})
+    if(NOT APPLE)  # macOS refuses undefined symbols in a shared library by default
+      target_link_options(tfi_layer_${layer} PRIVATE -Wl,--no-undefined)
+    endif()
+  endforeach()
 endif()
 
 if(TFI_BUILD_TOOLS)
@@ -62,14 +109,21 @@ if(TFI_BUILD_TOOLS)
   add_executable(tfi_golden tests/golden.cpp)
   target_link_libraries(tfi_golden PRIVATE tfi)
 
-  add_executable(tfi_tests tests/unit.cpp)
+  file(GLOB tfi_unit_sources CONFIGURE_DEPENDS tests/unit/*.cpp)  # one file per group, and main.cpp
+  add_executable(tfi_tests ${tfi_unit_sources})
   target_link_libraries(tfi_tests PRIVATE tfi)
+  target_include_directories(tfi_tests PRIVATE src)  # the tests reach internals too
 
   enable_testing()
-  # One test per group (tests/unit.cpp), so ctest -R gpu runs part and ctest -j runs them side by side.
+  # One test per group (tests/unit/<group>.cpp), so ctest -R gpu runs part and ctest -j runs them side by side.
   foreach(group core analysis grad fp16 gpu)
     add_test(NAME unit_${group} COMMAND tfi_tests --group ${group})
   endforeach()
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    add_test(NAME layers COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_layers.py
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
 endif()
 
 # cmake --install: the library, its headers and a CMake package, so that other projects can

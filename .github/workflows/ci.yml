@@ -80,6 +80,10 @@ jobs:
           cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Release
           cmake --build build-cmake --parallel
           ctest --test-dir build-cmake --output-on-failure
+      - name: Layers (each linked on its own)
+        run: |
+          cmake -S . -B build-layers -DCMAKE_BUILD_TYPE=Release -DTFI_CHECK_LAYERS=ON -DTFI_BUILD_TOOLS=OFF
+          cmake --build build-layers --parallel
 
   sanitizers:
     name: ASan + UBSan (golden tests on sanitized binaries)

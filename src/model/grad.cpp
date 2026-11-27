@@ -8,18 +8,18 @@
 #include <format>
 #include <stdexcept>
 
-#include "ops.h"
+#include "model/model_impl.h"
+#include "model/ops.h"
+#include "support/vmath.h"
 #include "tfi/model.h"
-#include "vmath.h"
 
 namespace tfi {
 
 using detail::apply_rope_;
+using detail::layer_prefix;
 using detail::merge_heads;
 
 namespace {
-
-std::string lp(int64_t layer) { return std::format("blocks.{}.", layer); }
 
 // dL/dx for y = x W^T (+ b), W (out, in): dy (..., out) -> (..., in).
 Tensor linear_backward(const Tensor& dy, const Weight& W) {
@@ -33,11 +33,6 @@ Tensor linear_backward(const Tensor& dy, const Weight& W) {
 }  // namespace
 
 namespace detail {
-
-// model.cpp: run_with_gradients on the GPU, where a single pass would go there; false (nothing done) otherwise.
-bool gradients_on_gpu(const Model& m, const Tokens& tokens, const std::function<Tensor(const Tensor&)>& dlogits,
-                      ActivationCache& grads, const NameFilter& filter, ActivationCache* acts, const Hooks* hooks,
-                      Tensor& logits);
 
 Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
                      const Tensor& dy) {
@@ -95,7 +90,7 @@ static void add_from(Tensor& dst, int64_t g, const Tensor& src) {
 AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& dz, const Tensor& q, const Tensor& k,
                                   const Tensor& v, const Tensor& P, const Tensor* q0, const Tensor* k0) {
     const ModelConfig& c = m.layer_cfg(layer);
-    const std::string p = lp(layer) + "attn.";
+    const std::string p = layer_prefix(layer) + "attn.";
     const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv, T = q.shape[1];
     const float scale = static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D)));
     Tensor dq({H, T, D}), dk({Hkv, T, D}), dv({Hkv, T, D}), dP({H, T, T});
@@ -179,14 +174,14 @@ struct Backward {
     // dL/d(attention input) from dL/d(attention output before any sandwich norm), (T, d_model).
     Tensor attention(int64_t layer, const Tensor& dout) const {
         const ModelConfig& c = m.layer_cfg(layer);
-        const std::string p = lp(layer) + "attn.";
+        const std::string p = layer_prefix(layer) + "attn.";
         const Tensor& q = act(p + "hook_q");  // (H, T, D)
         const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), T = q.shape[1];
 
         Tensor dz = linear_backward(dout, m.weight(p + "o_proj.weight"));  // (T, H*D)
         report(p + "hook_z", dz.reshape({T, H, D}));
         Tensor q0, k0;  // the projections before qk_norm
-        const Tensor& x = act(lp(layer) + "hook_attn_in");
+        const Tensor& x = act(layer_prefix(layer) + "hook_attn_in");
         if (c.qk_norm) {
             q0 = detail::split_heads(linear(x, m.weight(p + "q_proj.weight"), m.weight_or_null(p + "q_proj.bias")), H,
                                      D);
@@ -208,7 +203,7 @@ struct Backward {
     // dL/d(MLP input) from dL/d(MLP output before any sandwich norm).
     Tensor mlp(int64_t layer, const Tensor& dout) const {
         const ModelConfig& c = m.layer_cfg(layer);
-        const std::string p = lp(layer) + "mlp.";
+        const std::string p = layer_prefix(layer) + "mlp.";
         const std::string fn = c.mlp_activation();
         Tensor dpost = linear_backward(dout, m.weight(p + "down.weight"));
         report(p + "hook_post", dpost);
@@ -221,7 +216,7 @@ struct Backward {
             return linear_backward(dpre, m.weight(p + "up.weight"));
         }
         // post = act(gate(x)) * up(x)
-        const Tensor& x = act(lp(layer) + "hook_mlp_in");
+        const Tensor& x = act(layer_prefix(layer) + "hook_mlp_in");
         const Tensor up = linear(x, m.weight(p + "up.weight"), m.weight_or_null(p + "up.bias"));
         Tensor activated = pre;
         detail::activate_(activated, fn);
@@ -236,25 +231,25 @@ struct Backward {
     Tensor sandwich_attn(int64_t layer, const Tensor& g) const {
         const ModelConfig& c = m.layer_cfg(layer);
         if (c.norm_position != "sandwich") return g;
-        const std::string p = lp(layer) + "attn.";
+        const std::string p = layer_prefix(layer) + "attn.";
         const Tensor& z = act(p + "hook_z");
         const int64_t T = z.shape[0];
         const Tensor raw =
             linear(z.reshape({T, -1}), m.weight(p + "o_proj.weight"), m.weight_or_null(p + "o_proj.bias"));
-        return norm_backward(m, lp(layer) + "ln1_post", c, raw, g);
+        return norm_backward(m, layer_prefix(layer) + "ln1_post", c, raw, g);
     }
     Tensor sandwich_mlp(int64_t layer, const Tensor& g) const {
         const ModelConfig& c = m.layer_cfg(layer);
         if (c.norm_position != "sandwich") return g;
-        const std::string p = lp(layer) + "mlp.";
+        const std::string p = layer_prefix(layer) + "mlp.";
         const Tensor raw = linear(act(p + "hook_post"), m.weight(p + "down.weight"), m.weight_or_null(p + "down.bias"));
-        return norm_backward(m, lp(layer) + "ln2_post", c, raw, g);
+        return norm_backward(m, layer_prefix(layer) + "ln2_post", c, raw, g);
     }
 
     // dL/d(hook_resid_pre) from dL/d(hook_resid_post), mirroring Model::block.
     Tensor block(int64_t layer, const Tensor& g_post) const {
         const ModelConfig& c = m.layer_cfg(layer);
-        const std::string p = lp(layer);
+        const std::string p = layer_prefix(layer);
         const bool post = c.norm_position == "post";
         const Tensor& x = act(p + "hook_resid_pre");
         report(p + "hook_resid_post", g_post);
@@ -327,7 +322,7 @@ Tensor Model::run_with_gradients(const Tokens& tokens, const std::function<Tenso
     bw.report("hook_final", g);
     const int64_t L = cfg_.n_layers;
     if (cfg_.norm_position != "post")
-        g = norm_backward(*this, "ln_final", cfg_, cache.at(lp(L - 1) + "hook_resid_post"), g);
+        g = norm_backward(*this, "ln_final", cfg_, cache.at(layer_prefix(L - 1) + "hook_resid_post"), g);
     for (int64_t i = L - 1; i >= 0; --i) g = bw.block(i, g);
     bw.report("hook_embed", g);  // resid_pre of block 0 = embed (+ pos_embed)
     if (cfg_.embedding_positional()) bw.report("hook_pos_embed", g);

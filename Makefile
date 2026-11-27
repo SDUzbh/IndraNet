@@ -11,7 +11,8 @@
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
 #   make CXXFLAGS="-O1 -g -fsanitize=address,undefined" test
 CXXFLAGS ?= -O2
-override CXXFLAGS += -std=c++20 -Wall -Wextra -Iinclude -pthread
+# -Isrc: the internal headers ("model/ops.h", ...), which the library and the tests include.
+override CXXFLAGS += -std=c++20 -Wall -Wextra -Iinclude -Isrc -pthread
 LDLIBS :=
 
 BUILD := build
@@ -46,8 +47,14 @@ $(BUILD)/indra: tools/indra.cpp $(BUILD)/libtfi.a $(HEADERS)
 $(BUILD)/tfi_golden: tests/golden.cpp $(BUILD)/libtfi.a $(HEADERS)
 	$(CXX) $(CXXFLAGS) $< $(BUILD)/libtfi.a $(LDLIBS) -o $@
 
-$(BUILD)/tfi_tests: tests/unit.cpp $(BUILD)/libtfi.a $(HEADERS)
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/libtfi.a $(LDLIBS) -o $@
+# The unit tests: one file per group (tests/unit/*.cpp), compiled side by side.
+TEST_OBJS := $(patsubst tests/unit/%.cpp,$(BUILD)/obj/tests/%.o,$(wildcard tests/unit/*.cpp))
+$(BUILD)/obj/tests/%.o: tests/unit/%.cpp tests/unit/common.h tests/unit/tests.h $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/tfi_tests: $(TEST_OBJS) $(BUILD)/libtfi.a
+	$(CXX) $(CXXFLAGS) $(TEST_OBJS) $(BUILD)/libtfi.a $(LDLIBS) -o $@
 
 test: $(BUILD)/tfi_tests
 	$(BUILD)/tfi_tests $(if $(GROUPS),--group $(GROUPS)) $(if $(FILTER),--filter "$(FILTER)")

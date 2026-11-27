@@ -17,7 +17,7 @@
   by Hugging Face's `tokenizers` library, must give its ids on varied text (scripts, emoji,
   whitespace runs, decomposed accents, special tokens), with and without special tokens. The C++
   unit tests check UTF-8, NFC / NFD, the split-pattern regex and the BPE rules on their own.
-- **Unit tests** (`tests/unit.cpp`) check invariants on random models: DLA parts sum to the real
+- **Unit tests** (`tests/unit/`, one file per group) check invariants on random models: DLA parts sum to the real
   logit difference, the last logit-lens stage equals the model's output, patching the only
   changed input restores the clean run exactly, the fast low-rank composition formula equals the
   direct d×d computation, plus causality and hooks. Gradients at every hook point are checked
@@ -38,12 +38,14 @@
   on the GPU must match the CPU at every hook point and activation, for a gradient on every row's logits,
   without hooks, with hooks that edit every activation (the pattern included) or only the patterns. In GPU-only mode a single pass must match the CPU at every activation it
   caches, with hooks that edit every activation (the pattern too) and capture hooks among them.
-- **fp16 weights** (also `tests/unit.cpp`): the fp16 conversion must round trip every fp16 value,
+- **fp16 weights** (`tests/unit/fp16.cpp`): the fp16 conversion must round trip every fp16 value,
   round to nearest-even and match the hardware's on arm64. A model with fp16 weights must compute
   what the float32 model with the rounded weights computes (forward and gradients), and so must
   loading with conversion. On the GPU, its batched passes and gradients must equal that float32
   model's bit for bit. The patching, attribution, DLA, lens and circuit invariants above are
   rerun on every configuration with fp16 weights.
+- **Layers** (`tools/check_layers.py`, the ctest test `layers`; CI also links each layer on its own): no
+  part of the library uses a layer above it ([architecture.md](architecture.md)).
 
 ## Tests
 
@@ -53,7 +55,8 @@ pytest          # Python tests, golden tests against PyTorch, the indra CLI, the
                 # examples (the bindings' tests build the module; skipped without nanobind)
 ```
 
-The C++ unit tests are in five groups, so part of the suite can run on its own:
+The C++ unit tests are in five groups, one file each in `tests/unit/` (`common.h` holds the helpers they share,
+`main.cpp` the runner), so part of the suite can run on its own:
 
 | Group | Covers |
 |---|---|
@@ -77,7 +80,7 @@ GitHub Actions runs on every push to `main` and every pull request
 ([.github/workflows/ci.yml](../.github/workflows/ci.yml)):
 
 - **cpp**: the engine built with make (`-Werror -pedantic`) and CMake, using GCC and clang on Linux
-  and clang on macOS.
+  and clang on macOS, and each of its layers linked on its own (`-DTFI_CHECK_LAYERS=ON`).
 - **sanitizers**: the C++ unit tests, golden tests and CLI on AddressSanitizer +
   UndefinedBehaviorSanitizer builds, and the unit tests under ThreadSanitizer.
 - **python**: the full test suite on Linux and macOS × Python 3.9 and 3.12 (the bindings included),

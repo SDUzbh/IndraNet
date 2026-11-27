@@ -149,14 +149,15 @@ hook names.
 | [docs/generation.md](docs/generation.md) | Sampling, the KV cache, `--trace`, batches, the prompt cache, speculative decoding |
 | [docs/methods.md](docs/methods.md) | The full induction walkthrough, attribution and mixed patching, every method's limits |
 | [docs/testing.md](docs/testing.md) | What the tests check (golden tests against PyTorch and transformers), test groups, CI, releases |
+| [docs/architecture.md](docs/architecture.md) | The engine's layers, how they are checked, where CPU-or-GPU is decided |
 
 | Path | What it is |
 |---|---|
-| [include/tfi/](include/tfi/), [src/](src/) | The tfi engine: its API, and the code in `model/`, `gpu/`, `text/`, `generation/` and `io/` |
+| [include/tfi/](include/tfi/), [src/](src/) | The tfi engine: its API, and its layers `support/`, `text/`, `core/`, `gpu/`, `model/`, `analysis/`, `generation/` |
 | [tools/indra.cpp](tools/indra.cpp) | The `indra` command line |
 | [python/](python/) | `indranet` (PyTorch models), [`indranet_hf`](python/indranet_hf/) (converter), [`tfi`](python/tfi/) (bindings) |
 | [examples/](examples/) | Two circuits trained in Python and reverse-engineered with `indra` |
-| [tests/](tests/) | C++ unit tests and the golden-test runner |
+| [tests/](tests/) | C++ unit tests (`unit/`, a file per group) and the golden-test runner |
 
 Tests: `make test` (C++) and `pytest` (Python, golden tests, CLI, bindings, examples).
 

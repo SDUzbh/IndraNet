@@ -8,8 +8,8 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "ops.h"
-#include "vmath.h"
+#include "core/gemm.h"
+#include "support/vmath.h"
 
 #ifdef TFI_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>

@@ -12,7 +12,7 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "../model/half.h"
+#include "support/half.h"
 #include "tfi/json.h"
 
 namespace tfi {

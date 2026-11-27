@@ -69,6 +69,9 @@ const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
 Tensor q_rows = Wq.rows(0, 16);                              // read as float32 either way (also cols, to_tensor)
 ```
 
+`set_num_threads` and `set_device` (where work runs, as `indra --device`) are declared in `tfi/device.h`, which
+`tfi/analysis.h` includes.
+
 `Model::weight` returns a `Weight`. Matrices (float32 or fp16) are read with `rows()`, `cols()`,
 `to_tensor()` and the `linear()` / `matmul()` overloads, which give float32 either way; they sit in
 page-aligned memory that the GPU uses in place, so no weight is held twice. Norm scales and biases

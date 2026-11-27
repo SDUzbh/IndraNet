@@ -53,7 +53,7 @@ std::atomic<bool> g_attn_tensor{true};
 }  // namespace
 void set_gpu_attention_tensor(bool on) { g_attn_tensor = on; }
 
-// Kernels of Gpu::Seq, compiled when first needed. The math is src/model/vmath.h's (same polynomials),
+// Kernels of Gpu::Seq, compiled when first needed. The math is src/support/vmath.h's (same polynomials),
 // so GPU and CPU agree to float rounding.
 const char* const kKernelSource = R"(
 #include <metal_stdlib>

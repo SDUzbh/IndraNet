@@ -11,13 +11,9 @@
 
 #include <unistd.h>
 
-#if defined(__APPLE__)
-#include <dispatch/dispatch.h>
-#endif
-
-#include "half.h"
-#include "ops.h"
-#include "tfi/analysis.h"  // num_threads
+#include "core/gemm.h"
+#include "support/half.h"
+#include "support/parallel.h"
 
 namespace tfi {
 
@@ -153,16 +149,7 @@ void run_row_chunks(int64_t total, int64_t in, F&& rows) {
     const int64_t chunks = threads <= 1 ? 1 : std::max<int64_t>(1, std::min<int64_t>(4 * threads, total / min_rows));
 #if defined(__APPLE__)
     if (chunks > 1) {
-        struct Job {
-            F* fn;
-            int64_t total, chunks;
-        } job{&rows, total, chunks};
-        dispatch_apply_f(static_cast<size_t>(chunks), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job,
-                         [](void* p, size_t c) {
-                             const Job& jb = *static_cast<const Job*>(p);
-                             const int64_t i = static_cast<int64_t>(c);
-                             (*jb.fn)(jb.total* i / jb.chunks, jb.total * (i + 1) / jb.chunks);
-                         });
+        detail::side_by_side(chunks, [&](int64_t i) { rows(total * i / chunks, total * (i + 1) / chunks); });
         return;
     }
 #else
