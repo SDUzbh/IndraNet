@@ -263,7 +263,9 @@ class Model {
     // each edited value as the activation itself (e.g. replacing hook_embed runs the model on other
     // embeddings). If `acts` is given it receives every activation. Returns the logits. On macOS the
     // whole pass runs on the GPU where a single pass of the tokens would (forward()'s rule), with the same
-    // results up to float rounding; the embeddings are made on the CPU.
+    // results up to float rounding; the embeddings are made on the CPU. It multiplies in float32 there even
+    // with fp16 weights, where forward() on the GPU rounds the multiplies' inputs to fp16: its activations then
+    // differ from forward()'s by about 1e-3 relative.
     Tensor run_with_gradients(const Tokens& tokens, const std::function<Tensor(const Tensor& logits)>& dlogits,
                               ActivationCache& grads, NameFilter filter = nullptr, ActivationCache* acts = nullptr,
                               const Hooks* hooks = nullptr) const;

@@ -30,6 +30,7 @@ namespace detail {
 
 namespace {
 constexpr int64_t kDefaultMinRows = 256;  // tuned on an M5 Pro
+constexpr size_t kPoolFloor = size_t(256) << 20;  // free buffers a pass ending may always leave pooled (Gpu::Seq)
 constexpr double kDefaultMinWork = 6e10;  // tuned on an M5 Pro (models of 1-85M parameters)
 std::atomic<int64_t> g_min_rows{0};
 std::atomic<double> g_min_work{0};
@@ -1317,6 +1318,17 @@ struct Gpu::Impl {
         std::scoped_lock lock(mutex);
         pool.push_back(b);
     }
+    // Frees pooled buffers, oldest first, until those left hold at most `keep` bytes. A pass ending keeps about
+    // its own buffers' worth for the next (Gpu::Seq::~Seq), so passes of one size reuse each other's while a
+    // peak of several at once (attribution's steps side by side) is given back instead of held for good.
+    void trim(size_t keep) {
+        std::scoped_lock lock(mutex);
+        size_t idle = 0;
+        for (id<MTLBuffer> b : pool) idle += b.length;
+        size_t n = 0;
+        while (idle > keep && n < pool.size()) idle -= pool[n++].length;
+        pool.erase(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(n));
+    }
 
     // Gpu::Seq's kernels, compiled on first use.
     std::once_flag kernels_once;
@@ -2384,13 +2396,20 @@ Gpu::Seq::Seq(Gpu& gpu) : impl_(new Impl(*gpu.impl_)) {
 
 Gpu::Seq::~Seq() {
     Impl& s = *impl_;
+    size_t bytes = 0;  // what this pass gives back
+    auto give = [&](id<MTLBuffer> b) {
+        if (!b) return;
+        bytes += b.length;
+        s.g.release(b);
+    };
     for (Impl::Slot& slot : s.slots) {
-        if (slot.buf) s.g.release(slot.buf);
-        if (slot.half) s.g.release(slot.half);
+        give(slot.buf);
+        give(slot.half);
     }
-    if (s.flag) s.g.release(s.flag);
-    if (s.split) s.g.release(s.split);
-    if (s.halves) s.g.release(s.halves);
+    give(s.flag);
+    give(s.split);
+    give(s.halves);
+    s.g.trim(std::max(bytes, kPoolFloor));
 }
 
 float* Gpu::Seq::reserve(int slot, int64_t floats) {

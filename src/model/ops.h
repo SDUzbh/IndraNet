@@ -104,6 +104,9 @@ void set_circuits_run_bytes(int64_t bytes);
 constexpr double kSinglePassLayerWeights = 3e6, kSinglePassRowWork = 5e7;
 bool single_pass_on_gpu(int64_t T, int64_t layers, double layer_weights, bool started, int64_t min_rows,
                         double min_work);
+// Whether Model::run_with_gradients of T tokens runs on the GPU (macOS, where a single pass of them would). Its
+// forward half then multiplies in float32 even with fp16 weights, unlike forward() there.
+bool gradients_go_to_gpu(const Model& m, int64_t T);
 
 // The sampler's weights (Sampler, generate.cpp): w[i] = exp((logits[i] - top) * scale) in float, for logits
 // at most `top`; 0 where that exponent is below -87 (exp under fp32's smallest normal), and for NaN and

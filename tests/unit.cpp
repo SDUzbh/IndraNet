@@ -2467,6 +2467,41 @@ static void test_gpu_run_with_gradients(const Model& m, int64_t T) {
 }
 #endif
 
+#ifdef TFI_USE_ACCELERATE
+// Attribution patching with step 0's gradients on the small-batch path while run_with_gradients goes to the GPU
+// (layers big enough for a short single pass there): the corrupted activations still come from a forward pass, as
+// the clean ones do, so its metric is exact patching's and the positions before the corruption have no effect, bit
+// for bit, with fp16 weights too (where the gradient pass's float32 multiplies differ from a forward pass's).
+static void test_attribution_corrupted_run_matches_clean() {
+    const ModelConfig cfg = tiny([](ModelConfig& c) {
+        c.d_model = 512;
+        c.n_heads = 8;
+        c.d_mlp = 2048;
+        c.n_layers = 2;
+    });
+    for (const WeightFormat f : {WeightFormat::fp32, WeightFormat::fp16}) {
+        const Model m = random_model(cfg, 71, f);
+        if (!m.gpu()) {
+            std::printf("     (no Metal device: GPU path not tested)\n");
+            return;
+        }
+        set_device(Device::Gpu);
+        m.forward(seq(8, 3));  // the GPU has started
+        set_device(Device::Both);
+        const Tokens clean = seq(8, 6);
+        Tokens corrupt = clean;
+        corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
+        CHECK(detail::gradients_go_to_gpu(m, 7));  // the case under test
+        const PatchResult exact = patch_residual(m, clean, corrupt, "resid_pre", 6, 1, 2);
+        const PatchResult atp = attribution_patch_residual(m, clean, corrupt, "resid_pre", 6, 1, 2);
+        CHECK(atp.clean_metric == exact.clean_metric);
+        CHECK(atp.corrupt_metric == exact.corrupt_metric);
+        for (int64_t i = 0; i < m.cfg().n_layers; ++i)
+            for (int64_t p = 0; p < 3; ++p) CHECK(atp.effect.at({i, p}) == 0.f);
+    }
+}
+#endif
+
 static void test_nan_never_matches() {
     Tensor a({3}, {1.f, 2.f, 3.f}), b = a;
     b.data[1] = NAN;
@@ -5542,6 +5577,8 @@ int main(int argc, char** argv) {
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu", "attribution + mixed patching on the GPU = CPU (macOS): " + name,
             [&] { test_gpu_attribution(random_model(cfg, 45)); });
+    run("gpu", "attribution: the corrupted run matches the clean one with gradients on the GPU, fp16 too (macOS)",
+        test_attribution_corrupted_run_matches_clean);
     for (const auto& [name, cfg] : gpu_block_configs())
         run("gpu", "fp16 weights on the GPU: = rounded float32 weights; gradients, attribution = CPU (macOS): " + name,
             [&] {

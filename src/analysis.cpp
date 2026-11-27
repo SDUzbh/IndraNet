@@ -882,20 +882,28 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
     cpu_steps = all_steps;
 #endif
     const bool corrupt_on_cpu = std::ranges::find(cpu_steps, 0) != cpu_steps.end();
+    // The corrupted run's activations come from a forward pass like the clean run's, so that what the
+    // corruption can't reach is the same in both, bit for bit: so from step 0's gradient pass only where its
+    // forward half is that pass (on the CPU). A gradient pass on the GPU multiplies in float32, a forward
+    // pass with fp16 weights there doesn't.
+    const bool corrupt_from_gradients = corrupt_on_cpu && !detail::gradients_go_to_gpu(m, P);
     std::vector<ActivationCache> step_grads(steps);
     // Jobs: the clean run, the corrupted run (with step 0's gradients when that is on the CPU), the
-    // GPU batches, then the other CPU steps.
+    // GPU batches one after another (they share the GPU, so running them side by side saves no time, and each
+    // holds every layer's activations: M5 Pro, 0.9B model, 4 steps of 2048 tokens took 8.7 s and 37 GB side by
+    // side, 7.7 s and 14.5 GB in turn), then the other CPU steps.
     const int64_t n_cpu_jobs = std::ssize(cpu_steps) - (corrupt_on_cpu ? 1 : 0);
     const int64_t n_gpu = std::ssize(gpu_batches);
     std::vector<int64_t> later_cpu;
     for (int64_t k : cpu_steps)
         if (k != 0) later_cpu.push_back(k);
-    parallel_for(2 + n_gpu + n_cpu_jobs, [&](int64_t j) {
+    const int64_t gpu_job = n_gpu ? 1 : 0;
+    parallel_for(2 + gpu_job + n_cpu_jobs, [&](int64_t j) {
         if (j == 0) {
             a.runs.result.clean_metric =
                 logit_metric(m.run_with_cache(c, a.runs.clean_cache, only(clean_extra)), pos, target, other);
         } else if (j == 1) {
-            if (corrupt_on_cpu) {
+            if (corrupt_from_gradients) {
                 ActivationCache all;
                 a.runs.result.corrupt_metric =
                     metric_gradients(m, x, pos, target, other, step_grads[0], only(names), &all);
@@ -904,24 +912,26 @@ AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const T
             } else {
                 a.runs.result.corrupt_metric =
                     logit_metric(m.run_with_cache(x, a.runs.corrupt_cache, only(corrupt_extra)), pos, target, other);
+                if (corrupt_on_cpu) metric_gradients(m, x, pos, target, other, step_grads[0], only(names));
             }
-        } else if (j < 2 + n_gpu) {
-            const Batch& b = gpu_batches[j - 2];
-            detail::RowBatch rb;
-            rb.gpu = gpu;
-            Tensor x0({b.rows, m.cfg().d_model});
-            for (int64_t k : b.items) {
-                const Hooks h = interpolate(k);
-                const Tensor e = m.embed(x, &h);
-                std::copy_n(e.ptr(), e.numel(), x0.ptr() + rb.rows() * m.cfg().d_model);
-                rb.add(0, P);
+        } else if (j < 2 + gpu_job) {
+            for (const Batch& b : gpu_batches) {
+                detail::RowBatch rb;
+                rb.gpu = gpu;
+                Tensor x0({b.rows, m.cfg().d_model});
+                for (int64_t k : b.items) {
+                    const Hooks h = interpolate(k);
+                    const Tensor e = m.embed(x, &h);
+                    std::copy_n(e.ptr(), e.numel(), x0.ptr() + rb.rows() * m.cfg().d_model);
+                    rb.add(0, P);
+                }
+                std::vector<ActivationCache> g = m.gradients_rows(
+                    x0, rb, [&](int64_t, const Tensor& logits) { return metric_dlogits(logits, 0, target, other); },
+                    only(names));
+                for (size_t i = 0; i < b.items.size(); ++i) step_grads[b.items[i]] = std::move(g[i]);
             }
-            std::vector<ActivationCache> g = m.gradients_rows(
-                x0, rb, [&](int64_t, const Tensor& logits) { return metric_dlogits(logits, 0, target, other); },
-                only(names));
-            for (size_t i = 0; i < b.items.size(); ++i) step_grads[b.items[i]] = std::move(g[i]);
         } else {
-            const int64_t k = later_cpu[j - 2 - n_gpu];
+            const int64_t k = later_cpu[j - 2 - gpu_job];
             const Hooks hooks = interpolate(k);
             m.run_with_gradients(
                 x, [&](const Tensor& logits) { return metric_dlogits(logits, pos, target, other); }, step_grads[k],
